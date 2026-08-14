@@ -1,0 +1,13 @@
+# Secrets and runtime state
+.env
+.env.*
+state/
+*.sqlite3
+__pycache__/
+.pytest_cache/
+*.pyc
+# Generated screenshots and local probes
+*.png
+*.html
+.shot*.py
+.network_probe.py
