@@ -4,13 +4,18 @@ import argparse
 import datetime as dt
 import hashlib
 import json
+import logging
 import sqlite3
+import threading
 import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from bs4 import BeautifulSoup
 from parse import DAY_FULL, _find_schedule_table, parse_all
+
+LOGGER = logging.getLogger(__name__)
+PERSIST_LOCK = threading.Lock()
 
 PARSER_VERSION = "2"
 ROOT = Path(__file__).resolve().parent
@@ -37,7 +42,7 @@ def fetch(group):
 def physical_lesson_count(html):
     table = _find_schedule_table(BeautifulSoup(html, "html.parser"))
     if table is None:
-        return 0
+        raise ValueError("schedule table not found")
     count = 0
     current_day = False
     inherited = 0
@@ -57,13 +62,18 @@ def physical_lesson_count(html):
             inherited -= 1
             subject = cells[1]
         else:
+            if any(cells):
+                raise ValueError(f"unrecognized schedule row shape: {len(cells)} cells")
             continue
         count += bool(subject)
     return count
 
 
 def validate(data, html):
-    lessons = [lesson for rows in (data.get("schedule") or {}).get("days", {}).values() for lesson in rows]
+    schedule = data.get("schedule")
+    if not isinstance(schedule, dict) or not isinstance(schedule.get("days"), dict):
+        raise ValueError("schedule is missing or is a stub response")
+    lessons = [lesson for rows in schedule["days"].values() for lesson in rows]
     expected = physical_lesson_count(html)
     if len(lessons) != expected:
         raise ValueError(f"parser invariant failed: physical={expected}, parsed={len(lessons)}")
@@ -74,7 +84,8 @@ def validate(data, html):
 
 def connect(path=DB_PATH):
     path.parent.mkdir(parents=True, exist_ok=True)
-    db = sqlite3.connect(path)
+    db = sqlite3.connect(path, timeout=30)
+    db.execute("PRAGMA busy_timeout = 30000")
     db.executescript((ROOT / "db" / "schema.sql").read_text())
     annotations = json.loads((ROOT / "data" / "annotations.json").read_text())
     for item in annotations["glossary"]:
@@ -88,14 +99,15 @@ def connect(path=DB_PATH):
 def persist(db, html, url, data):
     digest = hashlib.sha256(html.encode()).hexdigest()
     now = dt.datetime.now(dt.timezone.utc).isoformat()
-    db.execute("INSERT OR IGNORE INTO snapshots(fetched_at,url,content_hash,html,parser_version) VALUES(?,?,?,?,?)", (now, url, digest, html, PARSER_VERSION))
-    sid = db.execute("SELECT id FROM snapshots WHERE content_hash=?", (digest,)).fetchone()[0]
-    sql = "INSERT OR REPLACE INTO lessons(snapshot_id,source_row,day,time_text,subject_raw,subject,teacher,raw_room,room,raw_comment,location,delivery_mode,link,note) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
-    for day, rows in data["schedule"]["days"].items():
-        for lesson in rows:
-            values = (sid, lesson["source_row"], day, lesson["time"], lesson.get("subject_raw", lesson["subject"]), lesson["subject"].split("\n", 1)[0], lesson["teacher"], lesson.get("raw_room"), lesson["room"], lesson.get("raw_comment"), lesson.get("location"), lesson.get("delivery_mode", "in_person"), lesson.get("link"), lesson.get("note"))
-            db.execute(sql, values)
-    db.commit()
+    with PERSIST_LOCK:
+        db.execute("INSERT OR IGNORE INTO snapshots(fetched_at,url,content_hash,html,parser_version) VALUES(?,?,?,?,?)", (now, url, digest, html, PARSER_VERSION))
+        sid = db.execute("SELECT id FROM snapshots WHERE content_hash=?", (digest,)).fetchone()[0]
+        sql = "INSERT OR REPLACE INTO lessons(snapshot_id,source_row,day,time_text,subject_raw,subject,teacher,raw_room,room,raw_comment,location,delivery_mode,link,note) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+        for day, rows in data["schedule"]["days"].items():
+            for lesson in rows:
+                values = (sid, lesson["source_row"], day, lesson["time"], lesson.get("subject_raw", lesson["subject"]), lesson["subject"].split("\n", 1)[0], lesson["teacher"], lesson.get("raw_room"), lesson["room"], lesson.get("raw_comment"), lesson.get("location"), lesson.get("delivery_mode", "in_person"), lesson.get("link"), lesson.get("note"))
+                db.execute(sql, values)
+        db.commit()
     return sid
 
 
@@ -121,8 +133,9 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_json(404, {"error": "unknown_group"})
         try:
             self.send_json(200, get_timetable(group))
-        except Exception as exc:
-            self.send_json(502, {"error": "upstream_or_parse_failure", "detail": str(exc)})
+        except Exception:
+            LOGGER.exception("timetable request failed for group %s", group)
+            self.send_json(502, {"error": "upstream_or_parse_failure"})
 
     def send_json(self, status, payload):
         body = json.dumps(payload, ensure_ascii=False).encode()

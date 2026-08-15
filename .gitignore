@@ -6,8 +6,10 @@ state/
 __pycache__/
 .pytest_cache/
 *.pyc
-# Generated screenshots and local probes
-*.png
-*.html
+# Generated screenshots, snapshots, and local probes
+/state/
+state/**/*.png
+state/**/*.html
+state/**/*.sqlite3
 .shot*.py
 .network_probe.py
