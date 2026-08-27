@@ -1,30 +1,38 @@
-"""Оркестратор: парсит расписание, делает скрин, постит в канал.
+"""Оркестратор: парсит расписание и постит в канал.
 
 Пайплайн:
-1. fetch_html + parse_6381 → JSON (weeks, schedule)
-2. screenshot_url → PNG
-3. format_schedule_post → list[str] (1+ сообщений, ≤4096 каждый)
-4. sendPhoto со скриншотом + caption (первое сообщение) → канал -1004256784811
-5. если есть ещё сообщения (rich таблица не влезла) → sendMessage для каждого
+1. fetch_html + parse_all → JSON (weeks, schedule)
+2. render_schedule_html → чистая HTML-таблица (предметы сгруппированы
+   по чётности недели: верхняя / нижняя / каждую)
+3. screenshot_html → PNG через headless chromium
+4. sendPhoto в канал + раскрывающаяся подпись (<blockquote expandable>)
+   с легендой по неделям и ссылкой на портал
+5. фоллбек на format_schedule_post (текст ≤4096), если скрин не получился
+6. заглушка портала → stub-сообщение через sendMessage
 
 Идемпотентность: не постить если с прошлого поста ничего не изменилось.
 Состояние "последний пост" хранится в state/last_post.json:
-  { hash, post_ts, message_ids: [int,...] }
+  { hash, fingerprint, ts, message_ids: [int,...] }
 """
 
 from __future__ import annotations
 
 import datetime as dt
+import html as _html
 import json
+import os
 import sys
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Any
+import zoneinfo
 
 import config  # noqa: E402
-from fetch import fetch_html, hash_html, is_stub  # noqa: E402
+from fetch import content_fingerprint, fetch_html, hash_html  # noqa: E402
 from parse import parse_all  # noqa: E402
-from format import format_schedule_post, format_changes_only  # noqa: E402
-from screenshot import screenshot_url  # noqa: E402
+from format import build_dashboard_rich_message, format_changes_only, format_schedule_post, render_schedule_html  # noqa: E402
+from screenshot import screenshot_html, screenshot_schedule_day_crop_items  # noqa: E402
+from telegram_api import edit_rich_message  # noqa: E402
 
 
 def _tg_api(method: str, **fields) -> dict[str, Any]:
@@ -94,100 +102,224 @@ def _read_last_post() -> dict:
     return {}
 
 
-def _write_last_post(d: dict) -> None:
-    f = config.STATE_DIR / "last_post.json"
-    f.write_text(json.dumps(d, ensure_ascii=False, indent=2), encoding="utf-8")
+def _write_last_post(data: dict) -> None:
+    path = config.STATE_DIR / "last_post.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    with temporary.open("w", encoding="utf-8") as handle:
+        json.dump(data, handle, ensure_ascii=False, indent=2)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temporary, path)
+
+
+def _semantic_fingerprint(data: dict) -> str:
+    """Compatibility alias for the single canonical fingerprint implementation."""
+    return content_fingerprint(data)
+
+
+def _photo_caption(source_url: str) -> str:
+    """Build a complete HTML caption; never cut markup at 1024 chars."""
+    escaped_url = _html.escape(str(source_url), quote=True)
+    link = f'<a href="{escaped_url}">открыть на портале</a>'
+    # An unexpectedly huge configured URL is safer to omit than to slice in
+    # the middle of an attribute or entity.
+    if len(link) > 400:
+        link = "открыть на портале НовГУ"
+    caption = (
+        "<b>Расписание группы 6381</b>\n"
+        "<blockquote expandable>"
+        "ВЕРХНЯЯ — 1, 3, 5… нечётные учебные недели\n"
+        "НИЖНЯЯ — 2, 4, 6… чётные учебные недели\n"
+        "Недели считаются по учебному календарю НовГУ.\n"
+        "* у предмета — условие раскрыто под таблицей.\n"
+        f"{link}"
+        "</blockquote>"
+    )
+    if len(caption) > 1024:
+        raise ValueError("photo caption exceeds Telegram's 1024-character limit")
+    return caption
+
+
+def _message_id(response: dict) -> int | None:
+    result = response.get("result") if isinstance(response, dict) else None
+    message_id = result.get("message_id") if isinstance(result, dict) else None
+    return message_id if isinstance(message_id, int) else None
 
 
 def post_to_channel(force: bool = False) -> dict:
-    """Главный entry point.
-
-    Args:
-      force: постить даже если hash не менялся (ручной прогон / первый запуск).
-    """
+    """Post the current schedule once per parsed semantic fingerprint."""
     html = fetch_html()
-    new_hash = hash_html(html)
+    raw_hash = hash_html(html)
+    data = parse_all(html)
+    fingerprint = _semantic_fingerprint(data)
     last = _read_last_post()
 
-    if not force and last.get("hash") == new_hash:
-        print(f"[skip] hash совпал с прошлым постом: {new_hash}")
-        return {"posted": False, "reason": "same_hash", "hash": new_hash}
+    same_semantics = last.get("fingerprint") == fingerprint
+    legacy_exact_match = "fingerprint" not in last and last.get("hash") == raw_hash
+    if not force and (same_semantics or legacy_exact_match):
+        print(f"[skip] semantic fingerprint совпал с прошлым постом: {fingerprint}")
+        return {
+            "posted": False,
+            "complete": True,
+            "partial": False,
+            "reason": "same_fingerprint",
+            "hash": raw_hash,
+            "fingerprint": fingerprint,
+        }
 
-    data = parse_all(html)
     stub = data.get("stub", True)
     weeks = data.get("weeks", [])
-
-    # Скриншот
-    screenshot_path = config.STATE_DIR / f"6381_screenshot_{dt.date.today().isoformat()}.png"
-    try:
-        screenshot_url(config.GROUP_URL, screenshot_path)
-    except Exception as e:  # noqa: BLE001
-        print(f"[screenshot ERR] {e}", file=sys.stderr)
-        screenshot_path = None  # пост без скрина
+    sent_ids: list[int] = []
+    failures: list[dict[str, Any]] = []
+    complete = False
+    delivery = "stub" if stub else "fallback"
 
     if stub:
-        msgs = [
+        text = (
             "ℹ️ <b>Расписание 6381</b>\n"
             "На портале пока заглушка — расписание не опубликовано.\n"
-            f"<a href=\"{config.GROUP_URL}\">открыть на портале</a>"
-        ]
-        caption = msgs[0]
-        followups: list[str] = []
-    else:
-        msgs = format_schedule_post(
-            data.get("schedule"),
-            weeks,
-            config.GROUP_URL,
-            changes_summary="",  # сюда позже можно добавлять дельту изменений
+            f'<a href="{_html.escape(str(config.GROUP_URL), quote=True)}">открыть на портале</a>'
         )
-        caption = msgs[0]
-        followups = msgs[1:]
-
-    sent_ids: list[int] = []
-
-    if screenshot_path and screenshot_path.exists():
-        result = _tg_api(
-            "sendPhoto",
-            chat_id=config.TG_CHANNEL_ID,
-            photo=str(screenshot_path),
-            caption=caption[:1024],  # лимит caption
-            parse_mode="HTML",
-        )
-        if result.get("ok"):
-            sent_ids.append(result["result"]["message_id"])
+        response = _tg_api("sendMessage", chat_id=config.TG_CHANNEL_ID, text=text, parse_mode="HTML")
+        message_id = _message_id(response)
+        if response.get("ok") and message_id is not None:
+            sent_ids.append(message_id)
+            complete = True
         else:
-            # фоллбек — пост без скрина
-            r2 = _tg_api("sendMessage", chat_id=config.TG_CHANNEL_ID, text=caption, parse_mode="HTML")
-            if r2.get("ok"):
-                sent_ids.append(r2["result"]["message_id"])
+            failures.append({"stage": "stub_message", "response": response})
     else:
-        r = _tg_api("sendMessage", chat_id=config.TG_CHANNEL_ID, text=caption, parse_mode="HTML")
-        if r.get("ok"):
-            sent_ids.append(r["result"]["message_id"])
+        sent_via_photo = False
+        try:
+            rendered = render_schedule_html(
+                data.get("schedule"), weeks, config.GROUP_URL, group_name="6381",
+            )
+            today_msk = dt.datetime.now(zoneinfo.ZoneInfo("Europe/Moscow")).date()
+            shot = config.STATE_DIR / f"6381_schedule_{today_msk.isoformat()}.png"
+            screenshot_html(rendered, shot)
+            result = _tg_api(
+                "sendPhoto",
+                chat_id=config.TG_CHANNEL_ID,
+                photo=str(shot),
+                caption=_photo_caption(config.GROUP_URL),
+                parse_mode="HTML",
+            )
+            message_id = _message_id(result)
+            if result.get("ok") and message_id is not None:
+                sent_ids.append(message_id)
+                sent_via_photo = True
+                complete = True
+                delivery = "photo"
+            else:
+                print(f"[sendPhoto FAIL] {result}", file=sys.stderr)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[screenshot ERR] {exc}", file=sys.stderr)
 
-    for m in followups:
-        r = _tg_api("sendMessage", chat_id=config.TG_CHANNEL_ID, text=m, parse_mode="HTML")
-        if r.get("ok"):
-            sent_ids.append(r["result"]["message_id"])
+        if not sent_via_photo:
+            # The failed photo is only an alternative transport.  A complete
+            # text fallback still counts as a complete post.
+            try:
+                messages = format_schedule_post(
+                    data.get("schedule"), weeks, config.GROUP_URL, group_name="6381",
+                )
+            except Exception as exc:  # noqa: BLE001
+                messages = []
+                failures.append({"stage": "format_fallback", "error": str(exc)})
+            fallback_successes = 0
+            for index, message in enumerate(messages):
+                response = _tg_api(
+                    "sendMessage",
+                    chat_id=config.TG_CHANNEL_ID,
+                    text=message,
+                    parse_mode="HTML",
+                )
+                message_id = _message_id(response)
+                if response.get("ok") and message_id is not None:
+                    sent_ids.append(message_id)
+                    fallback_successes += 1
+                else:
+                    failures.append({
+                        "stage": "fallback_message",
+                        "index": index,
+                        "response": response,
+                    })
+            complete = bool(messages) and fallback_successes == len(messages)
 
-    _write_last_post(
-        {
-            "hash": new_hash,
-            "ts": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
+    posted = bool(sent_ids)
+    partial = posted and not complete
+    result = {
+        "posted": posted,
+        "complete": complete,
+        "partial": partial,
+        "reason": "posted" if complete else ("partial_failure" if partial else "send_failed"),
+        "hash": raw_hash,
+        "fingerprint": fingerprint,
+        "stub": stub,
+        "message_ids": sent_ids,
+    }
+    if failures:
+        result["failures"] = failures
+
+    # Only a complete delivery is safe to deduplicate.  Full and partial
+    # failures remain retryable and must not advance last_post.json.
+    if complete:
+        now_msk = dt.datetime.now(zoneinfo.ZoneInfo("Europe/Moscow"))
+        _write_last_post({
+            "hash": raw_hash,
+            "fingerprint": fingerprint,
+            "ts": now_msk.isoformat(timespec="seconds"),
+            "timezone": "Europe/Moscow",
             "message_ids": sent_ids,
             "stub": stub,
-        }
-    )
-    return {"posted": True, "hash": new_hash, "stub": stub, "message_ids": sent_ids}
+            "delivery": delivery,
+        })
+    return result
 
 
-def post_changes_alert(changes_summary: str) -> dict:
-    """Короткий пост-уведомление об изменениях (без полного расписания)."""
-    html = fetch_html()
-    data = parse_all(html)
+def post_changes_alert(changes_summary: str, data: dict | None = None) -> dict:
+    """Короткий пост-уведомление об изменениях (без полного расписания).
+
+    data — уже распарсенный parse_all(); если не передан, фетчим сами.
+    Детальные дифф-посты делает monitor._post_changes_to_channel (rich).
+    """
+    if data is None:
+        data = parse_all(fetch_html())
     text = format_changes_only(data.get("weeks", []), [{"when": changes_summary}], config.GROUP_URL)
     result = _tg_api("sendMessage", chat_id=config.TG_CHANNEL_ID, text=text, parse_mode="HTML")
     return result
+
+
+def edit_dashboard_post(message_id: int, target_date: dt.date, html: str | None = None) -> dict:
+    """Обновить закреплённый rich-пост. html — уже скачанная страница
+    (монитор передаёт её, чтобы не фетчить дважды за цикл)."""
+    if html is None:
+        html = fetch_html()
+    data = parse_all(html)
+    with TemporaryDirectory(prefix=".tmp-novsu-tt-", dir=config.STATE_DIR) as tmpdir:
+        shot = Path(tmpdir) / f"6381_site_{target_date.isoformat()}.png"
+        shot_items = screenshot_schedule_day_crop_items(html, config.GROUP_URL, shot)
+        screenshot_media = [
+            {"label": item["label"], "media": f"attach://site_screenshot_{index}"}
+            for index, item in enumerate(shot_items, 1)
+        ]
+        rich = build_dashboard_rich_message(
+            data.get("schedule"),
+            data.get("weeks", []),
+            config.GROUP_URL,
+            target_date,
+            group_name="6381",
+            screenshot_media=screenshot_media,
+            current_date=dt.datetime.now(zoneinfo.ZoneInfo("Europe/Moscow")).date(),
+        )
+        files = {f"site_screenshot_{index}": item["path"] for index, item in enumerate(shot_items, 1)}
+        return edit_rich_message(
+            rich,
+            token=config.TG_BOT_TOKEN,
+            chat_id=config.TG_CHANNEL_ID,
+            message_id=message_id,
+            files=files,
+            timeout=120,
+        )
 
 
 if __name__ == "__main__":
@@ -196,9 +328,15 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--force", action="store_true", help="постить даже если hash не менялся")
     ap.add_argument("--alert", help="короткий пост-уведомление об изменениях")
+    ap.add_argument("--edit-rich", type=int, metavar="MESSAGE_ID", help="отредактировать существующий пост dashboard-rich форматом")
+    ap.add_argument("--date", default="2026-09-02", help="дата фокуса для --edit-rich, YYYY-MM-DD")
     args = ap.parse_args()
 
-    if args.alert:
+    if args.edit_rich:
+        target_date = dt.datetime.strptime(args.date, "%Y-%m-%d").date()
+        r = edit_dashboard_post(args.edit_rich, target_date)
+        print(json.dumps(r, ensure_ascii=False))
+    elif args.alert:
         r = post_changes_alert(args.alert)
         print(json.dumps(r, ensure_ascii=False))
     else:

@@ -1,36 +1,129 @@
-# NovSU Timetable API Facade
+# novsu-tg-md-raspis-bot
 
-Private service for reading the public server-rendered NovSU timetable and exposing a validated JSON contract. The NovSU page does not expose a timetable JSON endpoint: the source is a normal `GET` returning HTML.
+Бот расписания НовГУ для группы **6381**: парсит серверный HTML портала, отдаёт стабильный JSON через мини-API, следит за изменениями каждые 30 ± 3 минуты и постит **красивые rich-уведомления** в Telegram-канал — что конкретно добавилось, убралось или поменялось.
+
+## Как это работает
+
+```
+портал НовГУ (HTML)
+      │  curl + случайный Chromium UA, ретраи
+      ▼
+ fetch.py ──► parse.py ──► content_fingerprint (отпечаток содержимого)
+      │                          │
+      │                    изменилось?
+      │                          ▼
+      │                    monitor.py: diff_schedules
+      │                          │
+      │            ┌─────────────┴─────────────┐
+      │            ▼                           ▼
+      │   sendRichMessage в канал      edit_dashboard_post
+      │   (➕ / ➖ / ✏️ дифф)          (обновить закреп)
+      ▼
+   api.py (JSON), post.py (пост со скрином), screenshot.py
+```
+
+## Модули
+
+| Файл | Что делает |
+|---|---|
+| `config.py` | `.env`, URL группы, Telegram-цели, `random_ua()` — рандомизация User-Agent через `fake-useragent` (только Chromium-семейство, фоллбек на статичный пул) |
+| `fetch.py` | `fetch_html` — curl с `--fail`, 3 ретрая, на каждый ретрай новый UA; `content_fingerprint` — sha256 распарсенного содержимого (иммунитет к волатильным таймстемпам `.xls`-ссылок портала) |
+| `parse.py` | HTML → структура `{days, weeks}`; восстанавливает rowspan/colspan, `<tbody>` и вложенный первый `<tr>` реального портала |
+| `schedule_logic.py` | Верхняя/нижняя неделя, диапазоны, даты проведения и отмены, «с октября», переход учебного года; view на день/неделю/следующие пары |
+| `monitor.py` | **Мониторинг**: `--interval 30 --jitter 3` — цикл 30 ± 3 мин; атомарное состояние, повтор доставки, rich-пост и HTML-фоллбек |
+| `format.py` | Билдеры rich-сообщений (Bot API 10.2): дашборд-закреп, дифф изменений `build_changes_rich_message`, текстовые фоллбеки |
+| `post.py` | Оркестратор постинга: скриншот + caption, stub-сообщения, обновление закрепа |
+| `screenshot.py` | Headless chromium: PNG таблицы, нарезка по дням |
+| `api.py` | JSON-фасад: `/v1/timetables/...`, `/v1/groups`, `/v1/institutes` |
+| `telegram_api.py` | Транспорт Bot API: `sendRichMessage` / `editMessageText`, multipart с файлами |
+
+## Мониторинг изменений (главное)
+
+```bash
+python3 monitor.py --interval 30 --jitter 3 --update-post <MESSAGE_ID>
+```
+
+- Проверка каждые **30 ± 3 минуты** по времени старта циклов, круглосуточно.
+- Сравнение по **отпечатку содержимого** (`content_fingerprint`), а не сырому HTML — смена таймстемпов на `.xls`-ссылках портала не даёт ложных «обновилось».
+- При реальном изменении в канал уходит rich-пост:
+  - **➕ Добавлено** — таблица: день, время, предмет, ауд., преподаватель
+  - **➖ Убрано** — такая же таблица
+  - **✏️ Изменено** — по каждой паре: `ауд.: 203 → 415`, смена препода, примечания
+  - Переходы заглушка↔расписание: «📅 Расписание опубликовано» / «⚠️ Расписание пропало»
+- Если `sendRichMessage` недоступен — фоллбек на обычный HTML `sendMessage` (≤4096).
+- **Личка** используется только для технических алертов (3 подряд неудачных цикла фетча, отказ постинга) — никакого содержимого расписания.
+- Ошибка сети ≠ изменение: состояние не перезаписывается, канал молчит.
+
+Состояние: атомарный `state/monitor_state.json`; `last.json` и `last_parsed.json` сохраняются для совместимости. Неотправленный дифф остаётся в `pending_notification.json` и повторяется.
+
+Другие режимы: `python3 monitor.py` — один прогон; `--schedule` — раз в день в 09:00 MSK.
+
+## Анти-блокировка портала
+
+Портал novsu.ru режет «неполные» UA (python-requests и т.п.), поэтому:
+- фетч только через curl с полным браузерным UA;
+- UA рандомизируется на каждый запрос (`fake-useragent`, фильтр Chrome/Edge ≥120); если пакет недоступен — статичный пул из реальных Chrome/Edge UA;
+- при ретрае берётся другой UA;
+- интервал проверок джиттерится.
+
+## Systemd-Монитор
+
+В Репозитории Есть Готовый Unit `deploy/novsu-timetable-monitor.service`. Установщик Только Копирует И Включает Unit, Но Намеренно Не Запускает Его До Проверки `.env`:
+
+```bash
+sudo ./deploy/install-monitor-service.sh
+sudo systemctl start novsu-timetable-monitor.service
+sudo systemctl status novsu-timetable-monitor.service
+```
+
+Сервис Запускает `monitor.py --interval 30 --jitter 3`, Перезапускается После Сбоя И Имеет Доступ На Запись Только К Каталогу `state/`.
 
 ## API
 
 ```text
 GET /health
-GET /v1/timetables/5234
+GET /v1/institutes
+GET /v1/groups?q=6381
+GET /v1/timetables/6381
+GET /v1/timetables/6381/day?date=tomorrow
+GET /v1/timetables/6381/week?week=2
+GET /v1/timetables/6381/next?date=2026-09-07&time=09:30&limit=3
 ```
 
-The API fetches the official portal page, parses the timetable, validates that no lesson rows disappeared, persists the raw snapshot and normalized lessons in SQLite, and returns JSON. On upstream or parser invariant failure it returns `502` instead of publishing partial data.
+Успешный ответ: `schema_version`, `group`, `source_url`, `snapshot_id`, `fetched_at`, `schedule.days`. Ошибки: `404` (роут/группа), `502` `{"error":"upstream_or_parse_failure"}` при падении фетча/парса/валидации. Снапшоты и нормализованные пары пишутся в `state/timetable.sqlite3` (`db/schema.sql`). Сервис без аутентификации — держать на loopback/приватной сети.
 
-## Run
+## Запуск
+
+```bash
+pip install -r requirements.txt      # beautifulsoup4, pillow, fake-useragent
+python3 -m pytest -q                 # тесты
+python3 api.py --once                # разовый JSON группы 6381
+python3 api.py --host 127.0.0.1 --port 8787
+python3 monitor.py --interval 30 --jitter 3  # мониторинг + уведомления в канал
+python3 post.py --force              # пост расписания со скрином
+```
+
+`.env` (в репо не лежит):
+
+```
+TG_BOT_TOKEN=...
+TG_CHANNEL_ID=-100...
+TG_DM_TARGET=...
+```
+
+Дефолтная группа **6381** (`inst_id=2244947`, `type=ДО`, `year=2026`). Резолвер ищет любую группу по индексу портала; `6381` всегда первая и используется для `default`/`me`/пустой группы.
+
+## Данные и парсер
+
+- `data/annotations.json` — версионированный словарь сокращений (ДОТ, лек., пр., лаб., ауд., подгр.) и правила пометок.
+- Общий DOM-обход восстанавливает реальный вложенный первый `<tr>`, обычные `<tbody>/<thead>`, `rowspan` и `colspan`; новый day-разделитель перекрывает протухший `rowspan`.
+- Колонки определяются по нормализованным заголовкам, а `под гр.` и `комм.` допускаются как необязательные.
+- Валидация: число распарсенных пар обязано совпасть с числом физических строк-пар в HTML, иначе `502` (никаких частичных данных).
+
+## Тесты
 
 ```bash
 python3 -m pytest -q
-python3 api.py --once
-python3 api.py --host 127.0.0.1 --port 8787
 ```
 
-The source URL is configured in `api.py` and points to group 5234, education type `ДО`, institute `868344`, year `2025`.
-
-## Data model
-
-`data/annotations.json` is the versioned glossary/rule source. `db/schema.sql` stores raw snapshots, normalized lessons, and interpretation metadata. Raw room/comment values are retained; `room`, `location`, `delivery_mode`, and `link` are derived separately.
-
-The parser treats NovSU day separator rows as authoritative because the portal currently emits stale day `rowspan` values. Lesson time `rowspan` is inherited only when the source explicitly indicates it.
-
-## Response and failure contract
-
-A successful timetable response has `schema_version`, `group`, `source_url`, `snapshot_id`, `fetched_at`, and `schedule.days`. Each lesson preserves `source_row`, `time`, `subject`, `teacher`, `room`, and structured location/mode/link/comment fields. `schema_version` changes when this response shape changes incompatibly.
-
-The service returns `404` for unknown routes or groups and `502` with `{"error":"upstream_or_parse_failure"}` when fetching, parsing, validation, or persistence fails. Internal exception details are logged server-side and are not returned to clients. `/health` is a liveness check only; it does not verify upstream availability.
-
-Each timetable request performs a live portal fetch and may write a deduplicated raw HTML snapshot and normalized lessons to `state/timetable.sqlite3`. Treat the service as unauthenticated and bind it to loopback or a protected private network; do not expose it directly to the public internet. Configure filesystem permissions and a retention policy for snapshots.
+Покрыто: парсер (rowspan, заглушки, структурирование комментариев), дата-логика (верх/низ, «с …», «только …»), fetch (ротация UA, `--fail`, ретраи, стабильность отпечатка), monitor (дифф add/remove/change, stub-переходы, тишина при сетевых ошибках и волатильных таймстемпах, фоллбек постинга), rich-форматирование (структура блоков, лимиты 4096/1024, экранирование HTML).

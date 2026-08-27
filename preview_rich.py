@@ -84,7 +84,7 @@ DAYS_ORDER = ["Понедельник", "Вторник", "Среда", "Чет�
 SOURCE_URL = os.environ.get(
     "GROUP_URL",
     "https://portal.novsu.ru/univer/timetable/ochn/i.1103357/"
-    "?page=EditViewGroup&name=6381&type=%D0%92%D0%9E&year=2026&instId=1786977",
+    "?page=EditViewGroup&name=6381&type=%D0%94%D0%9E&year=2026&instId=2244947",
 )
 
 
