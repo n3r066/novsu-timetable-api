@@ -57,6 +57,34 @@ def test_diff_detects_changed_room_and_teacher():
     assert labels == {"ауд.", "преподаватель"}
 
 
+def test_diff_enriches_short_teacher_names():
+    """Bare last names in the changed/added/removed sections are enriched
+    to full FIO when a matching full name exists in the schedules."""
+    old = _schedule()
+    new = _copy(old)
+    day = list(new["days"])[0]
+    # Change teacher to a bare last name that exists as a full name in old.
+    new["days"][day][0]["teacher"] = "Петров"
+    new["days"][day][0]["room"] = "999"
+    diff = monitor.diff_schedules(old, new)
+    assert len(diff["changed"]) == 1
+    fields = {label: (old_v, new_v) for label, old_v, new_v in diff["changed"][0]["fields"]}
+    assert fields["преподаватель"][1] == "Петров П. П."
+
+
+def test_diff_enriches_with_external_lookup():
+    """A teacher_lookup from a persistent cache enriches names not in either schedule."""
+    old = _schedule()
+    new = _copy(old)
+    day = list(new["days"])[0]
+    new["days"][day][0]["teacher"] = "Сидоров"
+    new["days"][day][0]["room"] = "999"
+    lookup = {"Сидоров": "Сидоров Сидор Сидорович"}
+    diff = monitor.diff_schedules(old, new, teacher_lookup=lookup)
+    fields = {label: (old_v, new_v) for label, old_v, new_v in diff["changed"][0]["fields"]}
+    assert fields["преподаватель"][1] == "Сидоров Сидор Сидорович"
+
+
 def test_diff_stub_transitions():
     schedule = _schedule()
     assert monitor.diff_schedules(None, schedule)["transition"] == "published"

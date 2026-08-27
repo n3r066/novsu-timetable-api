@@ -479,9 +479,9 @@ def build_rich_message(
         blocks.append(_divider())
 
     if not rendered_days:
-        blocks.append(_paragraph("ℹ️ На портале пока нет опубликованных занятий на эту неделю."))
+        blocks.append(_paragraph("На портале пока нет опубликованных занятий на эту неделю."))
     if changes_summary:
-        blocks.extend([_divider(), _pullquote(f"⚠️ Что изменилось\n{changes_summary}")])
+        blocks.extend([_divider(), _pullquote(f"Что изменилось\n{changes_summary}")])
 
     # No boilerplate/footer: keep the post focused on the timetable itself.
     return {"rich_message": {"blocks": blocks}}
@@ -491,7 +491,7 @@ def fallback_text(schedule: dict | None, weeks: list[dict], source_url: str, tod
     """Plain text fallback when sendRichMessage is temporarily unavailable."""
     week = find_current_week(weeks, today)
     title = f"Расписание группы 6381 — неделя {week['week']}" if week else "Расписание группы 6381"
-    lines = [f"📅 {title}"]
+    lines = [f"{title}"]
     days = (schedule or {}).get("days") or {}
     for day in DAYS_ORDER:
         if days.get(day):
@@ -605,7 +605,7 @@ def render_schedule_html(
             for subject, condition in notes:
                 parts.append(f"<div class='note'>• {_html.escape(subject)} — {_html.escape(condition)}</div>")
     if not rendered:
-        parts.append("<div class='sub'>ℹ️ На портале пока нет опубликованных занятий.</div>")
+        parts.append("<div class='sub'>На портале пока нет опубликованных занятий.</div>")
     parts.append(f"<div class='foot'>источник · portal.novsu.ru · {_html.escape(source_url)}</div>")
     parts.append("</div></body></html>")
     return "".join(parts)
@@ -769,7 +769,7 @@ def _day_chunks(day: str, pairs: list) -> list[str]:
 
 
 def _changes_summary_chunks(changes_summary: object) -> list[str]:
-    header = "⚠️ Что изменилось\n"
+    header = "Что изменилось\n"
     budget = 4096 - len(header)
     return [header + piece for piece in _split_plain_for_html(changes_summary, budget)]
 
@@ -801,7 +801,7 @@ def format_schedule_post(schedule, weeks, source_url, today=None, changes_summar
     if buf:
         messages.append(buf)
     if not any(days.get(day) for day in DAYS_ORDER):
-        messages.append("ℹ️ На портале пока нет опубликованных занятий на эту неделю.")
+        messages.append("На портале пока нет опубликованных занятий на эту неделю.")
     if changes_summary:
         messages.extend(_changes_summary_chunks(changes_summary))
     if not all(len(message) <= 4096 for message in messages):
@@ -936,7 +936,7 @@ def _changed_section(selected: list[dict], total: int) -> dict:
     omitted = total - len(selected)
     if omitted:
         content.append(_paragraph(f"Показаны первые {len(selected)}. Ещё {omitted} не поместились в лимит сообщения."))
-    return _details_open(f"✏️ Изменено — {total}", *content)
+    return _details_open(f"Изменено — {total}", *content)
 
 
 def build_changes_rich_message(
@@ -966,12 +966,12 @@ def build_changes_rich_message(
 
     title_lines = [f"Обновление расписания {_truncate_rich_text(group_name, 80)}"]
     if transition == "published":
-        title_lines.append("📅 Расписание опубликовано на портале")
+        title_lines.append("Расписание опубликовано на портале")
     elif transition == "vanished":
-        title_lines.append("⚠️ Расписание пропало с портала (заглушка)")
+        title_lines.append("Расписание пропало с портала (заглушка)")
     elif total:
         title_lines.append(f"{total} {_changes_word(total)}")
-    title_lines.append(now.strftime("%d.%m.%Y %H:%M MSK"))
+    title_lines.append(now.strftime("%d.%m.%Y %H:%M МСК"))
     if week:
         half = WEEK_HALF_NAME.get(week.get("half"), week.get("half", ""))
         title_lines.append(
@@ -989,9 +989,9 @@ def build_changes_rich_message(
     def assemble() -> dict:
         blocks: list[dict] = [_pullquote("\n".join(title_lines))]
         if added:
-            blocks.append(_diff_table_section("➕ Добавлено", added[:limits[0]], len(added)))
+            blocks.append(_diff_table_section("Добавлено", added[:limits[0]], len(added)))
         if removed:
-            blocks.append(_diff_table_section("➖ Убрано", removed[:limits[1]], len(removed)))
+            blocks.append(_diff_table_section("Убрано", removed[:limits[1]], len(removed)))
         if changed:
             blocks.append(_changed_section(changed[:limits[2]], len(changed)))
         if not (added or removed or changed or transition):
@@ -1025,12 +1025,12 @@ def changes_fallback_text(diff: dict, source_url: str, *, group_name: str = "638
     lines = [header]
     transition = diff.get("transition")
     if transition == "published":
-        lines.append("📅 Расписание опубликовано на портале")
+        lines.append("Расписание опубликовано на портале")
     elif transition == "vanished":
-        lines.append("⚠️ Расписание пропало с портала (заглушка)")
+        lines.append("Расписание пропало с портала (заглушка)")
 
     item_lines: list[str] = []
-    for prefix, key in (("➕", "added"), ("➖", "removed")):
+    for prefix, key in (("+", "added"), ("-", "removed")):
         for item in diff.get(key) or []:
             day_value = str(item.get("day") or "—")
             day = DAY_TO_SHORT.get(day_value, day_value)
@@ -1059,7 +1059,7 @@ def changes_fallback_text(diff: dict, source_url: str, *, group_name: str = "638
             field_parts.append(f"… ещё {len(fields) - 4} полей")
         details = "; ".join(field_parts) or "изменение"
         item_lines.append(
-            f"✏️ {_escape_truncated(day, 60)} {_escape_truncated(item.get('time'), 100)} — "
+            f"~ {_escape_truncated(day, 60)} {_escape_truncated(item.get('time'), 100)} — "
             f"{_escape_truncated(subject, 1200)} ({details})"
         )
 

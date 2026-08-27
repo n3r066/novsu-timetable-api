@@ -177,7 +177,7 @@ def post_to_channel(force: bool = False) -> dict:
 
     if stub:
         text = (
-            "ℹ️ <b>Расписание 6381</b>\n"
+            "<b>Расписание 6381</b>\n"
             "На портале пока заглушка — расписание не опубликовано.\n"
             f'<a href="{_html.escape(str(config.GROUP_URL), quote=True)}">открыть на портале</a>'
         )

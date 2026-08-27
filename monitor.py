@@ -118,8 +118,15 @@ def diff_schedules(
     *,
     old_stub: bool | None = None,
     new_stub: bool | None = None,
+    teacher_lookup: dict[str, str] | None = None,
 ) -> dict:
-    """Compare schedules without collapsing simultaneous subgroup lessons."""
+    """Compare schedules without collapsing simultaneous subgroup lessons.
+
+    When *teacher_lookup* is provided (or built from both schedules), bare
+    last names in teacher fields are enriched to full names so that the
+    "Изменено" section shows "Барышева Ангелина Алексеевна → Иванова …"
+    instead of just "Барышева → Иванова".
+    """
     old_groups = _group_lessons(old)
     new_groups = _group_lessons(new)
     added: list[dict] = []
@@ -175,6 +182,29 @@ def diff_schedules(
         old_stub = not any(old_groups.values())
     if new_stub is None:
         new_stub = not any(new_groups.values())
+
+    # Enrich bare last names to full names in teacher fields.
+    lookup = teacher_lookup or _build_teacher_lookup(
+        _collect_teacher_names(old) | _collect_teacher_names(new)
+    )
+    if lookup:
+        for item in added + removed:
+            enriched = _enrich_teacher(str(item.get("teacher") or ""), lookup)
+            if enriched != str(item.get("teacher") or ""):
+                item["teacher"] = enriched
+        for item in changed:
+            new_fields = []
+            for field in (item.get("fields") or []):
+                if not isinstance(field, (list, tuple)) or len(field) != 3:
+                    new_fields.append(field)
+                    continue
+                label, old_val, new_val = field
+                if label == "преподаватель":
+                    old_val = _enrich_teacher(old_val, lookup)
+                    new_val = _enrich_teacher(new_val, lookup)
+                new_fields.append([label, old_val, new_val])
+            item["fields"] = new_fields
+
     transition = "published" if old_stub and not new_stub else "vanished" if not old_stub and new_stub else None
     return {
         "added": sorted(added, key=sort_key),
@@ -260,6 +290,54 @@ def _unlink(path: Path) -> None:
         pass
 
 
+def _collect_teacher_names(schedule: dict | None) -> set[str]:
+    """Extract all non-empty teacher names from a schedule."""
+    names: set[str] = set()
+    for lessons in ((schedule or {}).get("days") or {}).values():
+        for lesson in lessons:
+            teacher = str(lesson.get("teacher") or "").strip()
+            if teacher and teacher != "—":
+                names.add(teacher)
+    return names
+
+
+def _build_teacher_lookup(names: set[str]) -> dict[str, str]:
+    """Map last name → full name when the mapping is unambiguous.
+
+    A name is considered full when it has at least two words. The last name
+    is the first word. If two different full names share the same last name,
+    the mapping is skipped to avoid guessing.
+    """
+    by_last: dict[str, set[str]] = defaultdict(set)
+    for name in names:
+        parts = name.split()
+        if len(parts) >= 2:
+            by_last[parts[0]].add(name)
+    return {last: fulls.pop() for last, fulls in by_last.items() if len(fulls) == 1}
+
+
+def _enrich_teacher(name: str, lookup: dict[str, str]) -> str:
+    """Replace a bare last name with the full name when the lookup is sure."""
+    name = str(name or "").strip()
+    if not name or name == "—":
+        return name
+    if " " in name:
+        return name  # already has first/middle name or initials
+    return lookup.get(name, name)
+
+
+def _load_teacher_cache() -> dict[str, str]:
+    try:
+        data = _read_json(config.STATE_DIR / "teacher_names.json")
+        return {str(k): str(v) for k, v in data.items()} if isinstance(data, dict) else {}
+    except (FileNotFoundError, OSError):
+        return {}
+
+
+def _save_teacher_cache(lookup: dict[str, str]) -> None:
+    _write_json_atomic(config.STATE_DIR / "teacher_names.json", lookup)
+
+
 def _lesson_count(schedule: dict | None) -> int:
     return sum(len(rows) for rows in ((schedule or {}).get("days") or {}).values())
 
@@ -290,7 +368,7 @@ def _try_dashboard(update_post_id: int | None, post_date: dt.date | None, html: 
         _unlink(pending_file)
         return True
     _write_json_atomic(pending_file, {"fingerprint": fingerprint, "message_id": update_post_id, "last_error": result})
-    _dm(f"⚠️ edit_dashboard_post failed: <code>{_escape_code(json.dumps(result, ensure_ascii=False))}</code>")
+    _dm(f"edit_dashboard_post failed: <code>{_escape_code(json.dumps(result, ensure_ascii=False))}</code>")
     return False
 
 
@@ -351,12 +429,22 @@ def _run_once_locked(update_post_id: int | None = None, post_date: dt.date | Non
             return {"changed": False, "pending_confirmation": True, "fingerprint": new_fp, "stub": stub, "posted": None, **event}
     _unlink(candidate_file)
 
+    # Build a teacher name lookup from the current and cached schedules so
+    # that bare last names in the "Изменено" section are enriched to full FIO.
+    teacher_cache = _load_teacher_cache()
+    all_names = _collect_teacher_names(old_data.get("schedule")) | _collect_teacher_names(data.get("schedule"))
+    lookup = {**_build_teacher_lookup(all_names), **teacher_cache}
     diff = diff_schedules(
         old_data.get("schedule"),
         data.get("schedule"),
         old_stub=old_data.get("stub"),
         new_stub=stub,
+        teacher_lookup=lookup,
     )
+    # Persist any new full names for future enrichment.
+    new_cache = {**teacher_cache, **_build_teacher_lookup(all_names)}
+    if new_cache != teacher_cache:
+        _save_teacher_cache(new_cache)
     _write_json_atomic(pending_file, {"event": event, "diff": diff})
     try:
         post_result = _post_changes_to_channel(diff, data.get("weeks", []))
@@ -364,7 +452,7 @@ def _run_once_locked(update_post_id: int | None = None, post_date: dt.date | Non
         post_result = {"ok": False, "error": str(exc)}
     post_ok = bool(post_result.get("ok"))
     if not post_ok:
-        _dm(f"⚠️ пост диффа в канал не прошёл: <code>{_escape_code(json.dumps(post_result, ensure_ascii=False))}</code>")
+        _dm(f"пост диффа в канал не прошёл: <code>{_escape_code(json.dumps(post_result, ensure_ascii=False))}</code>")
         print(f"[delivery pending] fingerprint={new_fp}")
         return {"changed": True, "fingerprint": new_fp, "stub": stub, "posted": False, "delivery_pending": True, **event}
 
@@ -399,7 +487,7 @@ def schedule_daily(hour: int = 9, minute: int = 0, update_post_id: int | None = 
             run_once(update_post_id=update_post_id, post_date=post_date)
         except Exception as e:  # noqa: BLE001
             print(f"[run ERR] {e}", file=sys.stderr)
-            _dm(f"⚠️ monitor.run_once failed: <code>{_escape_code(e)}</code>")
+            _dm(f"monitor.run_once failed: <code>{_escape_code(e)}</code>")
 
 
 def run_interval(
@@ -428,7 +516,7 @@ def run_interval(
             print(f"[run ERR {consecutive_failures}] {e}", file=sys.stderr)
             if consecutive_failures >= FAIL_ALERT_THRESHOLD and not alerted:
                 _dm(
-                    f"⚠️ monitor: {consecutive_failures} подряд неудачных циклов\n"
+                    f"monitor: {consecutive_failures} подряд неудачных циклов\n"
                     f"последняя ошибка: <code>{_escape_code(e, 400)}</code>"
                 )
                 alerted = True
