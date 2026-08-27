@@ -296,6 +296,7 @@ def build_dashboard_rich_message(
     group_name: str = "6381",
     screenshot_media: str | list[str] | list[dict] | None = None,
     current_date: dt.date | None = None,
+    last_updated: str = "",
 ) -> dict:
     """Build pinned dashboard: diary + current week, date-aware."""
     target_week = find_schedule_week(weeks, target_date)
@@ -309,22 +310,18 @@ def build_dashboard_rich_message(
             f"Неделя {target_week['week']} ({half})\n"
             f"{target_week['start']} — {target_week['end']}"
         )
+        if last_updated:
+            title += f"\n\nПоследние изменения: {last_updated}"
     else:
         title = f"Расписание группы {group_name}\n\nФокус: {target_date.strftime('%d.%m.%Y')}"
+        if last_updated:
+            title += f"\n\nПоследние изменения: {last_updated}"
 
     today = day_view(schedule, weeks, target_date, group=group_name, source_url=source_url)
     tomorrow = day_view(schedule, weeks, target_date + dt.timedelta(days=1), group=group_name, source_url=source_url)
     current_date = current_date or dt.date.today()
 
-    blocks: list[dict] = [
-        _pullquote(title),
-        _details(
-            f"Дневник: {target_date.strftime('%d.%m')} и {(target_date + dt.timedelta(days=1)).strftime('%d.%m')}",
-            _day_blocks(today),
-            _day_blocks(tomorrow),
-        ),
-        _divider(),
-    ]
+    blocks: list[dict] = [_pullquote(title)]
 
     if target_week:
         week = week_view(schedule, weeks, target_week, group=group_name, source_url=source_url)
@@ -352,6 +349,14 @@ def build_dashboard_rich_message(
         blocks.append(_details(_week_summary(target_week["start"], target_week["end"]), *week_blocks))
         blocks.append(_divider())
 
+    blocks.append(
+        _details(
+            f"Дневник: {target_date.strftime('%d.%m')} и {(target_date + dt.timedelta(days=1)).strftime('%d.%m')}",
+            _day_blocks(today),
+            _day_blocks(tomorrow),
+        )
+    )
+    blocks.append(_divider())
     blocks.append(_reading_help(source_url))
     return {"rich_message": {"blocks": blocks}}
 

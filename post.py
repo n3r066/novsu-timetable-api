@@ -302,6 +302,25 @@ def edit_dashboard_post(message_id: int, target_date: dt.date, html: str | None 
             {"label": item["label"], "media": f"attach://site_screenshot_{index}"}
             for index, item in enumerate(shot_items, 1)
         ]
+        # Читаем дату последнего изменения из monitor_state.json
+        monitor_state_path = config.STATE_DIR / "monitor_state.json"
+        last_updated = ""
+        if monitor_state_path.exists():
+            try:
+                monitor_data = json.loads(monitor_state_path.read_text(encoding="utf-8"))
+                event = monitor_data.get("event", {})
+                ts = event.get("ts", "")
+                if ts:
+                    # Формат: 2026-08-27T15:45:25+00:00 -> 27.08.2026 15:45
+                    try:
+                        dt_obj = dt.datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                        dt_obj = dt_obj.astimezone(zoneinfo.ZoneInfo("Europe/Moscow"))
+                        last_updated = dt_obj.strftime("%d.%m.%Y %H:%M")
+                    except ValueError:
+                        pass
+            except Exception:
+                pass
+
         rich = build_dashboard_rich_message(
             data.get("schedule"),
             data.get("weeks", []),
@@ -310,6 +329,7 @@ def edit_dashboard_post(message_id: int, target_date: dt.date, html: str | None 
             group_name="6381",
             screenshot_media=screenshot_media,
             current_date=dt.datetime.now(zoneinfo.ZoneInfo("Europe/Moscow")).date(),
+            last_updated=last_updated,
         )
         files = {f"site_screenshot_{index}": item["path"] for index, item in enumerate(shot_items, 1)}
         return edit_rich_message(

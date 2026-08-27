@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 import datetime as dt
 
@@ -328,3 +329,50 @@ def test_changes_fallback_handles_one_huge_entity_heavy_line_atomically():
     assert text.count("<a ") == text.count("</a>") == 1
     assert not __import__("re").search(r"&(?:#(?:x[0-9A-Fa-f]*)?|[A-Za-z]*)$", text)
     assert "<script>" not in text
+
+
+def test_dashboard_last_updated_in_title():
+    data = _load()
+    weeks = [{"week": 1, "half": "top", "start": "01.09.2026", "end": "05.09.2026"}]
+    rm = build_dashboard_rich_message(
+        data["schedule"], weeks, "https://example.test", dt.date(2026, 9, 2),
+        last_updated="27.08.2026 18:45",
+    )
+    import json
+    blob = json.dumps(rm, ensure_ascii=False)
+    assert "Последние изменения: 27.08.2026 18:45" in blob
+
+
+def test_dashboard_no_last_updated_when_empty():
+    data = _load()
+    weeks = [{"week": 1, "half": "top", "start": "01.09.2026", "end": "05.09.2026"}]
+    rm = build_dashboard_rich_message(
+        data["schedule"], weeks, "https://example.test", dt.date(2026, 9, 2),
+    )
+    import json
+    blob = json.dumps(rm, ensure_ascii=False)
+    assert "Последние изменения" not in blob
+
+
+def test_dashboard_week_before_diary():
+    data = _load()
+    weeks = [{"week": 1, "half": "top", "start": "01.09.2026", "end": "05.09.2026"}]
+    rm = build_dashboard_rich_message(
+        data["schedule"], weeks, "https://example.test", dt.date(2026, 9, 2),
+    )
+    blocks = rm["rich_message"]["blocks"]
+    # block 0 = pullquote (title)
+    # block 1 = details (week) — must come BEFORE diary
+    # block 3 = details (diary)
+    assert blocks[0]["type"] == "pullquote"
+    assert blocks[1]["type"] == "details"
+    assert "Дневник" not in json.dumps(blocks[1], ensure_ascii=False)
+    assert "Полное расписание" in json.dumps(blocks[1], ensure_ascii=False)
+    diary_found = False
+    for b in blocks[2:]:
+        if b.get("type") == "details":
+            blob = json.dumps(b, ensure_ascii=False)
+            if "Дневник" in blob:
+                diary_found = True
+                break
+    assert diary_found
