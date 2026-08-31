@@ -212,6 +212,15 @@ def post_to_channel(force: bool = False) -> dict:
             )
             today_msk = dt.datetime.now(zoneinfo.ZoneInfo("Europe/Moscow")).date()
             shot = config.STATE_DIR / f"6381_schedule_{today_msk.isoformat()}.png"
+            # Старые скрины заменяются новым, а не копятся на диске.
+            for stale in (
+                *config.STATE_DIR.glob("6381_schedule_*.png"),
+                *config.STATE_DIR.glob("6381_schedule_*.html"),
+            ):
+                try:
+                    stale.unlink()
+                except OSError:
+                    pass
             screenshot_html(rendered, shot)
             result = _tg_api(
                 "sendPhoto",
@@ -323,9 +332,9 @@ def _dashboard_screens(html: str, fingerprint: str, target_date: dt.date) -> lis
     if cached and all(Path(item.get("path", "")).exists() for item in cached):
         return cached
 
-    # Расписание поменялось — пересоздаём скрины. Чистим старые части рендера,
-    # чтобы не копить мусор между версиями расписания.
-    for stale in shot_dir.glob("6381_site_*_part*.png"):
+    # Расписание поменялось — пересоздаём скрины. Чистим старые части рендера
+    # (и их html-исходники), чтобы не копить мусор между версиями расписания.
+    for stale in (*shot_dir.glob("6381_site_*_part*.png"), *shot_dir.glob("6381_site_*_part*.html")):
         try:
             stale.unlink()
         except OSError:
