@@ -6,7 +6,7 @@ import json
 import re
 from pathlib import Path
 from bs4 import BeautifulSoup
-from portal_parser import expand_table, find_schedule_table, schedule_header, text
+from portal_parser import day_token as canonical_day, expand_table, find_schedule_table, schedule_header, text
 
 DAY_FULL = {
     "Пн": "Понедельник", "Вт": "Вторник", "Ср": "Среда",
@@ -24,7 +24,7 @@ def parse_calendar(html: str) -> list[dict]:
         cells = [_text(cell) for cell in tr.find_all(["td", "th"], recursive=False)]
         if len(cells) != 4 or not cells[0].isdigit() or not cells[2].isdigit():
             continue
-        dates = [re.fullmatch(r"(\d{2}\.\d{2}\.\d{4})\s*-\s*(\d{2}\.\d{2}\.\d{4})", cells[i]) for i in (1, 3)]
+        dates = [re.fullmatch(r"(\d{2}\.\d{2}\.\d{4})\s*[-–—]\s*(\d{2}\.\d{2}\.\d{4})", cells[i]) for i in (1, 3)]
         if not all(dates):
             continue
         for number_index, date_match, half in ((0, dates[0], "top"), (2, dates[1], "bottom")):
@@ -94,16 +94,17 @@ def parse_schedule(html: str) -> dict | None:
     for source_row, row in enumerate(grid[header_index + 1:], header_index + 1):
         if any(cell.strip() for cell in row[header_width:]):
             raise ValueError(f"unrecognized schedule row shape at source row {source_row}")
-        day_token = value(row, "дата")
-        if day_token in DAY_FULL:
-            current_day = DAY_FULL[day_token]
+        date_value = value(row, "дата")
+        day_abbr = canonical_day(date_value) or (date_value if date_value in DAY_FULL else None)
+        if day_abbr is not None:
+            current_day = DAY_FULL[day_abbr]
             days.setdefault(current_day, [])
             non_date = [
                 cell.strip()
                 for column, cell in enumerate(row[:header_width])
                 if column != columns["дата"]
             ]
-            if all(not cell or cell == day_token for cell in non_date):
+            if all(not cell or cell == date_value or canonical_day(cell) == day_abbr for cell in non_date):
                 continue
         if current_day is None:
             continue

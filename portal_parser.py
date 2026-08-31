@@ -10,6 +10,13 @@ from bs4 import BeautifulSoup
 
 
 DAY_ABBRS = {"Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"}
+_DAY_CANONICAL = {"пн": "Пн", "вт": "Вт", "ср": "Ср", "чт": "Чт", "пт": "Пт", "сб": "Сб", "вс": "Вс"}
+
+
+def day_token(value: object) -> str | None:
+    """Каноническая аббревиатура дня из вариантов разделителя ('пн', 'Пн.', 'ПН ')."""
+    token = re.sub(r"\s+", "", str(value or "")).casefold().strip(".")
+    return _DAY_CANONICAL.get(token)
 SCHEDULE_TABLE_HEADERS = {"дата", "время", "предмет", "преподаватель", "ауд."}
 SCHEDULE_OPTIONAL_HEADERS = {"под гр.", "комм."}
 CONTENT_ID = "npe_instance_1103357_npe_content"
@@ -30,6 +37,14 @@ _HEADER_ALIASES = {
     "комм": "комм.",
     "комментарий": "комм.",
     "примечание": "комм.",
+    "примечания": "комм.",
+    "комментарии": "комм.",
+    "преподаватели": "преподаватель",
+    "предметы": "предмет",
+    "аудитории": "ауд.",
+    "подгруппы": "под гр.",
+    "день недели": "дата",
+    "время занятий": "время",
 }
 
 
@@ -81,13 +96,14 @@ def expand_table(table) -> list[list[str]]:
     for tr in iter_table_rows(table):
         cells = tr.find_all(["td", "th"], recursive=False)
         first_value = text(cells[0]) if cells else ""
-        starts_day = first_value in DAY_ABBRS
+        starts_day_abbr = day_token(first_value)
+        starts_day = starts_day_abbr is not None
         if starts_day:
             # A new day is an authoritative boundary. The live portal can leave
             # stale rowspans not only in the date column, but also in time,
             # teacher and room columns.
             active.clear()
-            current_day = first_value
+            current_day = starts_day_abbr
 
         row: dict[int, str] = {}
         next_active: dict[int, tuple[str, int]] = {}
@@ -114,6 +130,8 @@ def expand_table(table) -> list[list[str]]:
             value = text(cell)
             rowspan, colspan = _span(cell.get("rowspan")), _span(cell.get("colspan"))
             if starts_day and cell_index == 0:
+                # Храним день канонически ('Пн'), чтобы 'пн'/'Пн.' не теряли пары.
+                value = starts_day_abbr
                 col = date_column if date_column is not None else 0
                 row.pop(col, None)
                 # A visual day separator can span the whole table; it is still
@@ -315,7 +333,7 @@ def render_schedule_day_chunk_htmls(source_html: str, source_url: str, days_per_
     current: list[str] = []
     for row in rows[1:]:
         cells = [text(cell) for cell in row.find_all(["td", "th"], recursive=False)]
-        is_day_row = len(cells) == 1 and cells[0] in DAY_ABBRS
+        is_day_row = len(cells) == 1 and day_token(cells[0]) is not None
         if is_day_row and current:
             day_groups.append(current)
             current = []
@@ -351,7 +369,7 @@ def _day_label_from_group(group: list[str]) -> str:
     if not first:
         return "День"
     cells = [text(cell) for cell in first.find_all(["td", "th"], recursive=False)]
-    return cells[0] if cells and cells[0] in DAY_ABBRS else "День"
+    return (day_token(cells[0]) if cells else None) or "День"
 
 
 def wrap_schedule_html(content_html: str, source_url: str) -> str:

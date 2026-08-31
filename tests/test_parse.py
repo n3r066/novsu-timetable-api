@@ -131,3 +131,58 @@ def test_real_antovo_comment_does_not_treat_cancelled_date_as_address():
     html = """<table><tr><th>дата</th><th>время</th><th>под гр.</th><th>предмет</th><th>преподаватель</th><th>ауд.</th><th>комм.</th></tr>
     <tr><td rowspan="2">Пн</td></tr><tr><td>09:00</td><td></td><td>Физкультура</td><td>Иванов</td><td>зал</td><td>ИГУМ, Антоново, 24.09.; 22.10.; 17.12. занятий не будет</td></tr></table>"""
     assert parse_schedule(html)["days"]["Понедельник"][0]["location"] == "ИГУМ, Антоново"
+
+
+SCHEDULE_HEAD = "<tr><th>дата</th><th>время</th><th>предмет</th><th>преподаватель</th><th>ауд.</th><th>комм.</th></tr>"
+
+
+def _day_variant_html(day_cell: str) -> str:
+    return (
+        f"<table>{SCHEDULE_HEAD}"
+        f"<tr><td>{day_cell}</td></tr>"
+        "<tr><td>9:00</td><td>А</td><td>Иванов</td><td>203</td><td></td></tr>"
+        "<tr><td>10:00</td><td>Б</td><td>Петров</td><td>204</td><td>ДОТ</td></tr>"
+        "</table>"
+    )
+
+
+def test_day_separator_case_dot_and_space_variants_keep_lessons():
+    for day_cell in ("Вт", "вт", "Вт.", "ВТ", " Вт "):
+        days = parse_schedule(_day_variant_html(day_cell))["days"]
+        assert "Вторник" in days, day_cell
+        assert [x["subject"] for x in days["Вторник"]] == ["А", "Б\nДОТ"], day_cell
+
+
+def test_day_separator_variants_do_not_change_fingerprint():
+    from fetch import content_fingerprint
+    base = content_fingerprint(_day_variant_html("Вт"))
+    for day_cell in ("вт", "Вт.", "ВТ"):
+        assert content_fingerprint(_day_variant_html(day_cell)) == base, day_cell
+
+
+def test_calendar_accepts_dash_and_em_dash_separators():
+    from parse import parse_calendar
+    for sep in ("-", "–", "—"):
+        html = (
+            "<table><tr><td>1</td><td>01.09.2026 " + sep + " 05.09.2026</td>"
+            "<td>2</td><td>07.09.2026 " + sep + " 12.09.2026</td></tr></table>"
+        )
+        weeks = parse_calendar(html)
+        assert len(weeks) == 2, sep
+        assert weeks[0]["half"] == "top" and weeks[1]["half"] == "bottom"
+
+
+def test_plural_header_aliases_keep_columns_mapped():
+    html = (
+        "<table>"
+        "<tr><th>Дата</th><th>Время занятий</th><th>Предметы</th>"
+        "<th>Преподаватели</th><th>Аудитории</th><th>Комментарии</th></tr>"
+        "<tr><td>Ср.</td></tr>"
+        "<tr><td>11:00</td><td>Экономика</td><td>Сидорова</td><td>415</td><td>Антоново</td></tr>"
+        "</table>"
+    )
+    rows = parse_schedule(html)["days"]["Среда"]
+    assert rows[0]["teacher"] == "Сидорова"
+    assert rows[0]["room"] == "415"
+    assert rows[0]["note"] == "Антоново"
+    assert rows[0]["time"] == "11:00"
