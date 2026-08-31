@@ -133,6 +133,45 @@ def random_ua() -> str:
     return random.choice(_FALLBACK_UA_POOL)
 
 
+# iPhone 11 (iOS 17.6, Safari). Портал отдаёт мобильному UA то же расписание,
+# а стабильная идентичность «живого устройства» выглядит естественнее, чем
+# ротация десктопных Chrome каждые 10 секунд.
+IPHONE_UA = (
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_6 like Mac OS X) AppleWebKit/605.1.15 "
+    "(KHTML, like Gecko) Version/17.6 Mobile/15E148 Safari/604.1"
+)
+
+
+def iphone_headers(ua: str | None = None) -> dict[str, str]:
+    """Реалистичный набор заголовков навигации Safari на iPhone (без Sec-CH-*)."""
+    return {
+        "User-Agent": ua or IPHONE_UA,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "ru-RU,ru;q=0.9",
+        "Cache-Control": "max-age=0",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-User": "?1",
+        "Upgrade-Insecure-Requests": "1",
+    }
+
+
+_PINNED_PROFILE: tuple[str, dict[str, str]] | None = None
+
+
+def pinned_profile() -> tuple[str, dict[str, str]]:
+    """Одна согласованная браузерная идентичность на процесс.
+
+    Настоящий пользователь не меняет UA каждые 10 секунд, поэтому профиль
+    выбирается один раз и переиспользуется во всех попытках и ретраях.
+    """
+    global _PINNED_PROFILE
+    if _PINNED_PROFILE is None:
+        _PINNED_PROFILE = (IPHONE_UA, iphone_headers(IPHONE_UA))
+    return _PINNED_PROFILE
+
+
 def chromium_headers(ua: str | None = None) -> dict[str, str]:
     """Полный единый набор заголовков навигации Chromium."""
     ua = ua or random_ua()

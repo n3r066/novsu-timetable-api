@@ -25,9 +25,9 @@ class PortalResponseError(RuntimeError):
     """HTTP был успешным, но тело не похоже на ожидаемую страницу портала."""
 
 
-def _curl(url: str, ua: str) -> str:
+def _curl(url: str, ua: str, headers: dict[str, str] | None = None) -> str:
     command = ["curl", "-sSL", "--fail", "-A", ua]
-    for name, value in config.chromium_headers(ua).items():
+    for name, value in (headers or config.chromium_headers(ua)).items():
         if name.casefold() != "user-agent":
             command.extend(["-H", f"{name}: {value}"])
     command.extend(["--compressed", url])
@@ -92,17 +92,10 @@ def fetch_html(
     """Загрузить и структурно проверить страницу с ретраями и полными headers."""
     attempts = max(1, int(retries))
     last_exc: Exception | None = None
-    previous_ua: str | None = None
+    ua, headers = config.pinned_profile()
     for attempt in range(1, attempts + 1):
-        ua = config.random_ua()
-        if previous_ua is not None:
-            for _ in range(5):
-                if ua != previous_ua:
-                    break
-                ua = config.random_ua()
-        previous_ua = ua
         try:
-            html = _curl(url, ua)
+            html = _curl(url, ua, headers)
             validate_portal_response(html, page_kind)
             return html
         except Exception as exc:  # noqa: BLE001 - сеть, curl и структура ретраятся одинаково

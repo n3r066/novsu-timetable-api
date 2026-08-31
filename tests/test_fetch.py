@@ -33,15 +33,12 @@ def test_random_ua_is_full_browser_ua():
         assert "Chrome/" in ua or "Edg/" in ua
 
 
-def test_fetch_html_rotates_ua_on_retry(monkeypatch):
-    ua_seq = iter([f"Mozilla/5.0 Chrome/127.0.0.{i}" for i in range(10)])
-    monkeypatch.setattr(config, "random_ua", lambda: next(ua_seq))
+def test_fetch_html_pins_one_ua_across_retries(monkeypatch):
     monkeypatch.setattr(fetch, "RETRY_DELAY_S", 0.0)
     used: list[str] = []
 
     def fake_run(cmd, **kwargs):
-        ua = cmd[cmd.index("-A") + 1]
-        used.append(ua)
+        used.append(cmd[cmd.index("-A") + 1])
         if len(used) == 1:
             raise subprocess.CalledProcessError(22, cmd)
 
@@ -52,10 +49,10 @@ def test_fetch_html_rotates_ua_on_retry(monkeypatch):
     monkeypatch.setattr(fetch.subprocess, "run", fake_run)
     assert fetch.fetch_html("https://example.test") == SCHEDULE_HTML
     assert len(used) == 2
-    assert used[0] != used[1]
+    assert used[0] == used[1] == config.IPHONE_UA
 
 
-def test_fetch_html_uses_fail_and_full_chromium_headers(monkeypatch):
+def test_fetch_html_uses_fail_and_iphone_safari_headers(monkeypatch):
     seen_cmd: list[str] = []
 
     def fake_run(cmd, **kwargs):
@@ -70,10 +67,12 @@ def test_fetch_html_uses_fail_and_full_chromium_headers(monkeypatch):
     joined = " ".join(seen_cmd)
     assert "--fail" in seen_cmd
     for header in (
-        "Accept:", "Accept-Language:", "Sec-CH-UA:", "Sec-Fetch-Dest:",
+        "Accept:", "Accept-Language:", "Sec-Fetch-Dest:",
         "Sec-Fetch-Mode:", "Sec-Fetch-Site:", "Upgrade-Insecure-Requests:",
     ):
         assert header in joined
+    assert "Sec-CH-UA:" not in joined
+    assert config.IPHONE_UA in seen_cmd
 
 
 def test_fetch_html_raises_after_all_retries(monkeypatch):
