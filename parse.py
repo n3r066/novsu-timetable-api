@@ -148,6 +148,27 @@ def parse_schedule(html: str) -> dict | None:
     return {"days": days, "raw": raw}
 
 
+
+
+def extract_teacher_ids(html: str) -> dict[str, str]:
+    """Extract teacher_text → teacherId mapping from schedule HTML links.
+
+    Each teacher cell in the portal contains an <a> link with teacherId=ora_XXXXX.
+    Returns a mapping of the link text (teacher name as shown) to the teacherId.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    table = find_schedule_table(soup)
+    if table is None:
+        return {}
+    mapping: dict[str, str] = {}
+    for a in table.find_all("a", href=True):
+        m = re.search(r"teacherId=((?:ora|ext)_\d+)", a["href"])
+        if m:
+            text = a.get_text(strip=True)
+            if text:
+                mapping[text] = m.group(1)
+    return mapping
+
 def is_stub_page(html: str) -> bool:
     return _find_schedule_table(BeautifulSoup(html, "html.parser")) is None
 

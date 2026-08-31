@@ -1,4 +1,5 @@
 import copy
+from pathlib import Path
 
 import post
 
@@ -138,3 +139,61 @@ def test_photo_caption_is_complete_html_and_bounded():
     assert len(caption) <= 1024
     assert caption.endswith("</blockquote>")
     assert "&amp;" in caption
+
+
+def test_dashboard_screens_cached_by_fingerprint(monkeypatch, tmp_path):
+    """Скрины пересоздаются только при смене fingerprint расписания."""
+    calls = []
+
+    def fake_crops(source_html, source_url, out_png):
+        calls.append(out_png)
+        out_png = Path(out_png)
+        out_png.parent.mkdir(parents=True, exist_ok=True)
+        out_png.write_bytes(b"\x89PNG\r\n\x1a\n" + b"x" * 50)
+        return [{"label": "Пн", "path": str(out_png)}]
+
+    monkeypatch.setattr(post, "screenshot_schedule_day_crop_items", fake_crops)
+    monkeypatch.setattr(post, "build_dashboard_rich_message", lambda *a, **k: {"rich_message": {"blocks": []}})
+    monkeypatch.setattr(post, "edit_rich_message", lambda *a, **k: {"ok": True})
+    monkeypatch.setattr(post, "content_fingerprint", lambda data: "FP-1")
+    monkeypatch.setattr(post, "parse_all", lambda html: {"schedule": {"days": {}}, "weeks": []})
+
+    state = tmp_path / "state"
+    monkeypatch.setattr(post.config, "STATE_DIR", state)
+
+    import datetime as dt
+    day = dt.date(2026, 9, 2)
+    post.edit_dashboard_post(1, day, html="html-A", fingerprint="FP-1")
+    post.edit_dashboard_post(1, day, html="html-B", fingerprint="FP-1")
+    assert len(calls) == 1, f"chromium должен был гоняться 1 раз, а не {len(calls)}"
+
+    post.edit_dashboard_post(1, day, html="html-C", fingerprint="FP-2")
+    assert len(calls) == 2, f"при смене расписания скрины должны пересоздаться (calls={len(calls)})"
+
+
+def test_dashboard_screens_recreated_when_cache_file_missing(monkeypatch, tmp_path):
+    """Если кеш-файл утерян, скрины рендерятся заново даже при том же fingerprint."""
+    calls = []
+
+    def fake_crops(source_html, source_url, out_png):
+        calls.append(out_png)
+        out_png = Path(out_png)
+        out_png.parent.mkdir(parents=True, exist_ok=True)
+        out_png.write_bytes(b"\x89PNG\r\n\x1a\n" + b"x" * 50)
+        return [{"label": "Пн", "path": str(out_png)}]
+
+    monkeypatch.setattr(post, "screenshot_schedule_day_crop_items", fake_crops)
+    monkeypatch.setattr(post, "build_dashboard_rich_message", lambda *a, **k: {"rich_message": {"blocks": []}})
+    monkeypatch.setattr(post, "edit_rich_message", lambda *a, **k: {"ok": True})
+    monkeypatch.setattr(post, "content_fingerprint", lambda data: "FP-1")
+    monkeypatch.setattr(post, "parse_all", lambda html: {"schedule": {"days": {}}, "weeks": []})
+
+    state = tmp_path / "state"
+    monkeypatch.setattr(post.config, "STATE_DIR", state)
+    import datetime as dt
+    day = dt.date(2026, 9, 2)
+    post.edit_dashboard_post(1, day, html="html-A", fingerprint="FP-1")
+    # Удаляем кеш-файл, имитируя утерю состояния.
+    (state / "dashboard_screens.json").unlink()
+    post.edit_dashboard_post(1, day, html="html-B", fingerprint="FP-1")
+    assert len(calls) == 2

@@ -41,7 +41,7 @@ import zoneinfo
 import config  # noqa: E402
 from fetch import content_fingerprint, fetch_html, hash_html, is_stub  # noqa: E402
 from format import build_changes_rich_message, changes_fallback_text  # noqa: E402
-from parse import parse_all  # noqa: E402
+from parse import extract_teacher_ids, parse_all  # noqa: E402
 from portal_parser import count_schedule_lessons  # noqa: E402
 from post import _tg_api, edit_dashboard_post  # noqa: E402
 from telegram_api import send_rich_message  # noqa: E402
@@ -253,7 +253,10 @@ def _state_lock():
     config.STATE_DIR.mkdir(parents=True, exist_ok=True)
     lock_path = config.STATE_DIR / ".monitor.lock"
     with lock_path.open("a+") as handle:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise RuntimeError("another monitor cycle is running; lock busy") from None
         try:
             yield
         finally:
@@ -338,6 +341,15 @@ def _save_teacher_cache(lookup: dict[str, str]) -> None:
     _write_json_atomic(config.STATE_DIR / "teacher_names.json", lookup)
 
 
+def _load_teacher_id_cache() -> dict[str, str]:
+    """Load teacherId → full_name cache (from portal teacher directory)."""
+    try:
+        data = _read_json(config.STATE_DIR / "teacher_ids.json")
+        return {str(k): str(v) for k, v in data.items()} if isinstance(data, dict) else {}
+    except (FileNotFoundError, OSError):
+        return {}
+
+
 def _lesson_count(schedule: dict | None) -> int:
     return sum(len(rows) for rows in ((schedule or {}).get("days") or {}).values())
 
@@ -361,14 +373,18 @@ def _try_dashboard(update_post_id: int | None, post_date: dt.date | None, html: 
         return None
     focus_date = post_date or dt.datetime.now(zoneinfo.ZoneInfo("Europe/Moscow")).date()
     try:
-        result = edit_dashboard_post(update_post_id, focus_date, html=html)
+        result = edit_dashboard_post(update_post_id, focus_date, html=html, fingerprint=fingerprint)
     except Exception as exc:  # noqa: BLE001
         result = {"ok": False, "error": str(exc)}
     if result.get("ok"):
         _unlink(pending_file)
         return True
+    previous = _read_json(pending_file)
+    prev_error = previous.get("last_error")
     _write_json_atomic(pending_file, {"fingerprint": fingerprint, "message_id": update_post_id, "last_error": result})
-    _dm(f"edit_dashboard_post failed: <code>{_escape_code(json.dumps(result, ensure_ascii=False))}</code>")
+    # Only DM on first failure or when the error changes.
+    if prev_error != result:
+        _dm(f"edit_dashboard_post failed: <code>{_escape_code(json.dumps(result, ensure_ascii=False))}</code>")
     return False
 
 
@@ -396,6 +412,13 @@ def _run_once_locked(update_post_id: int | None = None, post_date: dt.date | Non
     }
     with changes_log.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(event, ensure_ascii=False) + "\n")
+    # Rotate if the log grows too large.
+    try:
+        if changes_log.stat().st_size > 1_000_000:
+            lines = changes_log.read_text(encoding="utf-8").splitlines()
+            changes_log.write_text("\n".join(lines[-500:]) + "\n", encoding="utf-8")
+    except Exception:  # noqa: BLE001
+        pass
 
     previous_event = baseline.get("event") or {}
     previous_fp = previous_event.get("fingerprint")
@@ -410,6 +433,18 @@ def _run_once_locked(update_post_id: int | None = None, post_date: dt.date | Non
     if not changed:
         _save_baseline(event, data)
         _unlink(candidate_file)
+        # Retry a previously failed diff post if one is pending.
+        pending_notif = _read_json(pending_file)
+        if pending_notif.get("diff") is not None:
+            try:
+                retry_result = _post_changes_to_channel(pending_notif["diff"], data.get("weeks", []))
+            except Exception as exc:  # noqa: BLE001
+                retry_result = {"ok": False, "error": str(exc)}
+            if retry_result.get("ok"):
+                _unlink(pending_file)
+                print(f"[retry pending] diff posted successfully")
+            else:
+                print(f"[retry pending] still failing: {retry_result.get('error', '?')}", file=sys.stderr)
         dashboard_ok = None
         if update_post_id and (config.STATE_DIR / "pending_dashboard.json").exists():
             dashboard_ok = _try_dashboard(update_post_id, post_date, html, new_fp)
@@ -433,7 +468,31 @@ def _run_once_locked(update_post_id: int | None = None, post_date: dt.date | Non
     # that bare last names in the "Изменено" section are enriched to full FIO.
     teacher_cache = _load_teacher_cache()
     all_names = _collect_teacher_names(old_data.get("schedule")) | _collect_teacher_names(data.get("schedule"))
-    lookup = {**_build_teacher_lookup(all_names), **teacher_cache}
+    schedule_lookup = _build_teacher_lookup(all_names)
+    # Detect ambiguous last names across BOTH schedule and cache
+    _by_last: dict[str, set[str]] = defaultdict(set)
+    for _name in all_names:
+        _parts = _name.split()
+        if len(_parts) >= 2:
+            _by_last[_parts[0]].add(_name)
+    for _clast, _cfull in teacher_cache.items():
+        _by_last[_clast].add(_cfull)
+    _ambiguous = {k for k, v in _by_last.items() if len(v) > 1}
+    # Cache entries for ambiguous surnames are unsafe — skip them
+    _safe_cache = {k: v for k, v in teacher_cache.items() if k not in _ambiguous}
+    # Teacher ID-based enrichment: teacher_text → teacherId → full_name
+    # This is unambiguous (no oneфамилец problem) and works for bare last names
+    _id_cache = _load_teacher_id_cache()
+    _id_lookup: dict[str, str] = {}
+    try:
+        _teacher_id_map = extract_teacher_ids(html)
+    except Exception:
+        _teacher_id_map = {}
+    for _ttext, _tid in _teacher_id_map.items():
+        _full = _id_cache.get(_tid)
+        if _full and _ttext != _full:
+            _id_lookup[_ttext] = _full
+    lookup = {**_safe_cache, **schedule_lookup, **_id_lookup}
     diff = diff_schedules(
         old_data.get("schedule"),
         data.get("schedule"),
@@ -442,7 +501,7 @@ def _run_once_locked(update_post_id: int | None = None, post_date: dt.date | Non
         teacher_lookup=lookup,
     )
     # Persist any new full names for future enrichment.
-    new_cache = {**teacher_cache, **_build_teacher_lookup(all_names)}
+    new_cache = {**_build_teacher_lookup(all_names), **teacher_cache}
     if new_cache != teacher_cache:
         _save_teacher_cache(new_cache)
     _write_json_atomic(pending_file, {"event": event, "diff": diff})
@@ -531,7 +590,15 @@ if __name__ == "__main__":
     ap.add_argument("--schedule", action="store_true", help="вечный scheduler раз в день 09:00 MSK")
     ap.add_argument("--interval", type=float, metavar="MINUTES", help="вечный цикл: проверка каждые N минут")
     ap.add_argument("--jitter", type=float, default=3.0, metavar="MINUTES", help="симметричный джиттер ±N минут (по умолчанию 3)")
-    ap.add_argument("--update-post", type=int, metavar="MESSAGE_ID", help="обновлять rich-закреп при изменении расписания")
+    _env_post = os.environ.get("NOVSU_DASHBOARD_POST_ID", "").strip()
+    _default_post = int(_env_post) if _env_post and _env_post not in ("0", "None") else None
+    ap.add_argument(
+        "--update-post",
+        type=int,
+        metavar="MESSAGE_ID",
+        default=_default_post,
+        help="обновлять rich-закреп при изменении расписания (по умолчанию берётся из NOVSU_DASHBOARD_POST_ID)",
+    )
     ap.add_argument("--date", default=None, help="дата фокуса для обновляемого поста, YYYY-MM-DD")
     args = ap.parse_args()
     post_date = dt.datetime.strptime(args.date, "%Y-%m-%d").date() if args.date else None

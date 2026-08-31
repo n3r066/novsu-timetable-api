@@ -23,7 +23,6 @@ import json
 import os
 import sys
 from pathlib import Path
-from tempfile import TemporaryDirectory
 from typing import Any
 import zoneinfo
 
@@ -116,6 +115,23 @@ def _write_last_post(data: dict) -> None:
 def _semantic_fingerprint(data: dict) -> str:
     """Compatibility alias for the single canonical fingerprint implementation."""
     return content_fingerprint(data)
+
+
+def _read_json(path: Path) -> dict:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, ValueError):
+        return {}
+
+
+def _write_json_atomic(path: Path, data: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    with tmp.open("w", encoding="utf-8") as handle:
+        json.dump(data, handle, ensure_ascii=False, indent=2)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(tmp, path)
 
 
 def _photo_caption(source_url: str) -> str:
@@ -289,57 +305,97 @@ def post_changes_alert(changes_summary: str, data: dict | None = None) -> dict:
     return result
 
 
-def edit_dashboard_post(message_id: int, target_date: dt.date, html: str | None = None) -> dict:
+def _dashboard_screens(html: str, fingerprint: str, target_date: dt.date) -> list[dict]:
+    """Вернуть [{label, path}] дневных скринов расписания.
+
+    Скриншоты кешируются по отпечатку расписания в state/dashboard_screens.json:
+    chromium гоняется, только когда расписание реально поменялось (другой
+    fingerprint). При неизменном расписании переиспользуем готовые PNG, чтобы
+    не пересоздавать скрины на каждом обновлении закрепа — смена даты фокуса,
+    ретрай упавшей доставки и т. п. к смене скринов не ведут.
+    """
+    cache_file = config.STATE_DIR / "dashboard_screens.json"
+    shot_dir = config.STATE_DIR / "dashboard_screens"
+    shot_dir.mkdir(parents=True, exist_ok=True)
+
+    cache = _read_json(cache_file)
+    cached = cache.get("items") if cache.get("fingerprint") == fingerprint else None
+    if cached and all(Path(item.get("path", "")).exists() for item in cached):
+        return cached
+
+    # Расписание поменялось — пересоздаём скрины. Чистим старые части рендера,
+    # чтобы не копить мусор между версиями расписания.
+    for stale in shot_dir.glob("6381_site_*_part*.png"):
+        try:
+            stale.unlink()
+        except OSError:
+            pass
+    base = shot_dir / f"6381_site_{target_date.isoformat()}.png"
+    raw = screenshot_schedule_day_crop_items(html, config.GROUP_URL, base)
+    items = [{"label": item["label"], "path": str(item["path"])} for item in raw]
+    _write_json_atomic(cache_file, {"fingerprint": fingerprint, "items": items})
+    return items
+
+
+def edit_dashboard_post(
+    message_id: int,
+    target_date: dt.date,
+    html: str | None = None,
+    fingerprint: str | None = None,
+) -> dict:
     """Обновить закреплённый rich-пост. html — уже скачанная страница
-    (монитор передаёт её, чтобы не фетчить дважды за цикл)."""
+    (монитор передаёт её, чтобы не фетчить дважды за цикл). fingerprint —
+    отпечаток распарсенного расписания (content_fingerprint); если он совпал
+    с прошлым рендером, скриншоты берутся из кеша и chromium не гоняется —
+    скрины обновляются только при реальном изменении расписания."""
     if html is None:
         html = fetch_html()
     data = parse_all(html)
-    with TemporaryDirectory(prefix=".tmp-novsu-tt-", dir=config.STATE_DIR) as tmpdir:
-        shot = Path(tmpdir) / f"6381_site_{target_date.isoformat()}.png"
-        shot_items = screenshot_schedule_day_crop_items(html, config.GROUP_URL, shot)
-        screenshot_media = [
-            {"label": item["label"], "media": f"attach://site_screenshot_{index}"}
-            for index, item in enumerate(shot_items, 1)
-        ]
-        # Читаем дату последнего изменения из monitor_state.json
-        monitor_state_path = config.STATE_DIR / "monitor_state.json"
-        last_updated = ""
-        if monitor_state_path.exists():
-            try:
-                monitor_data = json.loads(monitor_state_path.read_text(encoding="utf-8"))
-                event = monitor_data.get("event", {})
-                ts = event.get("ts", "")
-                if ts:
-                    # Формат: 2026-08-27T15:45:25+00:00 -> 27.08.2026 15:45
-                    try:
-                        dt_obj = dt.datetime.fromisoformat(ts.replace("Z", "+00:00"))
-                        dt_obj = dt_obj.astimezone(zoneinfo.ZoneInfo("Europe/Moscow"))
-                        last_updated = dt_obj.strftime("%d.%m.%Y %H:%M")
-                    except ValueError:
-                        pass
-            except Exception:
-                pass
+    fp = fingerprint or content_fingerprint(data)
 
-        rich = build_dashboard_rich_message(
-            data.get("schedule"),
-            data.get("weeks", []),
-            config.GROUP_URL,
-            target_date,
-            group_name="6381",
-            screenshot_media=screenshot_media,
-            current_date=dt.datetime.now(zoneinfo.ZoneInfo("Europe/Moscow")).date(),
-            last_updated=last_updated,
-        )
-        files = {f"site_screenshot_{index}": item["path"] for index, item in enumerate(shot_items, 1)}
-        return edit_rich_message(
-            rich,
-            token=config.TG_BOT_TOKEN,
-            chat_id=config.TG_CHANNEL_ID,
-            message_id=message_id,
-            files=files,
-            timeout=120,
-        )
+    shot_items = _dashboard_screens(html, fp, target_date)
+    screenshot_media = [
+        {"label": item["label"], "media": f"attach://site_screenshot_{index}"}
+        for index, item in enumerate(shot_items, 1)
+    ]
+    # Читаем дату последнего изменения из monitor_state.json
+    monitor_state_path = config.STATE_DIR / "monitor_state.json"
+    last_updated = ""
+    if monitor_state_path.exists():
+        try:
+            monitor_data = json.loads(monitor_state_path.read_text(encoding="utf-8"))
+            event = monitor_data.get("event", {})
+            ts = event.get("ts", "")
+            if ts:
+                # Формат: 2026-08-27T15:45:25+00:00 -> 27.08.2026 15:45
+                try:
+                    dt_obj = dt.datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                    dt_obj = dt_obj.astimezone(zoneinfo.ZoneInfo("Europe/Moscow"))
+                    last_updated = dt_obj.strftime("%d.%m.%Y %H:%M")
+                except ValueError:
+                    pass
+        except Exception:
+            pass
+
+    rich = build_dashboard_rich_message(
+        data.get("schedule"),
+        data.get("weeks", []),
+        config.GROUP_URL,
+        target_date,
+        group_name="6381",
+        screenshot_media=screenshot_media,
+        current_date=dt.datetime.now(zoneinfo.ZoneInfo("Europe/Moscow")).date(),
+        last_updated=last_updated,
+    )
+    files = {f"site_screenshot_{index}": item["path"] for index, item in enumerate(shot_items, 1)}
+    return edit_rich_message(
+        rich,
+        token=config.TG_BOT_TOKEN,
+        chat_id=config.TG_CHANNEL_ID,
+        message_id=message_id,
+        files=files,
+        timeout=120,
+    )
 
 
 if __name__ == "__main__":

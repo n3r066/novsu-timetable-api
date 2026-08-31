@@ -24,10 +24,11 @@ DAYS_ORDER = [
     "Понедельник", "Вторник", "Среда", "Четверг",
     "Пятница", "Суббота", "Воскресенье",
 ]
+TEACHERS_POST_URL = "https://t.me/c/4256784811/98"
 
 
 def find_current_week(weeks: list[dict], today: dt.date | None = None) -> dict | None:
-    today = today or dt.date.today()
+    today = today or dt.datetime.now(zoneinfo.ZoneInfo("Europe/Moscow")).date()
     for week in weeks:
         try:
             start = dt.datetime.strptime(week["start"], "%d.%m.%Y").date()
@@ -131,10 +132,9 @@ def _pairs_word(count: int) -> str:
     return "пар"
 
 
-def _week_summary(start: str, end: str) -> list[object]:
+def _week_summary() -> list[object]:
     return [
         {"type": "marked", "text": {"type": "bold", "text": "Полное расписание"}},
-        f" · вся неделя: {start} — {end}",
     ]
 
 
@@ -238,22 +238,48 @@ def _lesson_table(lessons: list[dict]) -> dict:
     return _table(body)
 
 
-def _day_blocks(day: dict, *, open_details: bool = False) -> dict:
+def _day_blocks(
+    day: dict,
+    *,
+    open_details: bool = False,
+    screenshot_media: str | None = None,
+    is_today: bool = False,
+    source_url: str = "",
+) -> dict:
     lessons = day.get("lessons") or []
     date = dt.date.fromisoformat(day["date"])
     title = f"{day['day']} — {date.strftime('%d.%m')}: {len(lessons)} {_pairs_word(len(lessons))}"
     blocks: list[dict] = []
     if not lessons:
         blocks.append(_paragraph("Пар нет."))
+        if screenshot_media:
+            blocks.append(_screenshot_block(day["day"], screenshot_media, is_today, source_url))
     else:
         blocks.append(_lesson_table(lessons))
         notes = [(item.get("subject") or "—", item.get("note") or "") for item in lessons if item.get("note")]
-        if notes:
+        note_blocks = [_note(subject, note) for subject, note in notes]
+        if screenshot_media:
+            scr = _screenshot_block(day["day"], screenshot_media, is_today, source_url)
+            if notes:
+                note_blocks.append(scr)
+            else:
+                blocks.append(scr)
+        if note_blocks:
             blocks.append(_details(
                 f"Примечания — {len(notes)} {_notes_word(len(notes))}",
-                *[_note(subject, note) for subject, note in notes],
+                *note_blocks,
             ))
     return (_details_open if open_details else _details)(title, *blocks)
+
+
+def _screenshot_block(day_label: str, media: str, is_today: bool, source_url: str) -> dict:
+    caption = [
+        {"type": "bold", "text": day_label},
+        " · оригинальное ",
+        {"type": "url", "text": "расписание", "url": source_url},
+    ]
+    details = _details_open if is_today else _details
+    return details(f"Скрин: {day_label}", _photo(media, caption))
 
 
 def _reading_help(source_url: str) -> dict:
@@ -278,6 +304,19 @@ def _reading_help(source_url: str) -> dict:
             {"type": "code", "text": "пр."}, " — практическое занятие\n",
             {"type": "code", "text": "лаб."}, " — лабораторная работа   ",
             {"type": "code", "text": "ауд."}, " — аудитория",
+        ]),
+        _divider(),
+        _rich_paragraph([
+            {"type": "marked", "text": {"type": "bold", "text": "Антоново"}},
+            " — учебный корпус в районе Антоново (Институт экономики, ИГУМ).\n",
+            {"type": "marked", "text": {"type": "bold", "text": "Б.С.-Петербургская, 41"}},
+            " — учебный корпус на Большой Санкт-Петербургской, 41.",
+        ]),
+        _divider(),
+        _rich_paragraph([
+            {"type": "bold", "text": "Преподаватели: "},
+            "полный список с предметами — ",
+            {"type": "url", "text": "в отдельном посте", "url": TEACHERS_POST_URL},
         ]),
         _divider(),
         _rich_paragraph([
@@ -325,28 +364,32 @@ def build_dashboard_rich_message(
 
     if target_week:
         week = week_view(schedule, weeks, target_week, group=group_name, source_url=source_url)
-        week_blocks = [_day_blocks(day, open_details=False) for day in week["days"]]
+        day_media: dict[str, str] = {}
         if screenshot_media:
             current_day = None if current_date.weekday() == 6 else DAYS_ORDER[current_date.weekday()]
             if isinstance(screenshot_media, str):
                 media_items = [{"label": "с сайта", "media": screenshot_media}]
             else:
                 media_items = [item if isinstance(item, dict) else {"label": "с сайта", "media": item} for item in screenshot_media]
-            screenshot_blocks = []
             for item in media_items:
                 label = str(item.get("label") or "с сайта")
                 day_label = DAY_SHORT_TO_FULL.get(label, label)
-                caption = [
-                    {"type": "bold", "text": day_label},
-                    " · оригинальное ",
-                    {"type": "url", "text": "расписание", "url": source_url},
-                ]
-                details = _details_open if day_label == current_day else _details
-                screenshot_blocks.append(details(f"Скрин: {day_label}", _photo(item["media"], caption)))
-            week_blocks.append(_details("Скрины · оригинал по дням", *screenshot_blocks))
+                day_media[day_label] = item["media"]
+        else:
+            current_day = None
+        week_blocks = [
+            _day_blocks(
+                day,
+                open_details=False,
+                screenshot_media=day_media.get(day["day"]),
+                is_today=(day["day"] == current_day),
+                source_url=source_url,
+            )
+            for day in week["days"]
+        ]
         if not week_blocks:
             week_blocks = [_paragraph("На эту учебную неделю пары не найдены.")]
-        blocks.append(_details(_week_summary(target_week["start"], target_week["end"]), *week_blocks))
+        blocks.append(_details(_week_summary(), *week_blocks))
         blocks.append(_divider())
 
     blocks.append(
@@ -964,7 +1007,7 @@ def build_changes_rich_message(
     transition = diff.get("transition")
     total = len(added) + len(removed) + len(changed)
 
-    title_lines = [f"Обновление расписания {_truncate_rich_text(group_name, 80)}"]
+    title_lines = ["Поменяли расписание"]
     if transition == "published":
         title_lines.append("Расписание опубликовано на портале")
     elif transition == "vanished":
@@ -1082,6 +1125,108 @@ def changes_fallback_text(diff: dict, source_url: str, *, group_name: str = "638
         # Dynamic pieces above are individually bounded, so only a future
         # change to the fixed copy can reach this contract failure.
         raise ValueError("changes fallback exceeds Telegram's 4096-character limit")
+    return text
+
+
+
+def build_changes_html(
+    diff: dict,
+    weeks: list[dict],
+    source_url: str,
+    *,
+    group_name: str = "6381",
+    now: dt.datetime | None = None,
+) -> str:
+    """Build standard Telegram HTML for the changes post (≤4096 chars).
+
+    Uses <blockquote expandable> for collapsible sections, <pre> for tables,
+    and <i> for highlighted change details — no rich-message format needed.
+    """
+    if now is None:
+        now = dt.datetime.now(_MSK)
+    elif now.tzinfo is not None:
+        now = now.astimezone(_MSK)
+    week = find_current_week(weeks, now.date())
+    added = list(diff.get("added") or [])
+    removed = list(diff.get("removed") or [])
+    changed = list(diff.get("changed") or [])
+    transition = diff.get("transition")
+    total = len(added) + len(removed) + len(changed)
+
+    # --- Title block ---
+    title_lines = ["<b>Поменяли расписание</b>"]
+    if transition == "published":
+        title_lines.append("Расписание опубликовано на портале")
+    elif transition == "vanished":
+        title_lines.append("Расписание пропало с портала (заглушка)")
+    elif total:
+        title_lines.append(f"{total} {_changes_word(total)}")
+    title_lines.append(_html.escape(now.strftime("%d.%m.%Y %H:%M МСК")))
+    if week:
+        half = WEEK_HALF_NAME.get(week.get("half"), week.get("half", ""))
+        title_lines.append(_html.escape(
+            f"Неделя {week['week']} ({half}) · {week['start']} — {week['end']}"
+        ))
+    parts: list[str] = ["<blockquote>" + "\n".join(title_lines) + "</blockquote>"]
+
+    # --- Helper: render a table as <pre> text ---
+    def _diff_table_html(items: list[dict]) -> str:
+        header = "день | время | предмет | ауд. | преподаватель"
+        rows: list[str] = []
+        for item in items:
+            day_value = str(item.get("day") or "—")
+            day = DAY_TO_SHORT.get(day_value, day_value)
+            time_val = str(item.get("time") or "—")
+            subject = str(item.get("subject") or "—").split("\n", 1)[0]
+            room = str(item.get("room") or "—")
+            teacher = str(item.get("teacher") or "—")
+            rows.append(f"{day} | {time_val} | {subject} | {room} | {teacher}")
+        body = _html.escape(header) + "\n" + "\n".join(_html.escape(r) for r in rows)
+        return f"<pre>{body}</pre>"
+
+    # --- Added section ---
+    if added:
+        inner = f"<b>Добавлено — {len(added)}</b>\n\n" + _diff_table_html(added)
+        parts.append(f"<blockquote expandable>{inner}</blockquote>")
+
+    # --- Removed section ---
+    if removed:
+        inner = f"<b>Убрано — {len(removed)}</b>\n\n" + _diff_table_html(removed)
+        parts.append(f"<blockquote expandable>{inner}</blockquote>")
+
+    # --- Changed section ---
+    if changed:
+        blocks: list[str] = [f"<b>Изменено — {len(changed)}</b>"]
+        for item in changed:
+            day_value = str(item.get("day") or "—")
+            day = DAY_TO_SHORT.get(day_value, day_value)
+            time_val = str(item.get("time") or "—")
+            subject = str(item.get("subject") or "—").split("\n", 1)[0]
+            header = f"<b>• {_html.escape(day)} {_html.escape(time_val)} — {_html.escape(subject)}</b>"
+            field_lines: list[str] = []
+            for field in (item.get("fields") or [])[:8]:
+                if not isinstance(field, (list, tuple)) or len(field) != 3:
+                    continue
+                label, old_val, new_val = field
+                field_lines.append(
+                    f"{_html.escape(str(label))}: {_html.escape(str(old_val))} → {_html.escape(str(new_val))}"
+                )
+            if len(item.get("fields") or []) > 8:
+                field_lines.append(f"… ещё {len(item['fields']) - 8} полей")
+            detail = "\n".join(field_lines) or "изменение"
+            blocks.append(header + "\n<i>" + detail + "</i>")
+        parts.append("<blockquote expandable>" + "\n\n".join(blocks) + "</blockquote>")
+
+    if not (added or removed or changed or transition):
+        parts.append("Содержимое страницы изменилось, но состав пар прежний.")
+
+    # --- Source ---
+    escaped_url = _html.escape(str(source_url), quote=True)
+    parts.append(f"—\n<b>Источник:</b> <a href=\"{escaped_url}\">портал НовГУ</a>")
+
+    text = "\n\n".join(parts)
+    if len(text) > 4096:
+        raise ValueError("changes HTML exceeds Telegram's 4096-character limit")
     return text
 
 
