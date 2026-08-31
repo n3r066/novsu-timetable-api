@@ -108,10 +108,11 @@ def test_changes_rich_message_structure():
     blocks = rm["rich_message"]["blocks"]
     assert blocks[0]["type"] == "pullquote"
     blob = json.dumps(rm, ensure_ascii=False)
-    assert "Обновление расписания 6381" in blob
-    assert "➕ Добавлено — 1" in blob
-    assert "➖ Убрано — 1" in blob
-    assert "✏️ Изменено — 1" in blob
+    assert "Поменяли расписание" in blob
+    assert "3 изменения" in blob
+    assert "Добавлено — 1" in blob
+    assert "Убрано — 1" in blob
+    assert "Изменено — 1" in blob
     assert "(лек.) Новый" in blob
     assert "203 → 415" in blob
     assert "портал НовГУ" in blob
@@ -154,7 +155,7 @@ def test_dashboard_rich_message_has_diary_and_week_sections():
     data = _load()
     weeks = [{"week": 1, "half": "top", "start": "01.09.2026", "end": "05.09.2026"}]
     screenshots = [
-        {"label": "Пн", "media": "attach://site_screenshot_1"},
+        {"label": "Вт", "media": "attach://site_screenshot_1"},
         {"label": "Ср", "media": "attach://site_screenshot_2"},
     ]
     rm = build_dashboard_rich_message(data["schedule"], weeks, "https://example.test", dt.date(2026, 9, 2), screenshot_media=screenshots, current_date=dt.date(2026, 8, 24))
@@ -163,13 +164,13 @@ def test_dashboard_rich_message_has_diary_and_week_sections():
     assert "Фокус: 02.09.2026" in blob
     assert "Дневник" in blob
     assert "Полное расписание" in blob
-    assert "вся неделя" in blob
+    assert "Неделя 1 (верхняя)" in blob
     assert "Как читать" in blob
     assert "портал НовГУ" in blob
     assert '"type": "footer"' not in blob
     assert "Среда — 02.09: 0 пар" in blob
-    assert "Скрины · оригинал по дням" in blob
-    assert "Скрин: Понедельник" in blob
+    assert "Скрины · оригинал по дням" not in blob
+    assert "Скрин: Вторник" in blob
     assert "Скрин: Среда" in blob
     assert "Скрин с сайта" not in blob
     assert '"text": "день"' not in blob
@@ -177,7 +178,7 @@ def test_dashboard_rich_message_has_diary_and_week_sections():
     assert '"text": "ниже"' not in blob
     assert "attach://site_screenshot_1" in blob
     assert "attach://site_screenshot_2" in blob
-    assert "Понедельник" in blob
+    assert "Вторник" in blob
     assert "Среда" in blob
     assert "оригинальное" in blob
     assert '"text": "расписание"' in blob
@@ -190,10 +191,10 @@ def test_dashboard_screenshot_section_is_the_only_open_section():
     data = _load()
     weeks = [{"week": 1, "half": "top", "start": "01.09.2026", "end": "05.09.2026"}]
     screenshots = [
-        {"label": "Пн", "media": "attach://site_screenshot_1"},
+        {"label": "Вт", "media": "attach://site_screenshot_1"},
         {"label": "Ср", "media": "attach://site_screenshot_2"},
     ]
-    rm = build_dashboard_rich_message(data["schedule"], weeks, "https://example.test", dt.date(2026, 9, 2), screenshot_media=screenshots, current_date=dt.date(2026, 8, 24))
+    rm = build_dashboard_rich_message(data["schedule"], weeks, "https://example.test", dt.date(2026, 9, 2), screenshot_media=screenshots, current_date=dt.date(2026, 9, 2))
     details = []
 
     def walk(blocks):
@@ -204,7 +205,7 @@ def test_dashboard_screenshot_section_is_the_only_open_section():
 
     walk(rm["rich_message"]["blocks"])
     open_sections = [block.get("summary") for block in details if block.get("is_open") or block.get("open")]
-    assert open_sections == ["Скрин: Понедельник"]
+    assert open_sections == ["Скрин: Среда"]
 
 
 def test_dashboard_has_no_open_sections_on_sunday():
