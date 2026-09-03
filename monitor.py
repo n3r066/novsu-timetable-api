@@ -51,9 +51,19 @@ FAIL_ALERT_THRESHOLD = 3
 
 
 def _dm(text: str) -> None:
-    """Короткое сообщение Георгию в личку."""
+    """Короткое сообщение Георгию в личку.
+
+    Только аварии реальной работы монитора: упавшая правка закрепа, пустой
+    дифф при новом отпечатке, мёртвый фетч, упавший цикл. Ручные прогоны при
+    разработке глушим переменной NOVSU_DM_SILENT=1, иначе отладка засоряет
+    личку алертами, которых в бою не было.
+    """
     import urllib.request
     import urllib.parse
+
+    if os.environ.get("NOVSU_DM_SILENT", "").strip() not in ("", "0", "false", "False"):
+        print(f"[dm silent] {text[:200]}", file=sys.stderr)
+        return
 
     url = f"https://api.telegram.org/bot{config.TG_BOT_TOKEN}/sendMessage"
     data = urllib.parse.urlencode({

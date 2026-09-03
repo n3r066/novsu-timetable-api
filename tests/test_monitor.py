@@ -462,3 +462,35 @@ def test_stale_pending_is_not_posted_twice(monkeypatch, tmp_path):
     assert any("Предмет Ц" in name for name in subjects)
     assert any("Предмет Э" in name for name in subjects)
     assert not (tmp_path / "pending_notification.json").exists()
+
+
+def test_dm_is_silenced_for_manual_runs_but_loud_in_production(monkeypatch, capsys):
+    """Ручной прогон при кодинге не пишет в личку; боевой цикл — пишет."""
+    sent = []
+
+    import urllib.request as urlreq
+
+    class _Resp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def read(self):
+            return b'{"ok": true}'
+
+    def fake_urlopen(req, timeout=0):
+        sent.append(req.data)
+        return _Resp()
+
+    monkeypatch.setattr(urlreq, "urlopen", fake_urlopen)
+
+    monkeypatch.setenv("NOVSU_DM_SILENT", "1")
+    monitor._dm("аварийный алерт")
+    assert sent == []
+    assert "[dm silent]" in capsys.readouterr().err
+
+    monkeypatch.delenv("NOVSU_DM_SILENT", raising=False)
+    monitor._dm("аварийный алерт")
+    assert len(sent) == 1
