@@ -113,7 +113,7 @@ def test_changes_rich_message_structure():
     # правки сгруппированы по дням в порядке недели, а не по типу изменения
     summaries = [block.get("summary") for block in blocks if block.get("type") == "details"]
     assert summaries[:3] == ["Вторник — 1 изменение", "Среда — 1 изменение", "Четверг — 1 изменение"]
-    assert "Правки по дням" in blob
+    assert "Что сделали с расписанием" in blob
     assert "(лек.) Новый" in blob
     assert "203 → 415" in blob
     day_blocks = {
@@ -121,14 +121,18 @@ def test_changes_rich_message_structure():
         for block in blocks if block.get("type") == "details"
     }
     wednesday = day_blocks["Среда — 1 изменение"]
-    # «что изменилось» видно сразу под таблицей дня, без вложенного «раскрыть»
-    assert wednesday[0]["type"] == "table"
-    assert wednesday[1]["type"] == "paragraph"
-    assert "203 → 415" in json.dumps(wednesday[1], ensure_ascii=False)
+    # правка идёт первой карточкой с глаголом, а не строкой со знаком
+    assert wednesday[0]["type"] == "paragraph"
+    first_card = json.dumps(wednesday[0], ensure_ascii=False)
+    assert "1. Изменили" in first_card
+    assert "203 → 415" in first_card
+    # сводная таблица остаётся, но уже ниже карточек
+    assert any(inner.get("type") == "table" for inner in wednesday)
     assert not any(inner.get("type") == "details" for inner in wednesday)
     # убранная пара на новом скрине не появится — предупреждаем текстом
     thursday = day_blocks["Четверг — 1 изменение"]
     removed_note = [json.dumps(inner, ensure_ascii=False) for inner in thursday]
+    assert any("1. Убрали" in note for note in removed_note)
     assert any("Убрано: 1 пара" in note and "на скрине ниже её уже нет" in note for note in removed_note)
     assert "портал НовГУ" in blob
     assert '"type": "table"' in blob
@@ -677,7 +681,7 @@ def test_changes_post_promises_highlight_only_when_screens_are_marked():
         screenshot_media=[{"label": "Вт", "media": "attach://changes_screenshot_1", "marked": 1}],
     )
     blob = json.dumps(marked, ensure_ascii=False)
-    assert "на скрине дня правки подсвечены жёлтым" in blob
+    assert "На скрине дня правки подсвечены жёлтым" in blob
     assert "жёлтым подсвечены правки" in blob
 
     clean = build_changes_rich_message(
@@ -694,3 +698,48 @@ def test_changes_post_promises_highlight_only_when_screens_are_marked():
         ensure_ascii=False,
     )
     assert "жёлтым" not in without_media
+
+
+def test_moved_pair_is_one_card_not_two_rows():
+    """Перенос пары — одна правка «было → стало», а не «убрали» + «добавили»."""
+    lesson = {
+        "day": "Четверг", "subject": "(пр.) География туризма", "subgroup": "",
+        "teacher": "Ефимов Олег Николаевич", "room": "418", "location": "Антоново",
+    }
+    diff = {
+        "added": [{**lesson, "time": "17:00 18:00"}],
+        "removed": [{**lesson, "time": "11:00 12:00"}],
+        "changed": [], "transition": None,
+    }
+    rm = build_changes_rich_message(
+        diff, [], "https://example.test", now=dt.datetime(2026, 9, 3, 12, 0),
+    )
+    blocks = rm["rich_message"]["blocks"]
+    day = next(b for b in blocks if b.get("type") == "details")
+    # обе записи склеены в один перенос, поэтому и заголовок про одно изменение
+    assert day["summary"] == "Четверг — 1 изменение"
+    card = json.dumps(day["blocks"][0], ensure_ascii=False)
+    assert "1. Перенесли: (пр.) География туризма" in card
+    assert "время: 11:00–12:45 → 17:00–18:45" in card
+    blob = json.dumps(rm, ensure_ascii=False)
+    # старую пару не выдаём за отдельное «убрали»
+    assert "Убрали:" not in blob
+    assert "Переносов: 1" in blob
+
+
+def test_real_removal_stays_removal():
+    """Если пара просто исчезла, склеивать её не с чем."""
+    diff = {
+        "added": [],
+        "removed": [{"day": "Пятница", "time": "09:00 10:00", "subject": "(лек.) Экономика",
+                     "teacher": "Иванов И. И.", "room": "1306", "location": ""}],
+        "changed": [], "transition": None,
+    }
+    blob = json.dumps(
+        build_changes_rich_message(diff, [], "https://example.test",
+                                   now=dt.datetime(2026, 9, 3, 12, 0)),
+        ensure_ascii=False,
+    )
+    assert "1. Убрали: (лек.) Экономика" in blob
+    assert "этой пары в новом расписании нет" in blob
+    assert "Перенесли" not in blob

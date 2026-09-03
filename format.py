@@ -1599,6 +1599,59 @@ def _chunked(values: list, size: int) -> list[list]:
 _KIND_MARK = {"added": "+", "removed": "−", "changed": "~"}
 _KIND_RANK = {"added": 0, "removed": 1, "changed": 2}
 
+# Человеческие названия правок: читателю нужен глагол, а не значок.
+_KIND_TITLE = {
+    "moved": "Перенесли",
+    "changed": "Изменили",
+    "added": "Добавили",
+    "removed": "Убрали",
+}
+_KIND_ORDER = {"moved": 0, "changed": 1, "added": 2, "removed": 3}
+# Поля, по которым сравниваем «убрали» и «добавили», чтобы поймать перенос
+# одной и той же пары на другое время.
+_MOVE_KEY_FIELDS = ("subject", "subgroup", "teacher")
+
+
+def _move_key(item: dict) -> tuple:
+    """Ключ «та же самая пара» без времени: предмет, подгруппа, преподаватель."""
+    subject = str(item.get("subject") or "").split("\n", 1)[0].strip().casefold()
+    return (
+        subject,
+        str(item.get("subgroup") or "").strip().casefold(),
+        str(item.get("teacher") or "").strip().casefold(),
+    )
+
+
+def _pair_moves(
+    removed: list[dict], added: list[dict]
+) -> tuple[list[tuple[dict, dict]], list[dict], list[dict]]:
+    """Склеить «убрали в 11:00» + «добавили в 17:00» в один перенос.
+
+    Портал не сообщает о переносе: он показывает пару на новом месте и убирает
+    со старого. Две несвязанные строки читаются как две разные правки, поэтому
+    внутри дня одинаковые пары (предмет, подгруппа, препод) сводим в пару
+    «было → стало». Остальное остаётся честным добавлением или убиранием.
+    """
+    moves: list[tuple[dict, dict]] = []
+    free_added = list(added)
+    rest_removed: list[dict] = []
+    for gone in removed:
+        match = next(
+            (
+                candidate
+                for candidate in free_added
+                if _move_key(candidate) == _move_key(gone)
+                and str(candidate.get("day") or "") == str(gone.get("day") or "")
+            ),
+            None,
+        )
+        if match is None:
+            rest_removed.append(gone)
+            continue
+        free_added.remove(match)
+        moves.append((gone, match))
+    return moves, rest_removed, free_added
+
 _DAY_TABLE_HEAD = [
     ("что", "bold"), ("время", "bold"), ("предмет", "bold"),
     ("ауд.", "bold"), ("преподаватель", "bold"),
@@ -1615,6 +1668,70 @@ def _day_change_row(kind: str, item: dict) -> list[tuple[object, str]]:
         (_truncate_rich_text(item.get("room"), 80), "code"),
         (_truncate_rich_text(item.get("teacher"), 160), "bold"),
     ]
+
+
+def _where(item: dict) -> str:
+    """Место пары одной строкой: аудитория и место проведения."""
+    room = str(item.get("room") or "").strip()
+    location = str(item.get("location") or "").strip()
+    if room and location and location.casefold() not in room.casefold():
+        return f"ауд. {room}, {location}"
+    if room:
+        return f"ауд. {room}"
+    return location or "место не указано"
+
+
+def _change_lines(kind: str, item: dict, partner: dict | None = None) -> list[str]:
+    """Строки «поле: было → стало» для одной правки, человеческим языком."""
+    lines: list[str] = []
+    if kind == "moved" and partner is not None:
+        lines.append(
+            f"время: {bells.slot(item.get('time')).label()} → "
+            f"{bells.slot(partner.get('time')).label()}"
+        )
+        if _where(item) != _where(partner):
+            lines.append(f"место: {_where(item)} → {_where(partner)}")
+        old_note = str(item.get("note") or "").strip()
+        new_note = str(partner.get("note") or "").strip()
+        if old_note != new_note:
+            lines.append(f"примечание: {old_note or '—'} → {new_note or '—'}")
+        return lines
+    if kind == "changed":
+        for field in item.get("fields") or []:
+            if not isinstance(field, (list, tuple)) or len(field) != 3:
+                continue
+            label, old, new = field
+            lines.append(f"{label}: {old or '—'} → {new or '—'}")
+        return lines or ["изменение без деталей"]
+    if kind == "added":
+        lines.append(f"когда: {bells.slot(item.get('time')).label()}")
+        lines.append(f"где: {_where(item)}")
+        teacher = str(item.get("teacher") or "").strip()
+        if teacher:
+            lines.append(f"кто ведёт: {teacher}")
+        note = str(item.get("note") or "").strip()
+        if note:
+            lines.append(f"примечание: {note}")
+        return lines
+    lines.append(f"когда было: {bells.slot(item.get('time')).label()}")
+    lines.append(f"где было: {_where(item)}")
+    lines.append("этой пары в новом расписании нет")
+    return lines
+
+
+def _change_card(number: int, kind: str, item: dict, partner: dict | None = None) -> dict:
+    """Одна правка как карточка: «1. Перенесли ...» и строки «было → стало».
+
+    Знаки ``+ − ~`` заставляли читателя держать легенду в голове, поэтому
+    заголовок пишем глаголом, а детали — отдельными строками под ним.
+    """
+    subject = str(item.get("subject") or "—").split("\n", 1)[0]
+    title = f"{number}. {_KIND_TITLE.get(kind, 'Правка')}: {_truncate_rich_text(subject, 200)}"
+    parts: list[object] = [{"type": "bold", "text": title}]
+    for line in _change_lines(kind, item, partner):
+        parts.append("\n")
+        parts.append({"type": "marked", "text": _truncate_rich_text(line, 220)})
+    return _rich_paragraph(parts)
 
 
 def _changed_note(item: dict, *, with_day: bool = True) -> dict:
@@ -1696,36 +1813,65 @@ def _day_sections(
     Читатель видит день целиком: знак правки у каждой записи, расшифровка
     «было → стало» и рядом картинка нового расписания с портала.
     """
-    by_day: dict[str, list[tuple[str, dict]]] = {}
-    for kind, items in (("added", added), ("removed", removed), ("changed", changed)):
-        for item in items:
-            day = str(item.get("day") or "").strip() or "—"
-            by_day.setdefault(day, []).append((kind, item))
+    by_day: dict[str, list[tuple[str, dict, dict | None]]] = {}
+    days = {str(item.get("day") or "").strip() or "—"
+            for item in (*added, *removed, *changed)}
+    for day in days:
+        day_added = [item for item in added if (str(item.get("day") or "").strip() or "—") == day]
+        day_removed = [item for item in removed if (str(item.get("day") or "").strip() or "—") == day]
+        day_changed = [item for item in changed if (str(item.get("day") or "").strip() or "—") == day]
+        moves, rest_removed, rest_added = _pair_moves(day_removed, day_added)
+        entries: list[tuple[str, dict, dict | None]] = []
+        for gone, arrived in moves:
+            entries.append(("moved", gone, arrived))
+        for item in day_changed:
+            entries.append(("changed", item, None))
+        for item in rest_added:
+            entries.append(("added", item, None))
+        for item in rest_removed:
+            entries.append(("removed", item, None))
+        by_day[day] = entries
     order = {name: index for index, name in enumerate(DAYS_ORDER)}
     used: set[str] = set()
     blocks: list[dict] = []
     for day in sorted(by_day, key=lambda name: order.get(name, len(order))):
         entries = by_day[day]
-        entries.sort(key=lambda pair: (bells.slot(pair[1].get("time")).start, _KIND_RANK.get(pair[0], 9)))
+        # Сначала по важности правки, потом по времени: читатель видит
+        # переносы и изменения раньше мелких добавлений.
+        entries.sort(key=lambda triple: (
+            _KIND_ORDER.get(triple[0], 9),
+            bells.slot(triple[1].get("time")).start,
+        ))
         content: list[dict] = []
-        rows = [_day_change_row(kind, item) for kind, item in entries]
-        chunks = _chunked(rows, _RICH_DIFF_TABLE_CHUNK)
-        for chunk_index, chunk in enumerate(chunks):
-            if len(chunks) > 1:
-                first = chunk_index * _RICH_DIFF_TABLE_CHUNK + 1
-                content.append(_paragraph(f"Записи {first}–{first + len(chunk) - 1}"))
-            content.append(_table([_DAY_TABLE_HEAD] + chunk))
-        # Сразу под таблицей — что именно поменялось: было → стало по полям.
-        # Вложенный «раскрыть» тут только мешал: правку дня надо видеть сразу.
-        for kind, item in entries:
-            if kind == "changed":
-                content.append(_changed_note(item, with_day=False))
-        removed_here = sum(1 for kind, _ in entries if kind == "removed")
+        # Карточки «что сделали» идут первыми: это ответ на главный вопрос.
+        for number, (kind, item, partner) in enumerate(entries, 1):
+            content.append(_change_card(number, kind, item, partner))
+        moved_here = sum(1 for kind, _, _ in entries if kind == "moved")
+        if moved_here:
+            content.append(_paragraph(
+                f"Переносов: {moved_here}. Портал не пишет «перенос» — он убирает пару "
+                "со старого времени и ставит на новое. Мы склеили это в одну правку."
+            ))
+        removed_here = sum(1 for kind, _, _ in entries if kind == "removed")
         if removed_here:
             pronoun = "её" if removed_here == 1 else "их"
             content.append(_paragraph(
                 f"Убрано: {removed_here} {_pairs_word(removed_here)} — на скрине ниже {pronoun} уже нет."
             ))
+        # Ниже — компактная сводка дня той же таблицей, но уже как итог.
+        rows: list[list[tuple[object, str]]] = []
+        for kind, item, partner in entries:
+            if kind == "moved":
+                rows.append(_day_change_row("removed", item))
+                rows.append(_day_change_row("added", partner or item))
+            else:
+                rows.append(_day_change_row(kind, item))
+        chunks = _chunked(rows, _RICH_DIFF_TABLE_CHUNK)
+        for chunk_index, chunk in enumerate(chunks):
+            if len(chunks) > 1:
+                first = chunk_index * _RICH_DIFF_TABLE_CHUNK + 1
+                content.append(_paragraph(f"Строки {first}–{first + len(chunk) - 1}"))
+            content.append(_table([_DAY_TABLE_HEAD] + chunk))
         media, shared = _media_for_day(day, screenshot_media, used)
         if media:
             caption: list[object] = [
@@ -1739,6 +1885,13 @@ def _day_sections(
             content.append(_paragraph(
                 f"Скрин этого дня общий с {', '.join(shared)} — он в блоке выше."
             ))
+        # В сводке знаки всё же нужны — расшифровываем их рядом с таблицей.
+        content.append(_rich_paragraph([
+            {"type": "bold", "text": "Сводка дня: "},
+            {"type": "code", "text": "+"}, " новое время/пара · ",
+            {"type": "code", "text": "−"}, " старое время/пара · ",
+            {"type": "code", "text": "~"}, " та же пара с правкой.",
+        ]))
         blocks.append(_details_open(
             f"{day} — {len(entries)} {_changes_word(len(entries))}", *content
         ))
@@ -1769,7 +1922,16 @@ def build_changes_rich_message(
     removed = list(diff.get("removed") or [])
     changed = list(diff.get("changed") or [])
     transition = diff.get("transition")
-    total = len(added) + len(removed) + len(changed)
+    # Считаем правки так же, как их видит читатель: перенос — одна правка,
+    # а не «убрали» + «добавили», иначе шапка спорит с номерами карточек.
+    moves_total = 0
+    for day in {str(item.get("day") or "").strip() for item in (*added, *removed)}:
+        day_moves, _, _ = _pair_moves(
+            [item for item in removed if str(item.get("day") or "").strip() == day],
+            [item for item in added if str(item.get("day") or "").strip() == day],
+        )
+        moves_total += len(day_moves)
+    total = len(added) + len(removed) + len(changed) - moves_total
 
     title_lines = ["Поменяли расписание"]
     if transition == "published":
@@ -1798,16 +1960,15 @@ def build_changes_rich_message(
         shown = (added[:limits[0]], removed[:limits[1]], changed[:limits[2]])
         if added or removed or changed:
             tail = (
-                " Под таблицей дня — что именно поменялось, "
-                "на скрине дня правки подсвечены жёлтым."
+                " Ниже по дням: каждая правка пронумерована и подписана глаголом, "
+                "под ней — «было → стало». На скрине дня правки подсвечены жёлтым."
                 if _has_screen_marks(screenshot_media)
-                else " Под таблицей дня — что именно поменялось."
+                else " Ниже по дням: каждая правка пронумерована и подписана глаголом, "
+                "под ней — «было → стало»."
             )
             blocks.append(_rich_paragraph([
-                {"type": "bold", "text": "Правки по дням: "},
-                {"type": "code", "text": "+"}, " добавлено · ",
-                {"type": "code", "text": "−"}, " убрано · ",
-                {"type": "code", "text": "~"}, " изменено." + tail,
+                {"type": "bold", "text": "Что сделали с расписанием."},
+                tail,
             ]))
             blocks.extend(_day_sections(*shown, screenshot_media, source_url))
             omitted = total - sum(len(part) for part in shown)
