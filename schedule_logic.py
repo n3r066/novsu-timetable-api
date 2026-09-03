@@ -5,6 +5,8 @@ import datetime as dt
 import re
 from typing import Any
 
+import bells
+
 
 DAYS_ORDER = [
     "Понедельник", "Вторник", "Среда", "Четверг",
@@ -42,7 +44,6 @@ _MONTHS = {
 }
 _AFTER_WEEK_RE = re.compile(r"после\s+(\d+)\s+недел", re.I)
 _UNTIL_WEEK_RE = re.compile(r"до\s+(\d+)\s+недел", re.I)
-_TIME_RE = re.compile(r"(?<!\d)\d{1,2}:\d{2}(?!\d)")
 
 
 def parse_user_date(value: str | None, *, today: dt.date | None = None) -> dt.date:
@@ -312,15 +313,54 @@ def _lesson_subject(lesson: dict) -> str:
 
 
 def _lesson_start(lesson: dict) -> dt.time:
-    m = _TIME_RE.search(str(lesson.get("time") or ""))
-    if not m:
-        return dt.time(23, 59)
-    hour, minute = [int(part) for part in m.group(0).split(":")]
-    try:
-        return dt.time(hour, minute)
-    except ValueError:
-        # Keep malformed upstream rows visible, but sort them after valid rows.
-        return dt.time(23, 59)
+    start = bells.slot(lesson.get("time")).start
+    # Keep malformed upstream rows visible, but sort them after valid rows.
+    return start or dt.time(23, 59)
+
+
+def time_labels(source: object) -> dict:
+    """Подписи времени для вывода: интервалы, структура, начало и конец.
+
+    Принимает словарь урока, сырую ячейку «время» или готовый Slot/Block из
+    bells.py. Само поле ``time`` не трогается: это идентификатор пары для
+    диффов и снапшотов, поэтому там остаётся портальное написание.
+    """
+    if isinstance(source, dict):
+        source = source.get("time")
+    cell = source if isinstance(source, (bells.Slot, bells.Block)) else bells.slot(source)
+    if isinstance(cell, bells.Block):
+        return {
+            "time_label": cell.label,
+            "time_cell": cell.label_cell,
+            "time_full": cell.label_full,
+            "time_short": cell.label_both,
+            "time_start": bells.hhmm(cell.start),
+            "time_end": bells.hhmm(cell.end),
+            "time_end_min": bells.hhmm(cell.end_min),
+        }
+    return {
+        "time_label": cell.label(),
+        "time_cell": cell.label_cell(),
+        "time_full": cell.label_full(),
+        "time_short": cell.label(both=True),
+        "time_start": bells.hhmm(cell.start),
+        "time_end": bells.hhmm(cell.end),
+        "time_end_min": bells.hhmm(cell.end_min),
+    }
+
+
+def lesson_pairs(lesson: dict) -> list[tuple[dt.time, dict]]:
+    """Разложить урок на пары: (начало, урок с подписями этой пары).
+
+    Ячейка «14:00 15:00 16:00 17:00» — это две пары. Без разложения фильтр по
+    текущему времени терял вторую: в 15:50 бот звал сразу на 19:00. Урок с
+    нечитаемым временем отдаётся целиком, чтобы мусор с портала не исчезал.
+    """
+    slot = bells.slot(lesson.get("time"))
+    pairs = slot.pair_blocks()
+    if not pairs:
+        return [(slot.start or dt.time(23, 59), lesson)]
+    return [(pair.start, {**lesson, **time_labels(pair)}) for pair in pairs]
 
 
 def _lesson_number(lesson: dict) -> int:
@@ -340,19 +380,33 @@ def _clean_note(lesson: dict) -> str:
 
 
 def normalise_lesson(lesson: dict) -> dict:
+    note = _clean_note(lesson)
+    subject = _lesson_subject(lesson)
+    # Пара с использованием ДОТ — помечаем [ДОТ] в начале названия предмета
+    if "ДОТ" in note and not subject.startswith("[ДОТ]"):
+        subject = f"[ДОТ] {subject}"
     return {
         "number": lesson.get("number"),
-        "subject": _lesson_subject(lesson),
+        "subject": subject,
         "time": lesson.get("time") or "—",
+        **time_labels(lesson),
         "room": lesson.get("room") or "—",
         "teacher": lesson.get("teacher") or "—",
-        "note": _clean_note(lesson),
+        "note": note,
         "raw_note": lesson.get("note") or lesson.get("raw_comment") or "",
         "parity": lesson_parity(lesson),
     }
 
 
+# Даты без регулярных пар (День знаний и т.п.)
+HOLIDAYS = {
+    dt.date(2026, 9, 1),   # 1 сентября — День знаний, регулярных пар нет
+}
+
+
 def lessons_for_date(schedule: dict | None, weeks: list[dict], target: dt.date) -> tuple[dict | None, list[dict]]:
+    if target in HOLIDAYS:
+        return find_week(weeks, target), []
     week = find_week(weeks, target)
     if week is None:
         return None, []
@@ -389,12 +443,15 @@ def day_view(schedule: dict | None, weeks: list[dict], target: dt.date, *, group
     lines = [
         f"Расписание группы {group} на {day.lower()}, {target.strftime('%d.%m.%Y')}",
         f"Учебная неделя {week['week']}: {half}",
+        bells.LEGEND,
         "",
     ]
     if not lessons:
         lines.append("Пар нет.")
     for index, lesson in enumerate(lessons, 1):
-        display_time = lesson["time"] if lesson["time"] != "—" else "время не указано"
+        display_time = lesson.get("time_label") or "—"
+        if display_time == "—":
+            display_time = "время не указано"
         lines.append(f"{index}. {display_time} — {lesson['subject']}")
         details = []
         if lesson["room"] and lesson["room"] != "—":
@@ -432,7 +489,7 @@ def week_view(schedule: dict | None, weeks: list[dict], week: dict, *, group: st
         lessons = day["lessons"]
         lines.append(f"{day['day']}, {dt.date.fromisoformat(day['date']).strftime('%d.%m')}: {len(lessons)}")
         for lesson in lessons:
-            lines.append(f"  {lesson['time']} — {lesson['subject']}")
+            lines.append(f"  {lesson.get('time_label') or lesson['time']} — {lesson['subject']}")
     return {"group": group, "week": week, "days": days, "summary": "\n".join(lines), "source_url": source_url}
 
 
@@ -461,11 +518,15 @@ def next_lessons(
     found: list[dict] = []
     while cur <= bounds[1] and len(found) < limit:
         view = day_view(schedule, weeks, cur, group=group, source_url=source_url)
-        for lesson in sorted(view["lessons"], key=lambda item: (_lesson_start(item), _lesson_number(item))):
-            lesson_time = _lesson_start(lesson)
-            if cur == start_date and lesson_time < current_time:
-                continue
-            found.append({"date": cur.isoformat(), "day": view["day"], **lesson})
+        lessons = sorted(view["lessons"], key=lambda item: (_lesson_start(item), _lesson_number(item)))
+        for lesson in lessons:
+            # Одна ячейка «время» может содержать две пары — показываем обе.
+            for pair_start, pair_lesson in lesson_pairs(lesson):
+                if cur == start_date and pair_start < current_time:
+                    continue
+                found.append({"date": cur.isoformat(), "day": view["day"], **pair_lesson})
+                if len(found) >= limit:
+                    break
             if len(found) >= limit:
                 break
         cur += dt.timedelta(days=1)
@@ -474,5 +535,7 @@ def next_lessons(
         lines.append("Не нашёл будущих пар в опубликованном календаре.")
     for item in found:
         date_label = dt.date.fromisoformat(item["date"]).strftime("%d.%m")
-        lines.append(f"{date_label}, {item['day'].lower()} — {item['time']} — {item['subject']}")
+        lines.append(
+            f"{date_label}, {item['day'].lower()} — {item.get('time_label') or item['time']} — {item['subject']}"
+        )
     return {"group": group, "lessons": found, "summary": "\n".join(lines), "source_url": source_url}

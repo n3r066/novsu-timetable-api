@@ -6,6 +6,8 @@ import json
 import re
 from pathlib import Path
 from bs4 import BeautifulSoup
+
+import bells
 from portal_parser import day_token as canonical_day, expand_table, find_schedule_table, schedule_header, text
 
 DAY_FULL = {
@@ -117,12 +119,9 @@ def parse_schedule(html: str) -> dict | None:
         raw_room = value(row, "ауд.")
         comment = value(row, "комм.")
         raw_time = value(row, "время")
-        valid_times = []
-        for token in re.findall(r"\d{1,2}:\d{2}", raw_time):
-            hour, minute = (int(part) for part in token.split(":"))
-            if 0 <= hour <= 23 and 0 <= minute <= 59:
-                valid_times.append(token)
-        time_text = " ".join(valid_times) or "—"
+        # Единственный разбор времени в проекте живёт в bells.py: там же
+        # строгий regex (мусор вроде «119:00» не чинится молча) и порядок.
+        time_text = " ".join(bells.hour_tokens(raw_time)) or "—"
 
         note_parts = ([f"подгруппа: {subgroup}"] if subgroup else []) + ([comment] if comment else [])
         subject = _clean_subject(subject_raw)

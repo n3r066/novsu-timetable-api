@@ -236,3 +236,41 @@ def test_explicit_date_can_move_lesson_to_actual_weekday():
     tuesday = day_view(schedule, weeks, dt.date(2026, 12, 29), group="1", source_url="x")
     assert [item["subject"] for item in monday["lessons"]] == ["История"]
     assert tuesday["lessons"] == []
+
+
+def test_next_lessons_keeps_the_second_pair_of_a_long_block():
+    """Ячейка «14:00 15:00 16:00 17:00» — две пары; в 15:50 вторая не теряется."""
+    schedule = {
+        "days": {
+            "Вторник": [
+                {"number": 1, "subject": "Проект", "time": "14:00 15:00 16:00 17:00", "note": ""},
+                {"number": 2, "subject": "Язык", "time": "19:00 20:00", "note": ""},
+            ]
+        }
+    }
+    weeks = [{"week": 2, "half": "bottom", "start": "07.09.2026", "end": "12.09.2026"}]
+    upcoming = next_lessons(
+        schedule, weeks, dt.date(2026, 9, 8), start_time="15:50",
+        group="6381", source_url="https://example.test", limit=3,
+    )
+    assert [item["time_label"] for item in upcoming["lessons"]] == ["16:00–17:45", "19:00–20:45"]
+    assert "16:00–17:45" in upcoming["summary"]
+
+
+def test_lesson_carries_machine_readable_times():
+    schedule = {
+        "days": {
+            "Вторник": [
+                {"number": 1, "subject": "Проект", "time": "14:00 15:00 16:00 17:00", "note": ""},
+            ]
+        }
+    }
+    weeks = [{"week": 2, "half": "bottom", "start": "07.09.2026", "end": "12.09.2026"}]
+    view = day_view(schedule, weeks, dt.date(2026, 9, 8), group="6381", source_url="https://example.test")
+    lesson = view["lessons"][0]
+    # Идентификатор пары не меняется, а рядом лежат готовые подписи и границы.
+    assert lesson["time"] == "14:00 15:00 16:00 17:00"
+    assert lesson["time_start"] == "14:00"
+    assert lesson["time_end"] == "17:45"
+    assert lesson["time_label"] == "14:00–15:45 + 16:00–17:45"
+    assert lesson["time_cell"] == "14:00–15:45\n16:00–17:45"

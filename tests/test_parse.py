@@ -1,7 +1,7 @@
 import json
 from pathlib import Path
 
-from parse import parse_schedule
+from parse import parse_all, parse_schedule
 
 
 def test_rowspan_time_is_inherited_by_alternative_lesson():
@@ -186,3 +186,20 @@ def test_plural_header_aliases_keep_columns_mapped():
     assert rows[0]["room"] == "415"
     assert rows[0]["note"] == "Антоново"
     assert rows[0]["time"] == "11:00"
+
+
+def test_garbage_time_cell_is_not_silently_repaired():
+    """«119:00» не должно превращаться в «19:00»: ячейка остаётся пустой."""
+    html = (
+        "<table>"
+        "<tr><th>дата</th><th>время</th><th>под гр.</th><th>предмет</th>"
+        "<th>преподаватель</th><th>ауд.</th><th>комм.</th></tr>"
+        "<tr><td>Пн</td><td>119:00</td><td></td><td>Мусор</td><td>Иванов</td><td>101</td><td></td></tr>"
+        "<tr><td>Пн</td><td>9:00 10:00</td><td></td><td>Пара</td><td>Петров</td><td>102</td><td></td></tr>"
+        "</table>"
+    )
+    data = parse_all(html)
+    lessons = data["schedule"]["days"]["Понедельник"]
+    assert [lesson["time"] for lesson in lessons] == ["—", "9:00 10:00"]
+    # Портальное написание сохраняется в raw_time для отладки и диффов.
+    assert lessons[1]["raw_time"] == "9:00 10:00"
