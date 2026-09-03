@@ -1,3 +1,4 @@
+import datetime as dt
 import json
 import os
 from pathlib import Path
@@ -117,7 +118,7 @@ def test_run_once_no_change_does_not_post(monkeypatch, tmp_path):
     monkeypatch.setattr(monitor, "fetch_html", lambda *a, **k: html)
     posts: list = []
     monkeypatch.setattr(monitor, "_post_changes_to_channel",
-                        lambda diff, weeks: posts.append(diff) or {"ok": True})
+                        lambda diff, weeks, **kwargs: posts.append(diff) or {"ok": True})
     dms: list = []
     monkeypatch.setattr(monitor, "_dm", lambda text: dms.append(text))
 
@@ -137,7 +138,7 @@ def test_run_once_posts_diff_to_channel_on_change(monkeypatch, tmp_path):
     monkeypatch.setattr(monitor, "fetch_html", lambda *a, **k: next(pages))
     posts: list = []
     monkeypatch.setattr(monitor, "_post_changes_to_channel",
-                        lambda diff, weeks: posts.append(diff) or {"ok": True})
+                        lambda diff, weeks, **kwargs: posts.append(diff) or {"ok": True})
     dms: list = []
     monkeypatch.setattr(monitor, "_dm", lambda text: dms.append(text))
 
@@ -163,7 +164,7 @@ def test_run_once_volatile_timestamp_change_is_silent(monkeypatch, tmp_path):
     monkeypatch.setattr(monitor, "fetch_html", lambda *a, **k: next(pages))
     posts: list = []
     monkeypatch.setattr(monitor, "_post_changes_to_channel",
-                        lambda diff, weeks: posts.append(diff) or {"ok": True})
+                        lambda diff, weeks, **kwargs: posts.append(diff) or {"ok": True})
 
     monitor.run_once()
     result = monitor.run_once()
@@ -180,7 +181,7 @@ def test_fetch_error_does_not_count_as_change(monkeypatch, tmp_path):
     monkeypatch.setattr(monitor, "fetch_html", boom)
     posts: list = []
     monkeypatch.setattr(monitor, "_post_changes_to_channel",
-                        lambda diff, weeks: posts.append(diff) or {"ok": True})
+                        lambda diff, weeks, **kwargs: posts.append(diff) or {"ok": True})
     try:
         monitor.run_once()
     except RuntimeError:
@@ -220,7 +221,7 @@ def test_failed_delivery_is_retried_and_baseline_is_not_advanced(monkeypatch, tm
     monkeypatch.setattr(monitor, "fetch_html", lambda *a, **k: next(pages))
     results = iter([{"ok": False, "error": "down"}, {"ok": True}])
     posts = []
-    monkeypatch.setattr(monitor, "_post_changes_to_channel", lambda diff, weeks: posts.append(diff) or next(results))
+    monkeypatch.setattr(monitor, "_post_changes_to_channel", lambda diff, weeks, **kwargs: posts.append(diff) or next(results))
     monkeypatch.setattr(monitor, "_dm", lambda text: None)
 
     monitor.run_once()
@@ -239,7 +240,7 @@ def test_stub_transition_requires_two_matching_samples(monkeypatch, tmp_path):
     monkeypatch.setattr(monitor.config, "STATE_DIR", tmp_path)
     monkeypatch.setattr(monitor, "fetch_html", lambda *a, **k: next(pages))
     posts = []
-    monkeypatch.setattr(monitor, "_post_changes_to_channel", lambda diff, weeks: posts.append(diff) or {"ok": True})
+    monkeypatch.setattr(monitor, "_post_changes_to_channel", lambda diff, weeks, **kwargs: posts.append(diff) or {"ok": True})
 
     monitor.run_once()
     candidate = monitor.run_once()
@@ -248,3 +249,102 @@ def test_stub_transition_requires_two_matching_samples(monkeypatch, tmp_path):
     assert candidate["changed"] is False
     assert confirmed["changed"] is True
     assert posts[0]["transition"] == "vanished"
+
+
+def _day_shots(tmp_path, labels):
+    shots = []
+    for label in labels:
+        path = tmp_path / f"{label}.png"
+        path.write_bytes(b"png")
+        shots.append({"label": label, "path": str(path)})
+    return shots
+
+
+def _tuesday_diff():
+    return {
+        "added": [{"day": "Вторник", "time": "09:00 10:00", "subject": "(лек.) Физика",
+                   "room": "101", "teacher": "Иванов"}],
+        "removed": [],
+        "changed": [],
+        "transition": None,
+    }
+
+
+def test_post_changes_attaches_screens_of_changed_days(monkeypatch, tmp_path):
+    shots = _day_shots(tmp_path, ["Пн", "Вт", "Ср"])
+    monkeypatch.setattr(monitor, "day_screens", lambda html, fp, date: shots)
+    sent = []
+
+    def fake_send(rich, **kwargs):
+        sent.append((rich, kwargs))
+        return {"ok": True, "result": {"message_id": 7}}
+
+    monkeypatch.setattr(monitor, "send_rich_message", fake_send)
+    result = monitor._post_changes_to_channel(
+        _tuesday_diff(), [], html="<html>", fingerprint="fp", focus_date=dt.date(2026, 9, 3),
+    )
+    assert result["ok"] is True
+    assert len(sent) == 1
+    rich, kwargs = sent[0]
+    # Скрин только на Вторник: Пн и Ср не менялись, гонять их в канал не надо.
+    assert kwargs["files"] == {"changes_screenshot_1": tmp_path / "Вт.png"}
+    blob = json.dumps(rich, ensure_ascii=False)
+    assert "attach://changes_screenshot_1" in blob
+    assert "Новое расписание: Вторник" in blob
+    # секция дня открыта сразу: читатель видит правку и картинку рядом
+    assert "Вторник — 1 изменение" in blob
+    assert "Правки по дням" in blob
+
+
+def test_post_changes_retries_without_screens_when_media_rejected(monkeypatch, tmp_path):
+    shots = _day_shots(tmp_path, ["Вт"])
+    monkeypatch.setattr(monitor, "day_screens", lambda html, fp, date: shots)
+    sent = []
+
+    def fake_send(rich, **kwargs):
+        sent.append((rich, kwargs))
+        if kwargs.get("files"):
+            return {"ok": False, "description": "Bad Request: wrong file identifier"}
+        return {"ok": True, "result": {"message_id": 9}}
+
+    monkeypatch.setattr(monitor, "send_rich_message", fake_send)
+    result = monitor._post_changes_to_channel(
+        _tuesday_diff(), [], html="<html>", fingerprint="fp", focus_date=dt.date(2026, 9, 3),
+    )
+    assert result["ok"] is True
+    assert len(sent) == 2
+    assert sent[0][1].get("files") == {"changes_screenshot_1": tmp_path / "Вт.png"}
+    assert sent[1][1].get("files") is None
+    assert "photo" not in json.dumps(sent[1][0], ensure_ascii=False)
+
+
+def test_post_changes_survives_screenshot_render_failure(monkeypatch, tmp_path):
+    def boom(*args, **kwargs):
+        raise RuntimeError("chromium screenshot failed")
+
+    monkeypatch.setattr(monitor, "day_screens", boom)
+    sent = []
+
+    def fake_send(rich, **kwargs):
+        sent.append((rich, kwargs))
+        return {"ok": True, "result": {"message_id": 11}}
+
+    monkeypatch.setattr(monitor, "send_rich_message", fake_send)
+    result = monitor._post_changes_to_channel(
+        _tuesday_diff(), [], html="<html>", fingerprint="fp", focus_date=dt.date(2026, 9, 3),
+    )
+    assert result["ok"] is True
+    assert sent[0][1].get("files") is None
+    assert "photo" not in json.dumps(sent[0][0], ensure_ascii=False)
+
+
+def test_post_changes_without_html_skips_screens(monkeypatch):
+    called = []
+    monkeypatch.setattr(monitor, "day_screens", lambda *a, **k: called.append(a) or [])
+    sent = []
+    monkeypatch.setattr(monitor, "send_rich_message",
+                        lambda rich, **kwargs: sent.append(kwargs) or {"ok": True, "result": {"message_id": 12}})
+    result = monitor._post_changes_to_channel(_tuesday_diff(), [])
+    assert result["ok"] is True
+    assert called == []
+    assert sent[0].get("files") is None

@@ -40,10 +40,10 @@ import zoneinfo
 
 import config  # noqa: E402
 from fetch import content_fingerprint, fetch_html, hash_html, is_stub  # noqa: E402
-from format import build_changes_rich_message, changes_fallback_text  # noqa: E402
+from format import build_changes_rich_message, changes_fallback_text, pick_day_screens  # noqa: E402
 from parse import extract_teacher_ids, parse_all  # noqa: E402
 from portal_parser import count_schedule_lessons  # noqa: E402
-from post import _tg_api, edit_dashboard_post  # noqa: E402
+from post import _tg_api, day_screens, edit_dashboard_post  # noqa: E402
 from telegram_api import send_rich_message  # noqa: E402
 
 # Сколько подряд неудачных циклов терпим молча перед tech-алертом в личку
@@ -214,16 +214,82 @@ def diff_schedules(
     }
 
 
-def _post_changes_to_channel(diff: dict, weeks: list[dict]) -> dict:
-    """Rich-пост в канал; при отказе — plain-HTML фоллбек."""
-    rich = build_changes_rich_message(diff, weeks, config.GROUP_URL, group_name="6381")
+def _changed_day_screen_media(
+    diff: dict,
+    html: str | None,
+    fingerprint: str | None,
+    focus_date: dt.date | None,
+) -> tuple[list[dict], dict[str, Path]]:
+    """Скриншоты нового расписания на дни из диффа: (медиа для rich, файлы).
+
+    Рендер идёт через тот же кеш по отпечатку, что и закреплённый пост, поэтому
+    chromium на одно изменение расписания запускается один раз. Скриншоты —
+    иллюстрация диффа, а не его суть: если рендер не удался, пост уходит
+    текстом, как раньше.
+    """
+    if not html or not fingerprint:
+        return [], {}
     try:
-        result = send_rich_message(rich, token=config.TG_BOT_TOKEN, chat_id=config.TG_CHANNEL_ID)
+        items = day_screens(
+            html,
+            fingerprint,
+            focus_date or dt.datetime.now(zoneinfo.ZoneInfo("Europe/Moscow")).date(),
+        )
+        picked = pick_day_screens(diff, items)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[diff screens] render failed: {exc}", file=sys.stderr)
+        return [], {}
+    media = [
+        {"label": item.get("label", ""), "media": f"attach://changes_screenshot_{index}"}
+        for index, item in enumerate(picked, 1)
+    ]
+    files = {
+        f"changes_screenshot_{index}": Path(item["path"])
+        for index, item in enumerate(picked, 1)
+    }
+    if picked:
+        print(f"[diff screens] {len(picked)} скрин(ов): {[item.get('label') for item in picked]}")
+    return media, files
+
+
+def _post_changes_to_channel(
+    diff: dict,
+    weeks: list[dict],
+    *,
+    html: str | None = None,
+    fingerprint: str | None = None,
+    focus_date: dt.date | None = None,
+) -> dict:
+    """Rich-пост в канал; при отказе — plain-HTML фоллбек."""
+    screenshot_media, files = _changed_day_screen_media(diff, html, fingerprint, focus_date)
+    rich = build_changes_rich_message(
+        diff, weeks, config.GROUP_URL, group_name="6381", screenshot_media=screenshot_media,
+    )
+    try:
+        result = send_rich_message(
+            rich, token=config.TG_BOT_TOKEN, chat_id=config.TG_CHANNEL_ID, files=files or None,
+        )
     except Exception as exc:  # local validation/transport failure also falls back
         result = {"ok": False, "error": str(exc)}
     if result.get("ok"):
         return result
     print(f"[sendRichMessage FAIL] {result}", file=sys.stderr)
+    if files:
+        # Отказ мог прийти из-за медиа (лимит, кривой файл, attach:// не
+        # подхватился). Пробуем тот же rich без скриншотов, прежде чем
+        # сваливаться в простой HTML.
+        try:
+            retry = send_rich_message(
+                build_changes_rich_message(diff, weeks, config.GROUP_URL, group_name="6381"),
+                token=config.TG_BOT_TOKEN,
+                chat_id=config.TG_CHANNEL_ID,
+            )
+        except Exception as exc:  # noqa: BLE001
+            retry = {"ok": False, "error": str(exc)}
+        if retry.get("ok"):
+            print("[diff post] отправлен без скриншотов", file=sys.stderr)
+            return retry
+        print(f"[sendRichMessage FAIL без скринов] {retry}", file=sys.stderr)
     text = changes_fallback_text(diff, config.GROUP_URL, group_name="6381")
     return _tg_api("sendMessage", chat_id=config.TG_CHANNEL_ID, text=text, parse_mode="HTML")
 
@@ -246,6 +312,24 @@ def _write_json_atomic(path: Path, value: dict) -> None:
         handle.flush()
         os.fsync(handle.fileno())
     os.replace(temporary, path)
+
+
+def _touch_state_file() -> None:
+    """Update mtime of monitor_state.json so healthcheck sees we're alive.
+
+    Called from the error path in run_interval when fetch keeps failing
+    (e.g. portal 502) — the normal write path never runs, so without this
+    the healthcheck would false-alarm "monitor not running".
+    """
+    try:
+        path = config.STATE_DIR / "monitor_state.json"
+        if path.exists():
+            os.utime(path)
+        else:
+            # File missing: create a minimal stub so mtime is fresh.
+            _write_json_atomic(path, {"event": {}, "stub": True, "schedule": None, "weeks": []})
+    except Exception:
+        pass
 
 
 @contextmanager
@@ -379,6 +463,11 @@ def _try_dashboard(update_post_id: int | None, post_date: dt.date | None, html: 
     if result.get("ok"):
         _unlink(pending_file)
         return True
+    # "message is not modified" — content already current, treat as success
+    desc = str(result.get("description", ""))
+    if "not modified" in desc:
+        _unlink(pending_file)
+        return True
     previous = _read_json(pending_file)
     prev_error = previous.get("last_error")
     _write_json_atomic(pending_file, {"fingerprint": fingerprint, "message_id": update_post_id, "last_error": result})
@@ -437,7 +526,13 @@ def _run_once_locked(update_post_id: int | None = None, post_date: dt.date | Non
         pending_notif = _read_json(pending_file)
         if pending_notif.get("diff") is not None:
             try:
-                retry_result = _post_changes_to_channel(pending_notif["diff"], data.get("weeks", []))
+                retry_result = _post_changes_to_channel(
+                    pending_notif["diff"],
+                    data.get("weeks", []),
+                    html=html,
+                    fingerprint=new_fp,
+                    focus_date=post_date,
+                )
             except Exception as exc:  # noqa: BLE001
                 retry_result = {"ok": False, "error": str(exc)}
             if retry_result.get("ok"):
@@ -446,7 +541,7 @@ def _run_once_locked(update_post_id: int | None = None, post_date: dt.date | Non
             else:
                 print(f"[retry pending] still failing: {retry_result.get('error', '?')}", file=sys.stderr)
         dashboard_ok = None
-        if update_post_id and (config.STATE_DIR / "pending_dashboard.json").exists():
+        if update_post_id:
             dashboard_ok = _try_dashboard(update_post_id, post_date, html, new_fp)
         print(f"[no change] fingerprint={new_fp} stub={stub}")
         return {"changed": False, "fingerprint": new_fp, "stub": stub, "posted": None, "dashboard_updated": dashboard_ok, **event}
@@ -506,7 +601,13 @@ def _run_once_locked(update_post_id: int | None = None, post_date: dt.date | Non
         _save_teacher_cache(new_cache)
     _write_json_atomic(pending_file, {"event": event, "diff": diff})
     try:
-        post_result = _post_changes_to_channel(diff, data.get("weeks", []))
+        post_result = _post_changes_to_channel(
+            diff,
+            data.get("weeks", []),
+            html=html,
+            fingerprint=new_fp,
+            focus_date=post_date,
+        )
     except Exception as exc:  # noqa: BLE001
         post_result = {"ok": False, "error": str(exc)}
     post_ok = bool(post_result.get("ok"))
@@ -573,6 +674,9 @@ def run_interval(
         except Exception as e:  # noqa: BLE001
             consecutive_failures += 1
             print(f"[run ERR {consecutive_failures}] {e}", file=sys.stderr)
+            # Touch state file so healthcheck knows monitor is alive even
+            # when the portal is down and fetch keeps failing.
+            _touch_state_file()
             if consecutive_failures >= FAIL_ALERT_THRESHOLD and not alerted:
                 _dm(
                     f"monitor: {consecutive_failures} подряд неудачных циклов\n"

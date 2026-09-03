@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
 import html as _html
 import json
 import os
@@ -340,10 +341,32 @@ def _dashboard_screens(html: str, fingerprint: str, target_date: dt.date) -> lis
         except OSError:
             pass
     base = shot_dir / f"6381_site_{target_date.isoformat()}.png"
-    raw = screenshot_schedule_day_crop_items(html, config.GROUP_URL, base)
+    try:
+        raw = screenshot_schedule_day_crop_items(html, config.GROUP_URL, base)
+    except Exception as exc:  # noqa: BLE001
+        # Скриншот — украшение поста, а не его суть. Если chromium не отработал
+        # (снап-песочница, нет памяти, портал отдал кривую вёрстку), закреплённый
+        # пост всё равно должен получить свежий текст: берём прошлый набор картинок,
+        # а если и его нет — обновляем пост вообще без медиа.
+        print(f"[dashboard screens] render failed: {exc}", file=sys.stderr)
+        if cached:
+            print("[dashboard screens] reusing cached screenshots", file=sys.stderr)
+            return cached
+        _write_json_atomic(cache_file, {"fingerprint": "", "items": []})
+        return []
     items = [{"label": item["label"], "path": str(item["path"])} for item in raw]
     _write_json_atomic(cache_file, {"fingerprint": fingerprint, "items": items})
     return items
+
+
+def day_screens(html: str, fingerprint: str, target_date: dt.date) -> list[dict]:
+    """Публичный доступ к дневным скринам расписания (кеш по отпечатку).
+
+    Монитор зовёт её перед дифф-постом, чтобы приложить скриншоты изменившихся
+    дней, а потом тот же кеш использует обновление закреплённого поста:
+    chromium на одно изменение расписания запускается один раз.
+    """
+    return _dashboard_screens(html, fingerprint, target_date)
 
 
 def edit_dashboard_post(
@@ -361,6 +384,20 @@ def edit_dashboard_post(
         html = fetch_html()
     data = parse_all(html)
     fp = fingerprint or content_fingerprint(data)
+
+    # Skip holidays: advance target_date to the next day with lessons
+    from schedule_logic import HOLIDAYS, lessons_for_date
+    schedule = data.get("schedule")
+    weeks = data.get("weeks", [])
+    for _ in range(7):
+        if target_date in HOLIDAYS:
+            target_date = target_date + dt.timedelta(days=1)
+            continue
+        _, lessons = lessons_for_date(schedule, weeks, target_date)
+        if not lessons:
+            target_date = target_date + dt.timedelta(days=1)
+            continue
+        break
 
     shot_items = _dashboard_screens(html, fp, target_date)
     screenshot_media = [

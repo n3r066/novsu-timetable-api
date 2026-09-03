@@ -243,9 +243,19 @@ def validate_rich_payload(payload: dict[str, Any]) -> None:
 # Descriptive alias for callers/tests that use the full name.
 validate_rich_message_payload = validate_rich_payload
 
-def send_rich_message(rich_message: dict[str, Any], *, token: str, chat_id: int, timeout: int = 30) -> dict[str, Any]:
+def send_rich_message(
+    rich_message: dict[str, Any],
+    *,
+    token: str,
+    chat_id: int,
+    files: dict[str, Path] | None = None,
+    timeout: int = 30,
+) -> dict[str, Any]:
+    """Отправить rich-сообщение. files — attach://-медиа (скриншоты и т. п.)."""
     payload = {"chat_id": chat_id, **rich_message}
     validate_rich_payload(payload)
+    if files:
+        return call_multipart(token, "sendRichMessage", payload, files, timeout=timeout)
     return call(token, "sendRichMessage", payload, timeout=timeout)
 
 
