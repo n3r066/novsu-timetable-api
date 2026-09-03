@@ -8,6 +8,8 @@ import re
 import urllib.error
 import urllib.request
 import zoneinfo
+
+import bells
 from schedule_logic import day_view, find_week as find_schedule_week, week_view
 
 WEEK_HALF_NAME = {"top": "верхняя", "bottom": "нижняя"}
@@ -24,7 +26,6 @@ DAYS_ORDER = [
     "Понедельник", "Вторник", "Среда", "Четверг",
     "Пятница", "Суббота", "Воскресенье",
 ]
-TEACHERS_POST_URL = "https://t.me/c/4256784811/98"
 
 
 def find_current_week(weeks: list[dict], today: dt.date | None = None) -> dict | None:
@@ -94,8 +95,12 @@ def _table_cell(text: object, style: str, *, is_header: bool = False) -> dict:
     requires both alignment fields; ``is_header`` is emitted only for actual
     heading cells.
     """
+    if style == "plain":
+        text_items = [str(text or "\u2014")]
+    else:
+        text_items = [_rt(text, style)]
     cell = {
-        "text": [_rt(text, style)],
+        "text": text_items,
         "align": "left",
         "valign": "middle",
     }
@@ -165,6 +170,20 @@ def _normalise_pair(row: object, index: int) -> list[str]:
     return (values + ["—"] * 5)[:5]
 
 
+def _time_display(lesson: dict) -> str:
+    """Интервалы пар для вывода: одна пара — одна строка.
+
+    Портал печатает в колонке «время» начала академических часов, поэтому
+    «9:00 10:00» — это пара 09:00–10:45, а «14:00 15:00 16:00 17:00» — две
+    пары. Арифметику делает bells.py; нормализованные уроки уже несут готовые
+    подписи, сырые строки парсера разбираются на месте.
+    """
+    prepared = lesson.get("time_cell")
+    if prepared:
+        return str(prepared)
+    return bells.slot(lesson.get("time")).label_cell()
+
+
 def _lesson_fields(pair: dict, index: int) -> dict:
     """Extract display fields from a parser lesson record."""
     full = pair.get("subject") or pair.get("subject_raw") or pair.get("name") or ""
@@ -172,7 +191,8 @@ def _lesson_fields(pair: dict, index: int) -> dict:
     return {
         "number": str(pair.get("number") or index),
         "subject": subject,
-        "time": pair.get("time") or "—",
+        "time": _time_display(pair),
+        "time_plain": bells.slot(pair.get("time")).label(),
         "room": pair.get("room") or "—",
         "teacher": pair.get("teacher") or "—",
         "note": pair.get("note") or pair.get("raw_comment") or "",
@@ -231,7 +251,7 @@ def _lesson_table(lessons: list[dict]) -> dict:
         body.append([
             (lesson.get("number") or index, "code"),
             (subject, "accent"),
-            (lesson.get("time") or "—", "code"),
+            (_time_display(lesson), "code"),
             (lesson.get("room") or "—", "code"),
             (lesson.get("teacher") or "—", "bold"),
         ])
@@ -282,48 +302,495 @@ def _screenshot_block(day_label: str, media: str, is_today: bool, source_url: st
     return details(f"Скрин: {day_label}", _photo(media, caption))
 
 
-def _reading_help(source_url: str) -> dict:
-    return _details(
+# Портал пишет аудитории неряшливо: «402ИГУМ», «310 ИГУМ», «1321ИГ» (опечатка),
+# «1313ИГУМ313» (склейка двух номеров). Разбираем то, что реально читается.
+_GUIDE_ROOM_RE = re.compile(
+    r"^(\d{3,4})\s*(ИГУМ|ИГ|ИЭ|ПИ|ПТИ|ХТИ|ИНПО|ИМО|МИ|ЮИ)?\s*(?:\d{3,4})?$"
+)
+_GUIDE_IGUM_MARKS = {"ИГУМ", "ИГ"}
+
+ANTONOVO_COORDS = {"latitude": 58.541187, "longitude": 31.288116}
+
+
+def _guide_decode_room(room: str) -> dict | None:
+    """Разбирает номера вида 1318 / 303 / 402ИГУМ.
+
+    Правило НовГУ: 3 цифры = этаж + кабинет, 4 цифры = корпус + этаж + аудитория.
+    В кампусе Антоново: 3 цифры = новый корпус, 4 цифры с единицей в начале = старый.
+    Суффикс (ИГУМ, ИЭ, ПИ, ИНПО…) — метка здания/подразделения: так портал разводит
+    одинаковые номера, поэтому 218ИГУМ и 218ИЭ — разные кабинеты. ИГУМ = Институт
+    гуманитарный (Гуманитарный институт НовГУ), его корпуса стоят в Антоново.
+    """
+    room = (room or "").strip()
+    m = _GUIDE_ROOM_RE.match(room)
+    if not m:
+        return None
+    digits, mark = m.group(1), (m.group(2) or "").upper()
+    igum = mark in _GUIDE_IGUM_MARKS
+    if len(digits) == 3:
+        prefix = "корпус Гуманитарного института (ИГУМ), " if igum else ""
+        if mark and not igum:
+            prefix = f"пометка {mark} — сверься с примечаниями, "
+        return {
+            "floor": digits[0],
+            "num": digits[1:],
+            "place": f"{prefix}новый корпус — кампус Антоново",
+        }
+    korpus = digits[0]
+    if korpus == "1":
+        prefix = "корпус Гуманитарного института (ИГУМ), " if igum else ""
+        if mark and not igum:
+            prefix = f"пометка {mark} — сверься с примечаниями, "
+        place = f"{prefix}старый корпус — кампус Антоново"
+    elif korpus == "3":
+        place = "корпус 3 — Б. Санкт-Петербургская, 41"
+        if mark:
+            place += f" (пометка {mark})"
+    else:
+        place = f"корпус {korpus} (смотри примечания)"
+    return {"floor": digits[1], "num": digits[2:], "place": place}
+
+
+def _guide_rooms_table(schedule: dict | None) -> tuple[dict, int]:
+    """Живая шпаргалка: все аудитории из расписания группы с расшифровкой."""
+    rooms: dict[str, int] = {}
+    days = (schedule or {}).get("days") or {}
+    for day in DAYS_ORDER:
+        for pair in days.get(day) or []:
+            room = str(pair.get("room") or "").strip()
+            if room and room != "—":
+                rooms[room] = rooms.get(room, 0) + 1
+    rows: list[list[tuple[object, str]]] = [[
+        ("аудитория", "bold"), ("куда идти", "bold"), ("этаж", "bold"), ("кабинет", "bold"),
+    ]]
+    for room in sorted(rooms):
+        info = _guide_decode_room(room)
+        if info is None:
+            rows.append([(room, "code"), ("Антоново (смотри примечания)", "plain"), ("—", "plain"), ("—", "plain")])
+        else:
+            rows.append([(room, "code"), (info["place"], "plain"), (info["floor"], "plain"), (info["num"], "plain")])
+    return _table(rows), len(rooms)
+
+
+def _guide_teacher_blocks(schedule: dict | None) -> tuple[list[dict], int]:
+    """Живой список преподавателей группы: имя + предметы."""
+    by_teacher: dict[str, set[str]] = {}
+    days = (schedule or {}).get("days") or {}
+    for day in DAYS_ORDER:
+        for pair in days.get(day) or []:
+            teacher = str(pair.get("teacher") or "").strip()
+            if not teacher or teacher == "—":
+                continue
+            subject = str(pair.get("subject") or "").split("\n", 1)[0].strip()
+            subject = re.sub(r"^\([^)]*\)\s*", "", subject)
+            if subject:
+                by_teacher.setdefault(teacher, set()).add(subject)
+    blocks = []
+    for teacher in sorted(by_teacher):
+        blocks.append(_rich_paragraph([
+            {"type": "bold", "text": teacher},
+            "\n",
+            {"type": "italic", "text": ", ".join(sorted(by_teacher[teacher]))},
+        ]))
+    return blocks, len(by_teacher)
+
+
+def _freshman_guide(schedule: dict | None, source_url: str) -> dict:
+    """Раскрытый раздел-гид для первокурсников: аудитории, корпуса, недели, справки."""
+    rooms_table, rooms_count = _guide_rooms_table(schedule)
+
+    algorithm = _details(
+        "Шаг за шагом: как понять, куда идти",
+        _rich_paragraph([
+            {"type": "bold", "text": "Шаг 1. Считай цифры в номере аудитории"},
+        ]),
+        _rich_paragraph([
+            {"type": "marked", "text": {"type": "bold", "text": "3 цифры"}},
+            ": первая = этаж, две другие = кабинет.",
+        ]),
+        _rich_paragraph([
+            "Пример: ", {"type": "code", "text": "303"}, " = этаж 3, кабинет 03.",
+        ]),
+        _rich_paragraph([
+            {"type": "marked", "text": {"type": "bold", "text": "4 цифры"}},
+            ": первая = корпус, вторая = этаж, две последние = аудитория.",
+        ]),
+        _rich_paragraph([
+            "Пример: ", {"type": "code", "text": "1318"}, " = корпус 1, этаж 3, аудитория 18.",
+        ]),
+        _rich_paragraph([
+            "• Если у пары есть примечание с адресом — оно главнее номера аудитории.",
+        ]),
+        _divider(),
+        _rich_paragraph([
+            {"type": "bold", "text": "Шаг 2. Пойми, в каком ты корпусе (Антоново)"},
+        ]),
+        _rich_paragraph([
+            "• 3 цифры → новый корпус в кампусе Антоново.",
+        ]),
+        _rich_paragraph([
+            "• 4 цифры, первая 1 → старый корпус в кампусе Антоново.",
+        ]),
+        _rich_paragraph([
+            "• Суффикс ", {"type": "code", "text": "ИГУМ"}, " (218ИГУМ, 402ИГУМ) → корпус Гуманитарного института, "
+            "это тоже кампус Антоново. Суффикс разводит одинаковые номера: 218ИГУМ и 218ИЭ — разные кабинеты.",
+        ]),
+        _divider(),
+        _rich_paragraph([
+            {"type": "bold", "text": "Шаг 3. Сверься со шпаргалкой ниже"},
+            " — там аудитории с расшифровкой, куда идти.",
+        ]),
+    )
+
+    rooms_section = _details(
+        f"Шпаргалка: аудитории ({rooms_count})",
+        rooms_table,
+        _paragraph("Список собран по расписанию на портале НовГУ."),
+    )
+
+    antonovo_section = _details(
+        "Антоново: адреса, карта, как добраться",
+        _rich_paragraph([
+            {"type": "bold", "text": "Старый корпус"},
+            " — кампус Антоново. Здесь аудитории с четырьмя цифрами, первая 1 (1306, 1318, 1331).",
+        ]),
+        _rich_paragraph([
+            {"type": "bold", "text": "Новый корпус"},
+            " — кампус Антоново, рядом со старым. Здесь аудитории с тремя цифрами (214, 216, 303, 418).",
+        ]),
+        _rich_paragraph([
+            {"type": "bold", "text": "ИГУМ = Институт гуманитарный, "},
+            "то есть Гуманитарный институт НовГУ. Так в официальном «Положении об Институте гуманитарном»: "
+            "сокращённое название — ИГУМ НовГУ, местонахождение — Великий Новгород, Антоново. "
+            "Расписание аудиторий этого института на портале так и называется — «Расписание аудиторий (ИГУМ)».",
+        ]),
+        _rich_paragraph([
+            {"type": "bold", "text": "Суффикс у номера — метка здания: "},
+            {"type": "code", "text": "218ИГУМ"}, " и ", {"type": "code", "text": "402ИГУМ"},
+            " — кабинеты в корпусах Гуманитарного института в Антоново. Нужен он, чтобы развести одинаковые номера: "
+            "в университете рядом живут ", {"type": "code", "text": "218ИГУМ"}, " и ", {"type": "code", "text": "218ИЭ"},
+            ", ", {"type": "code", "text": "402ИГУМ"}, " и ", {"type": "code", "text": "402ПИ"}, ", ",
+            {"type": "code", "text": "310 ИГУМ"}, " и ", {"type": "code", "text": "310 ИНПО"},
+            " — это разные кабинеты. Этаж и номер читай по цифрам, как в шаге 1.",
+        ]),
+        _rich_paragraph([
+            {"type": "bold", "text": "Что это значит для нас: "},
+            "наш институт — экономики, но часть пар стоит в корпусах Гуманитарного института. "
+            "Это тот же кампус Антоново, ехать в другой район не надо: видишь ИГУМ в номере — идёшь в Антоново. ",
+            {"type": "bold", "text": "Спортзал"}, " — тоже Антоново.",
+        ]),
+        _rich_paragraph([
+            {"type": "bold", "text": "Пометка «ИГУМ, Антоново» в комментариях: "},
+            "это не номер кабинета, а место проведения (например, спортзал или актовый зал Гуманитарного института). "
+            "Бот выносит её в отдельное поле «место», чтобы не путать с аудиторией.",
+        ]),
+        _rich_paragraph([
+            {"type": "bold", "text": "Переход: "},
+            "из нового корпуса в старый (и наоборот) есть крытый переход — "
+            "можно пройти между зданиями, не выходя на улицу.",
+        ]),
+        _photo("attach://antonovo_transition", "Переход между корпусами Антоново"),
+        _rich_paragraph([
+            {"type": "bold", "text": "Столовая: "},
+            "при входе в новый корпус — справа.",
+        ]),
+        _rich_paragraph([
+            {"type": "bold", "text": "Важно: "},
+            "кампус стоит на территории бывшего Антониева монастыря (основан в 1106 году), "
+            "но метка на карте ниже — у входа в старый корпус, а не у собора.",
+        ]),
+        {"type": "map",
+         "location": dict(ANTONOVO_COORDS),
+         "zoom": 17, "width": 800, "height": 450,
+         "caption": {"text": [
+             {"type": "bold", "text": "Гуманитарный институт (ИГУМ)"},
+             " — кампус Антоново, метка у входа в старый корпус",
+         ]}},
+        _rich_paragraph([
+            {"type": "bold", "text": "Как добраться: "},
+            "автобусы ", {"type": "code", "text": "№ 2, 5, 8а"},
+            ", остановка «Студенческая улица, 1» (около 350 м до кампуса). "
+            "Для навигатора: Великий Новгород, территория Антоново, 1.",
+        ]),
+    )
+
+    weeks_section = _details(
         "Как читать недели и пометки",
         _rich_paragraph([
             {"type": "marked", "text": {"type": "bold", "text": "ВЕРХНЯЯ"}},
-            "  1, 3, 5, 7…  нечётные учебные недели\n",
+            "  1, 3, 5, 7… нечётные учебные недели.  ",
             {"type": "marked", "text": {"type": "bold", "text": "НИЖНЯЯ"}},
-            "  2, 4, 6, 8…  чётные учебные недели\n",
-            "Недели считаются от 01.09 по учебному календарю НовГУ.",
+            "  2, 4, 6, 8… чётные учебные недели. "
+            "Считаются от 01.09 по учебному календарю НовГУ.",
         ]),
         _divider(),
         _rich_paragraph([
             {"type": "marked", "text": {"type": "bold", "text": "ДОТ"}},
-            " — дистанционные образовательные технологии. ",
-            {"type": "code", "text": "*"},
-            " у предмета — смотри примечания под таблицей.",
+            " — дистанционные образовательные технологии: пара онлайн, идти никуда не надо. ",
+            {"type": "code", "text": "*"}, " у предмета — к нему есть примечание (уточнение по аудитории или формату).",
         ]),
         _rich_paragraph([
             {"type": "code", "text": "лек."}, " — лекция   ",
-            {"type": "code", "text": "пр."}, " — практическое занятие\n",
+            {"type": "code", "text": "пр."}, " — практическое занятие   ",
             {"type": "code", "text": "лаб."}, " — лабораторная работа   ",
-            {"type": "code", "text": "ауд."}, " — аудитория",
-        ]),
-        _divider(),
-        _rich_paragraph([
-            {"type": "marked", "text": {"type": "bold", "text": "Антоново"}},
-            " — учебный корпус в районе Антоново (Институт экономики, ИГУМ).\n",
-            {"type": "marked", "text": {"type": "bold", "text": "Б.С.-Петербургская, 41"}},
-            " — учебный корпус на Большой Санкт-Петербургской, 41.",
-        ]),
-        _divider(),
-        _rich_paragraph([
-            {"type": "bold", "text": "Преподаватели: "},
-            "полный список с предметами — ",
-            {"type": "url", "text": "в отдельном посте", "url": TEACHERS_POST_URL},
-        ]),
-        _divider(),
-        _rich_paragraph([
-            {"type": "bold", "text": "Источник: "},
-            {"type": "url", "text": "портал НовГУ", "url": source_url},
+            {"type": "code", "text": "подгр."}, " — подгруппа",
         ]),
     )
+
+    certificates_section = _details(
+        "Справки студентам",
+        _rich_paragraph([
+            {"type": "bold", "text": "Справка об обучении"},
+            " — с цветной печатью и подписью. Можно получить в электронном виде и распечатать самостоятельно.",
+        ]),
+        _rich_paragraph([
+            {"type": "bold", "text": "Как получить онлайн:"},
+        ]),
+        _rich_paragraph(["1. Зайти на портал НовГУ под личным логином и паролем;"]),
+        _rich_paragraph(["2. Открыть свой профайл;"]),
+        _rich_paragraph(["3. Найти раздел «Справки студентам»;"]),
+        _rich_paragraph(["4. Выбрать справку и скачать её."]),
+        _rich_paragraph([
+            "Также можно получить в ",
+            {"type": "bold", "text": "МФЦО"},
+            " (каб. 3105/5, главный корпус) при наличии студенческого билета.",
+        ]),
+        _rich_paragraph([
+            {"type": "bold", "text": "Важно: "},
+            "скачанную справку принимают не всегда — некоторые организации требуют оригинал с печатью.",
+        ]),
+        _divider(),
+        _rich_paragraph([
+            {"type": "bold", "text": "Справка о доходах"},
+            " — нужно заранее заказать: написать ФИО, номер группы, период, за который нужны доходы, "
+            "и количество экземпляров в журнале на столе у каб. 2207.",
+        ]),
+        _rich_paragraph([
+            {"type": "bold", "text": "Где: "},
+            "главный корпус НовГУ, Б. Санкт-Петербургская, 41, ",
+            {"type": "bold", "text": "кабинет 2207"},
+            " (2 этаж).",
+        ]),
+        _rich_paragraph([
+            "Также по электронной почте: ",
+            {"type": "code", "text": "Svetlana.Seliverstova@novsu.ru"},
+            ", в копию ",
+            {"type": "code", "text": "Galina.Vasyunova@novsu.ru"},
+            ".",
+        ]),
+        _rich_paragraph([
+            "Оригиналы готовы на следующий день после 14:00 в кабинете 2207 (главный корпус).",
+        ]),
+    )
+
+    money_section = _details(
+        "Деньги: стипендии, матпомощь, касса",
+        _rich_paragraph([
+            {"type": "bold", "text": "Стипендии платят 4 числа"},
+            " каждого месяца за предыдущий. Если 4-е выпадает на выходной — "
+            "в последний рабочий день перед ним. В декабре платят дважды, "
+            "январскую стипендию — к 25 января (Татьянин день).",
+        ]),
+        _rich_paragraph([
+            {"type": "bold", "text": "Академическая — 2545 ₽."},
+            " Назначается сразу после зачисления. Чтобы сохранить после сессии, "
+            "все зачёты и экзамены надо сдать без троек и долгов.",
+        ]),
+        _rich_paragraph([
+            {"type": "bold", "text": "Социальная — 3818 ₽"},
+            " (малообеспеченным студентам и льготным категориям).",
+        ]),
+        _rich_paragraph([
+            {"type": "bold", "text": "Повышенная академическая — 7400 ₽"},
+            " за достижения в учёбе, науке, спорте, творчестве или общественной деятельности. "
+            "Сессия на 4 и 5; заявления подают в первые две недели сентября и февраля. "
+            "Можно подать сразу на несколько номинаций — максимум до 20 000 ₽.",
+        ]),
+        _rich_paragraph([
+            {"type": "bold", "text": "Матпомощь — до 15 000 ₽"},
+            " раз в семестр (очно, бюджет). Документы подают в ООД с 1 по 10 число "
+            "(кроме января, июня, июля и августа), выплата приходит со стипендией в следующем месяце.",
+        ]),
+        _rich_paragraph([
+            {"type": "bold", "text": "Касса (главный корпус, 2 этаж, 14:00–18:00): "},
+            "каб. 2207 — стипендии, матпомощь, справки; каб. 2209 — оплата обучения; "
+            "каб. 2210 — оплата общежития.",
+        ]),
+    )
+
+    ood_section = _details(
+        "ООД: куда идти по вопросам учёбы",
+        _rich_paragraph([
+            "По любым вопросам учёбы (переводы, пересдачи, задолженности, индивидуальный план) "
+            "обращаются на свою кафедру или в ООД — отдел обеспечения деятельности.",
+        ]),
+        _rich_paragraph([
+            {"type": "bold", "text": "ООД Института экономики (наш институт): "},
+            "начальник отдела Одинокова Татьяна, каб. 423.",
+        ]),
+        _rich_paragraph([
+            "Телефон: ", {"type": "code", "text": "8 (8162) 97-45-61"},
+            ", почта: ", {"type": "code", "text": "Tatyana.Odinokova@novsu.ru"}, ".",
+        ]),
+        _rich_paragraph([
+            "ООД других институтов и колледжей — на официальной странице ",
+            {"type": "url", "text": "Отделы обеспечения деятельности НовГУ", "url": "https://www.novsu.ru/study/ood/"}, ".",
+        ]),
+    )
+
+    library_section = _details(
+        "Библиотека в Антоново",
+        _rich_paragraph([
+            "Отдел обслуживания пользователей Научной библиотеки НовГУ — для Гуманитарного, Юридического институтов "
+            "и Института экономики, то есть и для нас. Он в ауд. 1109 в кампусе Антоново.",
+        ]),
+        _rich_paragraph([
+            {"type": "bold", "text": "Для записи нужны: "},
+            "студенческий билет, 2 фотографии и паспорт. Единый читательский билет "
+            "действует во всех абонементах и читальных залах НовГУ.",
+        ]),
+        _rich_paragraph([
+            {"type": "bold", "text": "Режим: "},
+            "пн–чт 09:00–17:30, пт 09:00–17:00. Последняя пятница месяца — санитарный день.",
+        ]),
+    )
+
+    transport_section = _details(
+        "Автобусы: Антоново → западный район",
+        _rich_paragraph([
+            {"type": "bold", "text": "У кампуса: "},
+            "остановки «Студенческая ул.» и «Парковая ул., 2». Прямо отсюда в западный район идут два маршрута — №8а и №2. "
+            "Там же садится №5, но он в другую сторону: центр (Розважа, Кооперативная, Колмово) и дальше до «Акрона».",
+        ]),
+        _rich_paragraph([
+            {"type": "bold", "text": "№8а — главный, идёт кольцом: "},
+            "Парковая → Студенческая → Колмово → Ломоносова → Кочетова → Свободы → Зелинского → Попова → "
+            "Нехинская, 61 → пр. Мира → Нехинская, 1 → Вокзальная площадь → центр → Б. Санкт-Петербургская → "
+            "Колмово → Парковая → снова Антоново. Часть рейсов делает заезд по пр. Корсунова до ул. Коровникова "
+            "(там общежитие №5).",
+        ]),
+        _rich_paragraph([
+            {"type": "bold", "text": "№2 — на Псковскую сторону: "},
+            "Студенческая → Колмово → Б. Санкт-Петербургская → пл. Победы-Софийская → Псковская ул., 1 → 32 → 40 → 50, "
+            "дальше Мостищи и Панковка. Обратно в Антоново тот же №2 идёт через Парковую и Б. Московскую, 53.",
+        ]),
+        _rich_paragraph([
+            {"type": "bold", "text": "7–10 минут пешком — и вариантов в разы больше: "},
+            "остановки «Б.Московская ул., 53» и «Московская ул.»: ",
+            {"type": "bold", "text": "№1 "}, "(пр. Корсунова, запад — садиться на «Б.Московская ул., 53»), ",
+            {"type": "bold", "text": "№1а "}, "(Псковская ул. до Мостищей), ",
+            {"type": "bold", "text": "№4 "}, "(Вокзальная пл. → Нехинская → Попова → Зелинского → пр. Корсунова), ",
+            {"type": "bold", "text": "№6 "}, "и ", {"type": "bold", "text": "№44М "},
+            "(Ломоносова → пр. Мира → Зелинского → Попова), ",
+            {"type": "bold", "text": "№19 "}, "(Вокзальная пл. → Нехинская → пр. Мира → Попова → Зелинского).",
+        ]),
+        _rich_paragraph([
+            {"type": "bold", "text": "В пути: "},
+            "от кампуса до Зелинского/Попова на №8а — 11 остановок и около 7 км, минут 25–35. "
+            "Обратно из западного района тем же №8а по кольцу через Вокзальную и центр — примерно 14 остановок. "
+            "№4 от Б. Московской до Зелинского короче: 11 остановок, около 6 км.",
+        ]),
+        _rich_paragraph([
+            {"type": "bold", "text": "Где общежития: "},
+            "№2, №3 и №6 на Парковой, 7/9/10 — пешком от кампуса; №7 на ул. Свободы, 4 и №5 на пр. Корсунова, 36 к3 — "
+            "западный район, туда №8а. По заселению: ЦДОД «ДНК им. Ковалевской», Б. Санкт-Петербургская, 41, ауд. 1225, ",
+            {"type": "code", "text": "8 (8162) 33-20-44"}, ", zaselenie@novsu.ru.",
+        ]),
+        _rich_paragraph([
+            {"type": "bold", "text": "Движение в реальном времени: "},
+            "Яндекс Карты или 2ГИС — там видно, где автобус сейчас.",
+        ]),
+    )
+
+    life_section = _details(
+        "Вне учёбы: студсовет, студии, спорт",
+        _rich_paragraph([
+            {"type": "bold", "text": "Студсовет Института экономики (наш): "},
+            "мероприятия, квизы, благотворительные акции. Активность даёт баллы на повышенную стипендию. "
+            "Группа ВКонтакте: ",
+            {"type": "url", "text": "Студсовет ИЭ НовГУ", "url": "https://vk.com/studsovet.ie_novsu"}, ".",
+        ]),
+        _rich_paragraph([
+            {"type": "bold", "text": "Ещё два студенческих канала: "},
+            "общеуниверситетский ",
+            {"type": "url", "text": "Студсовет НовГУ", "url": "https://vk.com/studsovet.novsu"},
+            " и ", {"type": "url", "text": "Студсовет Гуманитарного института", "url": "https://vk.com/studsovet.igum"},
+            " — мы занимаемся в его корпусах, часть событий в Антоново анонсирует он.",
+        ]),
+        _rich_paragraph([
+            {"type": "bold", "text": "Профсоюз студентов: "},
+            "защита прав, скидки по программе «ПрофПлюс» и РЖД Бонус. Вступление — каб. 3216 главного корпуса. "
+            "Группа ВКонтакте: ",
+            {"type": "url", "text": "Студенческий профком НовГУ", "url": "https://vk.com/profkomnovgu"}, ".",
+        ]),
+        _rich_paragraph([
+            {"type": "bold", "text": "Волонтёрство: "},
+            "часы волонтёрства конвертируются в баллы на повышенную стипендию; "
+            "есть конкурсы «Волонтёр месяца» и «Волонтёр года».",
+        ]),
+        _rich_paragraph([
+            {"type": "bold", "text": "Творческие студии (бесплатно): "},
+            "актовый зал Антоново — вокал «MIX» и «КАЛЕЙДОСКОП», хор «РЕНЕССАНС», театр «АМПЛУА», "
+            "хореография, гитара, школа диджеев. Расписание и анонсы — в группе ВКонтакте ",
+            {"type": "url", "text": "Культура и творчество НовГУ (ЦСПИ)", "url": "https://vk.com/novsu.event"}, ".",
+        ]),
+        _rich_paragraph([
+            {"type": "bold", "text": "Спортклуб «Новгородские Рыси» (бесплатно, 18 секций): "},
+            "в Антоново — флорбол (зал 1: пн 19:00–20:30, пт 19:30–21:00), вольная борьба (зал 2: пн/ср/пт 20:00–22:00), "
+            "большой теннис (зал 1: вс 10:00–17:00) и бадминтон (зал 1: вс 20:00–22:00). "
+            "Полное расписание — в группе ВКонтакте ",
+            {"type": "url", "text": "Новгородские Рыси | ССК НовГУ", "url": "https://vk.com/sport_novsu"}, ".",
+        ]),
+        _rich_paragraph([
+            {"type": "bold", "text": "Адаптеры: "},
+            "студент старшего курса, который координирует группу первокурсников, — «человек, к которому можно "
+            "обратиться по любому вопросу». Адаптеры Института экономики — в посте ",
+            {"type": "url", "text": "ВКонтакте", "url": "https://vk.com/wall-34755757_34267"},
+            ", списки по всем институтам — на официальной странице ",
+            {"type": "url", "text": "«Адаптеры» НовГУ", "url": "https://www.novsu.ru/study/freshman/adapters/"}, ".",
+        ]),
+        _rich_paragraph([
+            {"type": "bold", "text": "Где поесть: "},
+            "в Антоново — столовая Гуманитарного института (новый корпус, 2 этаж, 10:00–16:00, есть диет-стол). "
+            "В главном корпусе на Б. Санкт-Петербургской, 41 — кафе университета (ауд. 1110, 10:00–17:00 без перерыва).",
+        ]),
+        _rich_paragraph([
+            {"type": "bold", "text": "Базы отдыха НовГУ со скидкой студентам: "},
+            "«Песочки» (Солецкий район, 61 км от города) и «Шуя» (Валдайский район, 150 км) — вариант на выходные и каникулы.",
+        ]),
+    )
+
+    return _details_open(
+        "Гид первокурсника: аудитории, корпуса, недели, деньги, справки",
+        algorithm,
+        rooms_section,
+        antonovo_section,
+        weeks_section,
+        certificates_section,
+        money_section,
+        ood_section,
+        library_section,
+        transport_section,
+        life_section,
+    )
+
+
+def _time_legend() -> dict:
+    """Легенда времени: портал печатает начала академических часов, не пары.
+
+    Один раз на пост объясняет сетку 45 + 15 + 45 и вариант «препод ведёт без
+    перерыва», чтобы в таблицах не повторять это у каждой пары.
+    """
+    return _rich_paragraph([
+        {"type": "bold", "text": "Время: "},
+        f"{bells.PAIR_STRUCTURE} — пара ", {"type": "code", "text": "09:00–10:45"},
+        ". Если препод ведёт без перерыва, конец на 15 минут раньше: ",
+        {"type": "code", "text": "09:00–10:30"},
+        ". На портале в колонке «время» стоят начала академических часов, "
+        "поэтому ", {"type": "code", "text": "14:00 15:00 16:00 17:00"},
+        " — это две пары: ", {"type": "code", "text": "14:00–15:45"}, " и ",
+        {"type": "code", "text": "16:00–17:45"}, ".",
+    ])
 
 
 def build_dashboard_rich_message(
@@ -356,11 +823,9 @@ def build_dashboard_rich_message(
         if last_updated:
             title += f"\n\nПоследние изменения: {last_updated}"
 
-    today = day_view(schedule, weeks, target_date, group=group_name, source_url=source_url)
-    tomorrow = day_view(schedule, weeks, target_date + dt.timedelta(days=1), group=group_name, source_url=source_url)
     current_date = current_date or dt.date.today()
 
-    blocks: list[dict] = [_pullquote(title)]
+    blocks: list[dict] = [_pullquote(title), _time_legend()]
 
     if target_week:
         week = week_view(schedule, weeks, target_week, group=group_name, source_url=source_url)
@@ -386,21 +851,13 @@ def build_dashboard_rich_message(
                 source_url=source_url,
             )
             for day in week["days"]
+            if day["lessons"]
         ]
         if not week_blocks:
             week_blocks = [_paragraph("На эту учебную неделю пары не найдены.")]
         blocks.append(_details(_week_summary(), *week_blocks))
         blocks.append(_divider())
 
-    blocks.append(
-        _details(
-            f"Дневник: {target_date.strftime('%d.%m')} и {(target_date + dt.timedelta(days=1)).strftime('%d.%m')}",
-            _day_blocks(today),
-            _day_blocks(tomorrow),
-        )
-    )
-    blocks.append(_divider())
-    blocks.append(_reading_help(source_url))
     return {"rich_message": {"blocks": blocks}}
 
 
@@ -425,7 +882,7 @@ def build_rich_message(
     else:
         title = f"Расписание группы {group_name}"
 
-    blocks: list[dict] = [_pullquote(title)]
+    blocks: list[dict] = [_pullquote(title), _time_legend()]
     if is_demo:
         blocks.append(_paragraph("Демо формата: данные занятий используются только для предпросмотра."))
     # Один раскрывающийся раздел с определениями — пометки по дням не трогаем
@@ -637,7 +1094,7 @@ def render_schedule_html(
                     "<tr>"
                     f"<td class='n'>{_html.escape(fields['number'])}</td>"
                     f"<td>{_html.escape(fields['subject'])}{star}</td>"
-                    f"<td class='t'>{_html.escape(fields['time'])}</td>"
+                    f"<td class='t'>{_html.escape(fields['time']).replace(chr(10), '<br>')}</td>"
                     f"<td class='r'>{_html.escape(fields['room'])}</td>"
                     f"<td>{_html.escape(fields['teacher'])}</td>"
                     "</tr>"
@@ -730,6 +1187,7 @@ def _header_message(group_name: str, week: dict | None, source_url: str) -> str:
         "<b>ВЕРХНЯЯ</b> 1, 3, 5, 7…  нечётные учебные недели",
         "<b>НИЖНЯЯ</b> 2, 4, 6, 8…  чётные учебные недели",
         "Важно: недели считаются по учебному календарю НовГУ, а не по календарным неделям года.",
+        f"<b>Время</b> {_escape_truncated(bells.LEGEND, 240)}",
         "<b>*</b> у предмета означает, что условие раскрыто в разделе «Примечания».",
         "<b>ДОТ</b> — дистанционные образовательные технологии.",
         "<b>лек.</b> — лекция   <b>пр.</b> — практическое занятие   <b>лаб.</b> — лабораторная работа",
@@ -760,7 +1218,7 @@ def _day_chunks(day: str, pairs: list) -> list[str]:
         number = pair.get("number") or index
         full_subject = pair.get("subject") or pair.get("subject_raw") or pair.get("name") or ""
         subject = full_subject.split("\n", 1)[0] if full_subject else "—"
-        pair_time = pair.get("time") or "—"
+        pair_time = bells.slot(pair.get("time")).label()
         room = pair.get("room") or "—"
         teacher = pair.get("teacher") or "—"
         note = pair.get("note") or pair.get("raw_comment") or ""
@@ -855,6 +1313,40 @@ def format_schedule_post(schedule, weeks, source_url, today=None, changes_summar
 DAY_TO_SHORT = {full: short for short, full in DAY_SHORT_TO_FULL.items()}
 
 
+def changed_days(diff: dict) -> list[str]:
+    """Полные имена дней из диффа в порядке недели (Понедельник … Воскресенье)."""
+    found: list[str] = []
+    for key in ("added", "removed", "changed"):
+        for item in diff.get(key) or []:
+            day = str(item.get("day") or "").strip()
+            if day and day not in found:
+                found.append(day)
+    order = {name: index for index, name in enumerate(DAYS_ORDER)}
+    return sorted(found, key=lambda day: order.get(day, len(order)))
+
+
+def pick_day_screens(diff: dict, items: list[dict] | None) -> list[dict]:
+    """Оставить только скрины тех дней, которые реально поменялись.
+
+    *items* — [{label, path}] от скриншоттера, где label это короткий день
+    портала («Ср») либо склейка «Пн + Вт» при days_per_chunk > 1. Скрин берём,
+    если хотя бы один день из его метки есть в диффе: картинка всё равно
+    показывает день целиком.
+    """
+    wanted = set(changed_days(diff))
+    if not wanted or not items:
+        return []
+    picked = []
+    for item in items:
+        if not isinstance(item, dict) or not item.get("path"):
+            continue
+        label = str(item.get("label") or "").strip()
+        parts = [DAY_SHORT_TO_FULL.get(part.strip(), part.strip()) for part in label.split("+")]
+        if any(part in wanted for part in parts):
+            picked.append(item)
+    return picked
+
+
 def _changes_word(count: int) -> str:
     if count % 10 == 1 and count % 100 != 11:
         return "изменение"
@@ -874,7 +1366,7 @@ def _diff_lesson_row(item: dict) -> list[tuple[object, str]]:
     subject = str(item.get("subject") or "—").split("\n", 1)[0]
     return [
         (_truncate_rich_text(day, 24), "code"),
-        (_truncate_rich_text(item.get("time"), 48), "code"),
+        (_truncate_rich_text(bells.slot(item.get("time")).label(), 48), "code"),
         (_truncate_rich_text(subject, 240), "accent"),
         (_truncate_rich_text(item.get("room"), 80), "code"),
         (_truncate_rich_text(item.get("teacher"), 160), "bold"),
@@ -932,54 +1424,128 @@ def _chunked(values: list, size: int) -> list[list]:
     return [values[index:index + size] for index in range(0, len(values), size)]
 
 
-def _diff_table_section(label: str, selected: list[dict], total: int) -> dict:
-    content: list[dict] = []
-    chunks = _chunked(selected, _RICH_DIFF_TABLE_CHUNK)
-    for index, chunk in enumerate(chunks):
-        if len(chunks) > 1:
-            first = index * _RICH_DIFF_TABLE_CHUNK + 1
-            last = first + len(chunk) - 1
-            content.append(_paragraph(f"Записи {first}–{last}"))
-        content.append(_table([_DIFF_TABLE_HEAD] + [_diff_lesson_row(item) for item in chunk]))
-    omitted = total - len(selected)
-    if omitted:
-        content.append(_paragraph(f"Показаны первые {len(selected)}. Ещё {omitted} не поместились в лимит сообщения."))
-    return _details_open(f"{label} — {total}", *content)
+_KIND_MARK = {"added": "+", "removed": "−", "changed": "~"}
+_KIND_RANK = {"added": 0, "removed": 1, "changed": 2}
+
+_DAY_TABLE_HEAD = [
+    ("что", "bold"), ("время", "bold"), ("предмет", "bold"),
+    ("ауд.", "bold"), ("преподаватель", "bold"),
+]
 
 
-def _changed_section(selected: list[dict], total: int) -> dict:
-    content: list[dict] = []
-    chunks = _chunked(selected, _RICH_DIFF_TABLE_CHUNK)
-    for chunk_index, chunk in enumerate(chunks):
-        if len(chunks) > 1:
-            first = chunk_index * _RICH_DIFF_TABLE_CHUNK + 1
-            last = first + len(chunk) - 1
-            content.append(_paragraph(f"Записи {first}–{last}"))
-        for item in chunk:
-            day_value = str(item.get("day") or "—")
-            day = DAY_TO_SHORT.get(day_value, day_value)
-            subject = str(item.get("subject") or "—").split("\n", 1)[0]
-            header = (
-                f"{_truncate_rich_text(day, 24)} "
-                f"{_truncate_rich_text(item.get('time'), 48)} — "
-                f"{_truncate_rich_text(subject, 240)}"
-            )
-            field_lines = []
-            for field in (item.get("fields") or [])[:8]:
-                if not isinstance(field, (list, tuple)) or len(field) != 3:
-                    continue
-                label, old, new = field
-                field_lines.append(
-                    f"{_truncate_rich_text(label, 60)}: "
-                    f"{_truncate_rich_text(old, 180)} → {_truncate_rich_text(new, 180)}"
-                )
-            if len(item.get("fields") or []) > 8:
-                field_lines.append(f"… ещё {len(item['fields']) - 8} полей")
-            content.append(_note(header, "\n".join(field_lines) or "изменение"))
-    omitted = total - len(selected)
-    if omitted:
-        content.append(_paragraph(f"Показаны первые {len(selected)}. Ещё {omitted} не поместились в лимит сообщения."))
-    return _details_open(f"Изменено — {total}", *content)
+def _day_change_row(kind: str, item: dict) -> list[tuple[object, str]]:
+    """Строка таблицы дня: знак правки, время парой, предмет, аудитория, препод."""
+    subject = str(item.get("subject") or "—").split("\n", 1)[0]
+    return [
+        (_KIND_MARK.get(kind, "?"), "code"),
+        (_truncate_rich_text(bells.slot(item.get("time")).label(), 48), "code"),
+        (_truncate_rich_text(subject, 240), "accent"),
+        (_truncate_rich_text(item.get("room"), 80), "code"),
+        (_truncate_rich_text(item.get("teacher"), 160), "bold"),
+    ]
+
+
+def _changed_note(item: dict, *, with_day: bool = True) -> dict:
+    """Заметка «что именно поменялось» в одной записи: было → стало."""
+    day_value = str(item.get("day") or "—")
+    day = DAY_TO_SHORT.get(day_value, day_value)
+    subject = str(item.get("subject") or "—").split("\n", 1)[0]
+    time_label = _truncate_rich_text(bells.slot(item.get("time")).label(), 48)
+    header = f"{_truncate_rich_text(subject, 240)}"
+    if with_day:
+        header = f"{_truncate_rich_text(day, 24)} {time_label} — {header}"
+    else:
+        header = f"{time_label} — {header}"
+    field_lines: list[str] = []
+    fields = item.get("fields") or []
+    for field in fields[:8]:
+        if not isinstance(field, (list, tuple)) or len(field) != 3:
+            continue
+        label, old, new = field
+        field_lines.append(
+            f"{_truncate_rich_text(label, 60)}: "
+            f"{_truncate_rich_text(old, 180)} → {_truncate_rich_text(new, 180)}"
+        )
+    if len(fields) > 8:
+        field_lines.append(f"… ещё {len(fields) - 8} полей")
+    return _note(header, "\n".join(field_lines) or "изменение")
+
+
+def _media_for_day(
+    day: str,
+    screenshot_media: list[dict] | None,
+    used: set[str],
+) -> tuple[str | None, list[str]]:
+    """Attach://-скрин дня и короткие имена дней, которым он тоже принадлежит.
+
+    Один файл используем ровно раз: при склейке «Пн + Вт» картинка попадает в
+    первый подходящий блок дня, остальным дням остаётся текстовая пометка.
+    """
+    for item in screenshot_media or []:
+        if not isinstance(item, dict):
+            continue
+        media = str(item.get("media") or "").strip()
+        if not media:
+            continue
+        parts = [part.strip() for part in str(item.get("label") or "").split("+") if part.strip()]
+        full = [DAY_SHORT_TO_FULL.get(part, part) for part in parts]
+        if day in full:
+            others = [DAY_TO_SHORT.get(name, name) for name in full if name != day]
+            if media in used:
+                return None, others
+            used.add(media)
+            return media, others
+    return None, []
+
+
+def _day_sections(
+    added: list[dict],
+    removed: list[dict],
+    changed: list[dict],
+    screenshot_media: list[dict] | None,
+    source_url: str,
+) -> list[dict]:
+    """Правки по дням: таблица дня, что именно изменилось и скрин нового дня.
+
+    Читатель видит день целиком: знак правки у каждой записи, расшифровка
+    «было → стало» и рядом картинка нового расписания с портала.
+    """
+    by_day: dict[str, list[tuple[str, dict]]] = {}
+    for kind, items in (("added", added), ("removed", removed), ("changed", changed)):
+        for item in items:
+            day = str(item.get("day") or "").strip() or "—"
+            by_day.setdefault(day, []).append((kind, item))
+    order = {name: index for index, name in enumerate(DAYS_ORDER)}
+    used: set[str] = set()
+    blocks: list[dict] = []
+    for day in sorted(by_day, key=lambda name: order.get(name, len(order))):
+        entries = by_day[day]
+        entries.sort(key=lambda pair: (bells.slot(pair[1].get("time")).start, _KIND_RANK.get(pair[0], 9)))
+        content: list[dict] = []
+        rows = [_day_change_row(kind, item) for kind, item in entries]
+        chunks = _chunked(rows, _RICH_DIFF_TABLE_CHUNK)
+        for chunk_index, chunk in enumerate(chunks):
+            if len(chunks) > 1:
+                first = chunk_index * _RICH_DIFF_TABLE_CHUNK + 1
+                content.append(_paragraph(f"Записи {first}–{first + len(chunk) - 1}"))
+            content.append(_table([_DAY_TABLE_HEAD] + chunk))
+        notes = [_changed_note(item, with_day=False) for kind, item in entries if kind == "changed"]
+        for chunk in _chunked(notes, _RICH_DIFF_TABLE_CHUNK):
+            content.append(_details(f"Что именно поменялось — {len(chunk)}", *chunk))
+        media, shared = _media_for_day(day, screenshot_media, used)
+        if media:
+            content.append(_photo(media, [
+                {"type": "bold", "text": f"Новое расписание: {day}"},
+                " · оригинал на ", {"type": "url", "text": "портале", "url": source_url},
+            ]))
+        elif shared:
+            content.append(_paragraph(
+                f"Скрин этого дня общий с {', '.join(shared)} — он в блоке выше."
+            ))
+        blocks.append(_details_open(
+            f"{day} — {len(entries)} {_changes_word(len(entries))}", *content
+        ))
+    return blocks
 
 
 def build_changes_rich_message(
@@ -989,6 +1555,7 @@ def build_changes_rich_message(
     *,
     group_name: str = "6381",
     now: dt.datetime | None = None,
+    screenshot_media: list[dict] | None = None,
 ) -> dict:
     """Build a bounded rich diff that stays within Bot API rich limits.
 
@@ -1031,15 +1598,24 @@ def build_changes_rich_message(
 
     def assemble() -> dict:
         blocks: list[dict] = [_pullquote("\n".join(title_lines))]
-        if added:
-            blocks.append(_diff_table_section("Добавлено", added[:limits[0]], len(added)))
-        if removed:
-            blocks.append(_diff_table_section("Убрано", removed[:limits[1]], len(removed)))
-        if changed:
-            blocks.append(_changed_section(changed[:limits[2]], len(changed)))
+        shown = (added[:limits[0]], removed[:limits[1]], changed[:limits[2]])
+        if added or removed or changed:
+            blocks.append(_rich_paragraph([
+                {"type": "bold", "text": "Правки по дням: "},
+                {"type": "code", "text": "+"}, " добавлено · ",
+                {"type": "code", "text": "−"}, " убрано · ",
+                {"type": "code", "text": "~"}, " изменено.",
+            ]))
+            blocks.extend(_day_sections(*shown, screenshot_media, source_url))
+            omitted = total - sum(len(part) for part in shown)
+            if omitted > 0:
+                blocks.append(_paragraph(
+                    f"Показаны не все правки: ещё {omitted} не поместились в лимит сообщения."
+                ))
         if not (added or removed or changed or transition):
             blocks.append(_paragraph("Содержимое страницы изменилось, но состав пар прежний."))
         blocks.append(_divider())
+        blocks.append(_time_legend())
         blocks.append(_rich_paragraph([
             {"type": "bold", "text": "Источник: "},
             {"type": "url", "text": "портал НовГУ", "url": source_url},
@@ -1080,7 +1656,7 @@ def changes_fallback_text(diff: dict, source_url: str, *, group_name: str = "638
             subject = str(item.get("subject") or "—").split("\n", 1)[0]
             item_lines.append(
                 f"{prefix} {_escape_truncated(day, 60)} "
-                f"{_escape_truncated(item.get('time'), 100)} — "
+                f"{_escape_truncated(bells.slot(item.get('time')).label(), 100)} — "
                 f"{_escape_truncated(subject, 1500)}, ауд. "
                 f"{_escape_truncated(item.get('room'), 300)}"
             )
@@ -1102,7 +1678,8 @@ def changes_fallback_text(diff: dict, source_url: str, *, group_name: str = "638
             field_parts.append(f"… ещё {len(fields) - 4} полей")
         details = "; ".join(field_parts) or "изменение"
         item_lines.append(
-            f"~ {_escape_truncated(day, 60)} {_escape_truncated(item.get('time'), 100)} — "
+            f"~ {_escape_truncated(day, 60)} "
+            f"{_escape_truncated(bells.slot(item.get('time')).label(), 100)} — "
             f"{_escape_truncated(subject, 1200)} ({details})"
         )
 

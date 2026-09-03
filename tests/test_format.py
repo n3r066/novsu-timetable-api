@@ -110,13 +110,22 @@ def test_changes_rich_message_structure():
     blob = json.dumps(rm, ensure_ascii=False)
     assert "Поменяли расписание" in blob
     assert "3 изменения" in blob
-    assert "Добавлено — 1" in blob
-    assert "Убрано — 1" in blob
-    assert "Изменено — 1" in blob
+    # правки сгруппированы по дням в порядке недели, а не по типу изменения
+    summaries = [block.get("summary") for block in blocks if block.get("type") == "details"]
+    assert summaries[:3] == ["Вторник — 1 изменение", "Среда — 1 изменение", "Четверг — 1 изменение"]
+    assert "Правки по дням" in blob
     assert "(лек.) Новый" in blob
     assert "203 → 415" in blob
+    assert "Что именно поменялось — 1" in blob
     assert "портал НовГУ" in blob
     assert '"type": "table"' in blob
+    marks = [
+        cell["text"][0]["text"]
+        for block in blocks if block.get("type") == "details"
+        for inner in block.get("blocks") or [] if inner.get("type") == "table"
+        for row in inner["cells"][1:] for cell in row[:1]
+    ]
+    assert sorted(marks) == sorted(["+", "−", "~"])
 
 
 def test_changes_rich_message_hides_empty_sections():
@@ -150,51 +159,51 @@ def test_changes_fallback_text_is_valid_and_bounded():
     assert len(changes_fallback_text(big, "https://example.test")) <= 4096
 
 
-def test_dashboard_rich_message_has_diary_and_week_sections():
+def test_dashboard_rich_message_has_week_section():
     import json
     data = _load()
     weeks = [{"week": 1, "half": "top", "start": "01.09.2026", "end": "05.09.2026"}]
     screenshots = [
-        {"label": "Вт", "media": "attach://site_screenshot_1"},
-        {"label": "Ср", "media": "attach://site_screenshot_2"},
+        {"label": "Чт", "media": "attach://site_screenshot_1"},
     ]
     rm = build_dashboard_rich_message(data["schedule"], weeks, "https://example.test", dt.date(2026, 9, 2), screenshot_media=screenshots, current_date=dt.date(2026, 8, 24))
     blob = json.dumps(rm, ensure_ascii=False)
     assert "Расписание группы 6381" in blob
     assert "Фокус: 02.09.2026" in blob
-    assert "Дневник" in blob
+    assert "Дневник" not in blob  # removed from dashboard
     assert "Полное расписание" in blob
     assert "Неделя 1 (верхняя)" in blob
-    assert "Как читать" in blob
-    assert "портал НовГУ" in blob
+    assert "Как читать" not in blob  # moved to separate guide post
+    assert "портал НовГУ" not in blob  # moved to separate guide post
     assert '"type": "footer"' not in blob
-    assert "Среда — 02.09: 0 пар" in blob
+    assert "Среда — 02.09: 0 пар" not in blob  # diary removed
     assert "Скрины · оригинал по дням" not in blob
-    assert "Скрин: Вторник" in blob
-    assert "Скрин: Среда" in blob
+    assert "Скрин: Четверг" in blob
     assert "Скрин с сайта" not in blob
     assert '"text": "день"' not in blob
     assert '"text": "скрин"' not in blob
     assert '"text": "ниже"' not in blob
     assert "attach://site_screenshot_1" in blob
-    assert "attach://site_screenshot_2" in blob
-    assert "Вторник" in blob
-    assert "Среда" in blob
+    assert "Четверг" in blob
+    assert "Среда" not in blob  # diary removed; 0-lesson day hidden from week view
     assert "оригинальное" in blob
     assert '"text": "расписание"' in blob
     assert '"type": "photo"' in blob
     assert '"header"' not in blob
     assert "details" in blob and "table" in blob
+    # Дни с нулём пар скрыты из полного расписания (и их скрины тоже)
+    assert "Вторник" not in blob
+    assert "Скрин: Вторник" not in blob
+    assert "Скрин: Среда" not in blob
 
 
 def test_dashboard_screenshot_section_is_the_only_open_section():
     data = _load()
     weeks = [{"week": 1, "half": "top", "start": "01.09.2026", "end": "05.09.2026"}]
     screenshots = [
-        {"label": "Вт", "media": "attach://site_screenshot_1"},
-        {"label": "Ср", "media": "attach://site_screenshot_2"},
+        {"label": "Чт", "media": "attach://site_screenshot_1"},
     ]
-    rm = build_dashboard_rich_message(data["schedule"], weeks, "https://example.test", dt.date(2026, 9, 2), screenshot_media=screenshots, current_date=dt.date(2026, 9, 2))
+    rm = build_dashboard_rich_message(data["schedule"], weeks, "https://example.test", dt.date(2026, 9, 3), screenshot_media=screenshots, current_date=dt.date(2026, 9, 3))
     details = []
 
     def walk(blocks):
@@ -205,7 +214,7 @@ def test_dashboard_screenshot_section_is_the_only_open_section():
 
     walk(rm["rich_message"]["blocks"])
     open_sections = [block.get("summary") for block in details if block.get("is_open") or block.get("open")]
-    assert open_sections == ["Скрин: Среда"]
+    assert open_sections == ["Скрин: Четверг"]
 
 
 def test_dashboard_has_no_open_sections_on_sunday():
@@ -362,18 +371,258 @@ def test_dashboard_week_before_diary():
         data["schedule"], weeks, "https://example.test", dt.date(2026, 9, 2),
     )
     blocks = rm["rich_message"]["blocks"]
-    # block 0 = pullquote (title)
-    # block 1 = details (week) — must come BEFORE diary
-    # block 3 = details (diary)
+    # block 0 = pullquote (title), block 1 = легенда времени, дальше разделы
     assert blocks[0]["type"] == "pullquote"
-    assert blocks[1]["type"] == "details"
-    assert "Дневник" not in json.dumps(blocks[1], ensure_ascii=False)
-    assert "Полное расписание" in json.dumps(blocks[1], ensure_ascii=False)
-    diary_found = False
-    for b in blocks[2:]:
-        if b.get("type") == "details":
-            blob = json.dumps(b, ensure_ascii=False)
-            if "Дневник" in blob:
-                diary_found = True
-                break
-    assert diary_found
+    week = next(block for block in blocks if block["type"] == "details")
+    assert "Полное расписание" in json.dumps(week, ensure_ascii=False)
+    assert "Дневник" not in json.dumps(week, ensure_ascii=False)
+    # дневник из дашборда убран: его не должно быть ни в одном блоке
+    assert all("Дневник" not in json.dumps(block, ensure_ascii=False) for block in blocks)
+
+
+def _mini_timetable() -> dict:
+    """Пн — обычная пара, Вт — четыре академических часа одной строкой."""
+    html = (
+        "<table>"
+        "<tr><th>дата</th><th>время</th><th>под гр.</th><th>предмет</th>"
+        "<th>преподаватель</th><th>ауд.</th><th>комм.</th></tr>"
+        "<tr><td>Пн</td><td>9:00 10:00</td><td></td><td>(лек.) Матан</td>"
+        "<td>Иванов И. И.</td><td>101</td><td></td></tr>"
+        "<tr><td>Вт</td><td>14:00 15:00 16:00 17:00</td><td></td><td>(пр.) Проект</td>"
+        "<td>Петров П. П.</td><td>202</td><td>Антоново</td></tr>"
+        "</table>"
+    )
+    return parse_all(html)
+
+
+WEEK_1 = [{"week": 1, "half": "top", "start": "31.08.2026", "end": "05.09.2026"}]
+
+
+def _tables(node) -> list:
+    """Все table-блоки rich-сообщения, в любом порядке вложенности."""
+    found: list = []
+    if isinstance(node, dict):
+        if node.get("type") == "table":
+            found.append(node)
+        for value in node.values():
+            found.extend(_tables(value))
+    elif isinstance(node, list):
+        for value in node:
+            found.extend(_tables(value))
+    return found
+
+
+def test_dashboard_shows_real_pair_intervals_instead_of_portal_hour_starts():
+    data = _mini_timetable()
+    rm = build_dashboard_rich_message(
+        data["schedule"], WEEK_1, "https://example.test", dt.date(2026, 8, 31),
+    )
+    blob = json.dumps(rm, ensure_ascii=False)
+    validate_rich_payload(rm)
+    tables = json.dumps(_tables(rm), ensure_ascii=False)
+    # Портальная запись «начала часов» в таблицы не просачивается
+    # (в легенде она остаётся как наглядный пример).
+    assert "9:00 10:00" not in tables
+    assert "14:00 15:00 16:00 17:00" not in tables
+    # Обычная пара — интервал с 15-минутным перерывом внутри.
+    assert "09:00–10:45" in blob
+    # Четыре академических часа — две пары, а не одно занятие до 17:45.
+    assert "14:00–15:45" in blob and "16:00–17:45" in blob
+    # Легенда объясняет сетку и вариант без перерыва.
+    assert "45 + 15 перерыв + 45" in blob
+    assert "09:00–10:30" in blob
+
+
+def test_dashboard_keeps_odd_hour_visible():
+    data = parse_all(
+        "<table>"
+        "<tr><th>дата</th><th>время</th><th>под гр.</th><th>предмет</th>"
+        "<th>преподаватель</th><th>ауд.</th><th>комм.</th></tr>"
+        "<tr><td>Пн</td><td>16:00 17:00 18:00</td><td></td><td>(лек.) Физра</td>"
+        "<td>—</td><td>Спортзал</td><td></td></tr>"
+        "</table>"
+    )
+    rm = build_dashboard_rich_message(
+        data["schedule"], WEEK_1, "https://example.test", dt.date(2026, 8, 31),
+    )
+    blob = json.dumps(rm, ensure_ascii=False)
+    assert "16:00–17:45" in blob
+    assert "18:00–18:45 (1 ак. ч.)" in blob
+
+
+def test_semester_post_and_html_screenshot_use_the_same_intervals():
+    data = _mini_timetable()
+    rm = build_rich_message(data["schedule"], WEEK_1, "https://example.test", dt.date(2026, 8, 31))
+    blob = json.dumps(rm, ensure_ascii=False)
+    assert "09:00–10:45" in blob and "16:00–17:45" in blob
+    html = render_schedule_html(data["schedule"], WEEK_1, "https://example.test", dt.date(2026, 8, 31))
+    assert "09:00–10:45" in html
+    assert "<br>" in html  # вторая пара того же дня — отдельной строкой
+    assert "9:00 10:00" not in html
+
+
+def _all_day_media():
+    return [
+        {"label": label, "media": f"attach://changes_screenshot_{index}"}
+        for index, label in enumerate(["Пн", "Вт", "Ср", "Чт", "Пт", "Сб"], 1)
+    ]
+
+
+def _photos_by_day(blocks):
+    """Фото внутри дневных секций: [(summary секции, media, caption)]."""
+    out = []
+    for block in blocks:
+        if block.get("type") != "details" or not block.get("summary"):
+            continue
+        for inner in block.get("blocks") or []:
+            if inner.get("type") == "photo":
+                out.append((block["summary"], inner["photo"]["media"], inner.get("caption", {}).get("text")))
+    return out
+
+
+def test_changes_post_attaches_screens_only_for_changed_days():
+    rm = build_changes_rich_message(
+        _sample_diff(), [], "https://example.test",
+        now=dt.datetime(2026, 9, 2, 12, 0),
+        screenshot_media=_all_day_media(),
+    )
+    blocks = rm["rich_message"]["blocks"]
+    shots = _photos_by_day(blocks)
+    # В диффе Вторник, Среда и Четверг — значит и скринов ровно три, по порядку недели.
+    assert [summary for summary, _, _ in shots] == [
+        "Вторник — 1 изменение", "Среда — 1 изменение", "Четверг — 1 изменение",
+    ]
+    assert [media for _, media, _ in shots] == [
+        "attach://changes_screenshot_2", "attach://changes_screenshot_3", "attach://changes_screenshot_4",
+    ]
+    assert all("Новое расписание" in json.dumps(caption, ensure_ascii=False) for _, _, caption in shots)
+    blob = json.dumps(rm, ensure_ascii=False)
+    # Понедельник, Пятница и Суббота не менялись — их скрины в пост не попали.
+    for unused in ("changes_screenshot_1", "changes_screenshot_5", "changes_screenshot_6"):
+        assert unused not in blob
+    validate_rich_payload({"chat_id": -1001, **rm})
+
+
+def test_changes_post_reuses_one_screen_for_combined_day_label():
+    diff = {
+        "added": [{"day": "Понедельник", "time": "09:00 10:00", "subject": "Новая пара",
+                   "room": "101", "teacher": "Иванов"}],
+        "removed": [{"day": "Вторник", "time": "11:00 12:00", "subject": "Старая пара",
+                     "room": "202", "teacher": "Петров"}],
+        "changed": [],
+        "transition": None,
+    }
+    rm = build_changes_rich_message(
+        diff, [], "https://example.test", now=dt.datetime(2026, 9, 2, 12, 0),
+        screenshot_media=[{"label": "Пн + Вт", "media": "attach://changes_screenshot_1"}],
+    )
+    shots = _photos_by_day(rm["rich_message"]["blocks"])
+    # одна картинка на два дня: вставляется в первый день, второму — пометка
+    assert [summary for summary, _, _ in shots] == ["Понедельник — 1 изменение"]
+    blob = json.dumps(rm, ensure_ascii=False)
+    assert "Скрин этого дня общий с Пн" in blob
+    assert blob.count("attach://changes_screenshot_1") == 1
+    validate_rich_payload({"chat_id": -1001, **rm})
+
+
+def test_changes_post_without_screens_stays_text_only():
+    rm = build_changes_rich_message(_sample_diff(), [], "https://example.test",
+                                    now=dt.datetime(2026, 9, 2, 12, 0))
+    assert _photos_by_day(rm["rich_message"]["blocks"]) == []
+    assert "photo" not in json.dumps(rm, ensure_ascii=False)
+
+
+def test_pick_day_screens_understands_combined_labels():
+    from format import pick_day_screens
+    items = [
+        {"label": "Пн + Вт", "path": "/tmp/a.png"},
+        {"label": "Ср", "path": "/tmp/b.png"},
+        {"label": "Пт", "path": "/tmp/c.png"},
+    ]
+    picked = pick_day_screens(_sample_diff(), items)
+    # «Пн + Вт» берём из-за Вторника, Пятница не менялась — мимо.
+    assert [item["label"] for item in picked] == ["Пн + Вт", "Ср"]
+    assert pick_day_screens({"added": [], "removed": [], "changed": []}, items) == []
+    assert pick_day_screens(_sample_diff(), []) == []
+
+
+def _rich_nodes(node):
+    """Обход всех rich-элементов (dict) в любую глубину."""
+    found: list = []
+    if isinstance(node, dict):
+        found.append(node)
+        for value in node.values():
+            found.extend(_rich_nodes(value))
+    elif isinstance(node, list):
+        for value in node:
+            found.extend(_rich_nodes(value))
+    return found
+
+
+def test_guide_decodes_rooms_and_igum_suffix():
+    from format import _guide_decode_room
+
+    assert _guide_decode_room("402ИГУМ") == {
+        "floor": "4",
+        "num": "02",
+        "place": "корпус Гуманитарного института (ИГУМ), новый корпус — кампус Антоново",
+    }
+    assert _guide_decode_room("1318")["place"] == "старый корпус — кампус Антоново"
+    assert _guide_decode_room("214")["place"] == "новый корпус — кампус Антоново"
+    assert _guide_decode_room("1313ИГУМ")["place"] == (
+        "корпус Гуманитарного института (ИГУМ), старый корпус — кампус Антоново"
+    )
+    assert _guide_decode_room("310 ИГУМ")["place"].endswith("новый корпус — кампус Антоново")
+    # портал пишет неряшливо: опечатка «1321ИГ» и склейка «1313ИГУМ313» тоже читаются
+    assert _guide_decode_room("1321ИГ")["place"].startswith("корпус Гуманитарного института")
+    assert _guide_decode_room("1313ИГУМ313") == {
+        "floor": "3",
+        "num": "13",
+        "place": "корпус Гуманитарного института (ИГУМ), старый корпус — кампус Антоново",
+    }
+    # чужая метка не выдаётся за корпус Гуманитарного института
+    assert "пометка ИЭ" in _guide_decode_room("218ИЭ")["place"]
+    assert _guide_decode_room("3207")["place"] == "корпус 3 — Б. Санкт-Петербургская, 41"
+    assert _guide_decode_room("Спортзал") is None
+    assert _guide_decode_room("209/226") is None
+
+
+def test_freshman_guide_serves_economics_institute_with_real_links():
+    from format import _freshman_guide
+
+    data = _mini_timetable()
+    guide = _freshman_guide(data["schedule"], "https://example.test")
+    blob = json.dumps(guide, ensure_ascii=False)
+    validate_rich_payload({"chat_id": -1001, "rich_message": {"blocks": [guide]}})
+
+    # психологическую помощь из гайда убрали, вместо неё — транспорт
+    assert "Психологическая помощь" not in blob
+    assert "Автобусы: Антоново → западный район" in blob
+
+    # ООД и студсовет — свои, Института экономики
+    assert "ООД Института экономики" in blob
+    assert "Tatyana.Odinokova@novsu.ru" in blob
+    assert "Студсовет Института экономики" in blob
+
+    # ИГУМ объяснён: институт + метка здания, без выдуманных «д. 1 / д. 2»
+    assert "ИГУМ = Институт гуманитарный" in blob
+    assert "218ИГУМ" in blob and "218ИЭ" in blob
+    assert "Антоново, д. 1" not in blob and "Антоново, д. 2" not in blob
+
+    nodes = _rich_nodes(guide)
+    urls = {n.get("url") for n in nodes if n.get("type") == "url"}
+    for expected in (
+        "https://vk.com/studsovet.ie_novsu",
+        "https://vk.com/studsovet.novsu",
+        "https://vk.com/novsu.event",
+        "https://vk.com/sport_novsu",
+        "https://vk.com/profkomnovgu",
+        "https://vk.com/wall-34755757_34267",
+        "https://www.novsu.ru/study/ood/",
+        "https://www.novsu.ru/study/freshman/adapters/",
+    ):
+        assert expected in urls
+    # мусорных ссылок и «ссылок кодом» быть не должно
+    assert not any(str(u).rstrip("/").endswith("/js") for u in urls)
+    codes = [n.get("text") for n in nodes if n.get("type") == "code"]
+    assert not any("vk." in str(text) for text in codes)
