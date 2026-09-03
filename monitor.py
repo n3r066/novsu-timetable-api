@@ -43,7 +43,7 @@ from fetch import content_fingerprint, fetch_html, hash_html, is_stub  # noqa: E
 from format import build_changes_rich_message, changes_fallback_text, pick_day_screens  # noqa: E402
 from parse import extract_teacher_ids, parse_all  # noqa: E402
 from portal_parser import count_schedule_lessons  # noqa: E402
-from post import _tg_api, day_screens, edit_dashboard_post  # noqa: E402
+from post import _tg_api, day_screens, diff_day_screens, edit_dashboard_post  # noqa: E402
 from telegram_api import send_rich_message  # noqa: E402
 
 # Сколько подряд неудачных циклов терпим молча перед tech-алертом в личку
@@ -220,27 +220,37 @@ def _changed_day_screen_media(
     fingerprint: str | None,
     focus_date: dt.date | None,
 ) -> tuple[list[dict], dict[str, Path]]:
-    """Скриншоты нового расписания на дни из диффа: (медиа для rich, файлы).
+    """Скриншоты изменившихся дней: (медиа для rich, файлы).
 
-    Рендер идёт через тот же кеш по отпечатку, что и закреплённый пост, поэтому
-    chromium на одно изменение расписания запускается один раз. Скриншоты —
-    иллюстрация диффа, а не его суть: если рендер не удался, пост уходит
-    текстом, как раньше.
+    Сначала пробуем машинную подсветку правок в самой портальной таблице
+    (post.diff_day_screens): на скрине видно, что именно поменялось. Если
+    подсветка не отрендерилась, берём чистые скрины тех же дней из общего кеша
+    закреплённого поста — chromium на одно изменение расписания всё равно
+    запускается один раз. Скриншоты — иллюстрация диффа, а не его суть: если
+    рендер не удался вовсе, пост уходит текстом, как раньше.
     """
     if not html or not fingerprint:
         return [], {}
+    target = focus_date or dt.datetime.now(zoneinfo.ZoneInfo("Europe/Moscow")).date()
+    picked: list[dict] = []
     try:
-        items = day_screens(
-            html,
-            fingerprint,
-            focus_date or dt.datetime.now(zoneinfo.ZoneInfo("Europe/Moscow")).date(),
-        )
-        picked = pick_day_screens(diff, items)
+        picked = diff_day_screens(html, diff, target, fingerprint=fingerprint)
+        if picked:
+            print(f"[diff screens] подсветка: {[(item.get('label'), item.get('marked')) for item in picked]}")
     except Exception as exc:  # noqa: BLE001
-        print(f"[diff screens] render failed: {exc}", file=sys.stderr)
-        return [], {}
+        print(f"[diff screens] highlight render failed: {exc}", file=sys.stderr)
+    if not picked:
+        try:
+            picked = pick_day_screens(diff, day_screens(html, fingerprint, target))
+        except Exception as exc:  # noqa: BLE001
+            print(f"[diff screens] render failed: {exc}", file=sys.stderr)
+            return [], {}
     media = [
-        {"label": item.get("label", ""), "media": f"attach://changes_screenshot_{index}"}
+        {
+            "label": item.get("label", ""),
+            "media": f"attach://changes_screenshot_{index}",
+            "marked": int(item.get("marked") or 0),
+        }
         for index, item in enumerate(picked, 1)
     ]
     files = {

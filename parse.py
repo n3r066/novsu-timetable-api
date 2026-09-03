@@ -56,7 +56,9 @@ def _structured_comment(comment: str) -> dict:
     urls = [value.rstrip(".,;:!?)\"]}") for value in re.findall(r"https?://\S+", comment)]
     delivery_mode = "remote_or_hybrid" if "ДОТ" in comment.upper() else "in_person"
     location = None
-    if re.search(r"\bИГУМ,\s*Антоново\b", comment, re.I):
+    # Портал пишет место по-разному: «ИГУМ, Антоново» (145 вхождений в живых данных)
+    # и «ИГУМ(Антоново)» (ещё 76). Нормализуем обе формы в одну строку.
+    if re.search(r"\bИГУМ\s*[,([\s]*Антоново", comment, re.I):
         location = "ИГУМ, Антоново"
     elif re.search(r"\bАнтоново\b", comment, re.I):
         location = "Антоново"

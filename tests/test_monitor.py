@@ -348,3 +348,50 @@ def test_post_changes_without_html_skips_screens(monkeypatch):
     assert result["ok"] is True
     assert called == []
     assert sent[0].get("files") is None
+
+
+def test_changed_day_screen_media_prefers_highlight_and_falls_back(monkeypatch, tmp_path):
+    diff = {
+        "added": [{"day": "Среда", "time": "9:00 10:00", "subject": "Новая пара", "room": "101"}],
+        "removed": [], "changed": [], "transition": None,
+    }
+    target = dt.date(2026, 9, 3)
+    calls = []
+    highlighted = tmp_path / "hl.png"
+    clean = tmp_path / "clean.png"
+
+    def fake_diff_screens(html, diff_arg, date_arg, *, fingerprint=""):
+        calls.append("highlight")
+        return [{"label": "Ср", "path": str(highlighted), "marked": 1}]
+
+    def fake_day_screens(html, fingerprint, date_arg):
+        calls.append("clean")
+        return [{"label": "Ср", "path": str(clean)}]
+
+    monkeypatch.setattr(monitor, "diff_day_screens", fake_diff_screens)
+    monkeypatch.setattr(monitor, "day_screens", fake_day_screens)
+
+    media, files = monitor._changed_day_screen_media(diff, "<html>", "fp", target)
+    assert calls == ["highlight"]
+    assert media == [{"label": "Ср", "media": "attach://changes_screenshot_1", "marked": 1}]
+    assert files == {"changes_screenshot_1": highlighted}
+
+    # Подсветка не отрендерилась — берём чистые скрины тех же дней.
+    calls.clear()
+
+    def boom(*args, **kwargs):
+        calls.append("highlight")
+        raise RuntimeError("chromium screenshot failed")
+
+    monkeypatch.setattr(monitor, "diff_day_screens", boom)
+    media, files = monitor._changed_day_screen_media(diff, "<html>", "fp", target)
+    assert calls == ["highlight", "clean"]
+    assert media == [{"label": "Ср", "media": "attach://changes_screenshot_1", "marked": 0}]
+    assert files == {"changes_screenshot_1": clean}
+
+    # Рендер не получился вовсе — пост уходит текстом, как и раньше.
+    def boom_clean(*args, **kwargs):
+        raise RuntimeError("chromium screenshot failed")
+
+    monkeypatch.setattr(monitor, "day_screens", boom_clean)
+    assert monitor._changed_day_screen_media(diff, "<html>", "fp", target) == ([], {})

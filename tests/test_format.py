@@ -116,7 +116,20 @@ def test_changes_rich_message_structure():
     assert "Правки по дням" in blob
     assert "(лек.) Новый" in blob
     assert "203 → 415" in blob
-    assert "Что именно поменялось — 1" in blob
+    day_blocks = {
+        block["summary"]: block.get("blocks") or []
+        for block in blocks if block.get("type") == "details"
+    }
+    wednesday = day_blocks["Среда — 1 изменение"]
+    # «что изменилось» видно сразу под таблицей дня, без вложенного «раскрыть»
+    assert wednesday[0]["type"] == "table"
+    assert wednesday[1]["type"] == "paragraph"
+    assert "203 → 415" in json.dumps(wednesday[1], ensure_ascii=False)
+    assert not any(inner.get("type") == "details" for inner in wednesday)
+    # убранная пара на новом скрине не появится — предупреждаем текстом
+    thursday = day_blocks["Четверг — 1 изменение"]
+    removed_note = [json.dumps(inner, ensure_ascii=False) for inner in thursday]
+    assert any("Убрано: 1 пара" in note and "на скрине ниже её уже нет" in note for note in removed_note)
     assert "портал НовГУ" in blob
     assert '"type": "table"' in blob
     marks = [
@@ -582,6 +595,21 @@ def test_guide_decodes_rooms_and_igum_suffix():
     }
     # чужая метка не выдаётся за корпус Гуманитарного института
     assert "пометка ИЭ" in _guide_decode_room("218ИЭ")["place"]
+    # у этих подразделений адрес официально другой — цифры номера тут не решают
+    assert _guide_decode_room("310 ИНПО")["place"] == (
+        "пометка ИНПО: ул. Чудинцева, 6 — не Антоново, сверься с примечаниями"
+    )
+    assert "Псковская, 3" in _guide_decode_room("103ПИ")["place"]
+    # литера, вариант в скобках и поточная аудитория тоже читаются
+    assert _guide_decode_room("323а") == {
+        "floor": "3", "num": "23а", "place": "новый корпус — кампус Антоново",
+    }
+    assert _guide_decode_room("1100(1)") == {
+        "floor": "1", "num": "00", "place": "старый корпус — кампус Антоново",
+    }
+    assert _guide_decode_room("3поточная") == {
+        "floor": "—", "num": "3 поточная", "place": "корпус 3 — Б. Санкт-Петербургская, 41",
+    }
     assert _guide_decode_room("3207")["place"] == "корпус 3 — Б. Санкт-Петербургская, 41"
     assert _guide_decode_room("Спортзал") is None
     assert _guide_decode_room("209/226") is None
@@ -606,8 +634,12 @@ def test_freshman_guide_serves_economics_institute_with_real_links():
 
     # ИГУМ объяснён: институт + метка здания, без выдуманных «д. 1 / д. 2»
     assert "ИГУМ = Институт гуманитарный" in blob
-    assert "218ИГУМ" in blob and "218ИЭ" in blob
+    assert "218ИГУМ" in blob
+    # «218ИГУМ и 218ИЭ — разные кабинеты» реестром не подтверждено, вместо этого
+    # честный пример того, что суффикс меняет адрес: 310 ИГУМ и 310 ИНПО.
+    assert "310 ИНПО" in blob and "Чудинцева" in blob
     assert "Антоново, д. 1" not in blob and "Антоново, д. 2" not in blob
+    assert "территория Антоново, 1" not in blob and "Псковская, 3" in blob
 
     nodes = _rich_nodes(guide)
     urls = {n.get("url") for n in nodes if n.get("type") == "url"}
@@ -617,12 +649,48 @@ def test_freshman_guide_serves_economics_institute_with_real_links():
         "https://vk.com/novsu.event",
         "https://vk.com/sport_novsu",
         "https://vk.com/profkomnovgu",
-        "https://vk.com/wall-34755757_34267",
+        "https://vk.com/wall-34755757_44442",
+        "https://vk.com/wall-34755757_44440",
+        "https://www.novsu.ru/study/campus_navigation/navigation_in_buildings/",
         "https://www.novsu.ru/study/ood/",
         "https://www.novsu.ru/study/freshman/adapters/",
     ):
         assert expected in urls
+    # адаптеры «Туризма» — в посте 44442 (ИЭ), а не в 44440 (ИГУМ/ИЮР/ПИ)
+    assert "Морковин" in blob and "Мехоношина" in blob
     # мусорных ссылок и «ссылок кодом» быть не должно
     assert not any(str(u).rstrip("/").endswith("/js") for u in urls)
+    assert "https://vk.com/wall-34755757_34267" not in urls
     codes = [n.get("text") for n in nodes if n.get("type") == "code"]
     assert not any("vk." in str(text) for text in codes)
+
+
+def test_changes_post_promises_highlight_only_when_screens_are_marked():
+    diff = {
+        "added": [{"day": "Вторник", "time": "09:00 10:30", "subject": "(лек.) Новый",
+                   "room": "101", "teacher": "Иванов"}],
+        "removed": [], "changed": [], "transition": None,
+    }
+    now = dt.datetime(2026, 9, 2, 12, 0)
+    marked = build_changes_rich_message(
+        diff, [], "https://example.test", now=now,
+        screenshot_media=[{"label": "Вт", "media": "attach://changes_screenshot_1", "marked": 1}],
+    )
+    blob = json.dumps(marked, ensure_ascii=False)
+    assert "на скрине дня правки подсвечены жёлтым" in blob
+    assert "жёлтым подсвечены правки" in blob
+
+    clean = build_changes_rich_message(
+        diff, [], "https://example.test", now=now,
+        screenshot_media=[{"label": "Вт", "media": "attach://changes_screenshot_1", "marked": 0}],
+    )
+    clean_blob = json.dumps(clean, ensure_ascii=False)
+    # чистый скрин (chromium упал) — никаких обещаний про жёлтый
+    assert "жёлтым" not in clean_blob
+    assert "attach://changes_screenshot_1" in clean_blob
+
+    without_media = json.dumps(
+        build_changes_rich_message(diff, [], "https://example.test", now=now),
+        ensure_ascii=False,
+    )
+    assert "жёлтым" not in without_media

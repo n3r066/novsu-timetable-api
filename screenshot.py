@@ -19,8 +19,20 @@ def render_source_schedule_crop_html(source_html: str, source_url: str) -> str:
     return render_schedule_crop_html(source_html, source_url)
 
 
-def render_source_schedule_day_chunk_htmls(source_html: str, source_url: str, days_per_chunk: int = 2) -> list[str]:
-    return [chunk["html"] for chunk in render_schedule_day_chunk_htmls(source_html, source_url, days_per_chunk=days_per_chunk)]
+def render_source_schedule_day_chunk_htmls(
+    source_html: str,
+    source_url: str,
+    days_per_chunk: int = 2,
+    diff_items: list[dict] | None = None,
+    diff_legend: str = "",
+) -> list[str]:
+    return [
+        chunk["html"]
+        for chunk in render_schedule_day_chunk_htmls(
+            source_html, source_url, days_per_chunk=days_per_chunk,
+            diff_items=diff_items, diff_legend=diff_legend,
+        )
+    ]
 
 
 def screenshot_url(url: str, out_png: Path, width: int = 1920, height: int = 3000, scale_factor: int = 2) -> Path:
@@ -68,16 +80,41 @@ def screenshot_schedule_day_crops(source_html: str, source_url: str, out_png: Pa
     return paths
 
 
-def screenshot_schedule_day_crop_items(source_html: str, source_url: str, out_png: Path) -> list[dict]:
-    """Return [{label, path}] screenshots split by whole timetable days."""
+def screenshot_schedule_day_crop_items(
+    source_html: str,
+    source_url: str,
+    out_png: Path,
+    *,
+    diff_items: list[dict] | None = None,
+    diff_legend: str = "",
+    only_labels: set[str] | None = None,
+) -> list[dict]:
+    """Return [{label, path, marked}] screenshots split by whole timetable days.
+
+    *diff_items* — записи диффа (добавленные/изменённые): их строки и ячейки
+    подсвечиваются прямо в портальной таблице, поэтому на скрине видно, что
+    именно поменялось. *only_labels* — короткие дни портала («Ср»): рендерим
+    только нужные дни, остальные части пропускаем.
+    """
     out_png = Path(out_png)
-    chunks = render_schedule_day_chunk_htmls(source_html, source_url, days_per_chunk=1)
+    chunks = render_schedule_day_chunk_htmls(
+        source_html,
+        source_url,
+        days_per_chunk=1,
+        diff_items=diff_items,
+        diff_legend=diff_legend,
+    )
     items: list[dict] = []
     stem = out_png.with_suffix("")
     for index, chunk in enumerate(chunks, 1):
+        label = str(chunk.get("label") or "")
+        if only_labels is not None and not any(
+            part.strip() in only_labels for part in label.split("+")
+        ):
+            continue
         path = out_png if len(chunks) == 1 else out_png.with_name(f"{stem.name}_part{index:02d}{out_png.suffix}")
         screenshot_html(chunk["html"], path, width=1280, height=3200, scale_factor=2, bg=(255, 255, 255))
-        items.append({"label": chunk["label"], "path": path})
+        items.append({"label": label, "path": path, "marked": int(chunk.get("marked") or 0)})
     return items
 
 

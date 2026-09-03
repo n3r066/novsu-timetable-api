@@ -30,7 +30,14 @@ import zoneinfo
 import config  # noqa: E402
 from fetch import content_fingerprint, fetch_html, hash_html  # noqa: E402
 from parse import parse_all  # noqa: E402
-from format import build_dashboard_rich_message, format_changes_only, format_schedule_post, render_schedule_html  # noqa: E402
+from format import (  # noqa: E402
+    DAY_TO_SHORT,
+    build_dashboard_rich_message,
+    changed_days,
+    format_changes_only,
+    format_schedule_post,
+    render_schedule_html,
+)
 from screenshot import screenshot_html, screenshot_schedule_day_crop_items  # noqa: E402
 from telegram_api import edit_rich_message  # noqa: E402
 
@@ -367,6 +374,81 @@ def day_screens(html: str, fingerprint: str, target_date: dt.date) -> list[dict]
     chromium на одно изменение расписания запускается один раз.
     """
     return _dashboard_screens(html, fingerprint, target_date)
+
+
+DIFF_SCREEN_LEGEND = (
+    "Жёлтым подсвечены правки: строка — новая или изменённая пара, яркая ячейка — "
+    "то самое поле. Убранных пар на скрине уже нет."
+)
+
+
+def _diff_signature(diff: dict) -> str:
+    """Подпись диффа: подсветка зависит от конкретного изменения, а не только от отпечатка."""
+    payload = json.dumps(
+        {key: diff.get(key) or [] for key in ("added", "removed", "changed")},
+        ensure_ascii=False,
+        sort_keys=True,
+        default=str,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def diff_day_screens(
+    html: str,
+    diff: dict,
+    target_date: dt.date,
+    *,
+    fingerprint: str = "",
+) -> list[dict]:
+    """Скрины изменившихся дней с машинной подсветкой правок.
+
+    Подсветка ставится в саму портальную таблицу (классы diff-row/diff-cell),
+    поэтому скрин остаётся оригиналом с портала, а правки видно глазом. Кеш
+    отдельный — state/diff_screens.json по отпечатку расписания и подписи
+    диффа: чистые скрины закреплённого поста для этого не годятся, а
+    перерисовывать свои на каждый ретрай незачем. Ошибки летят наружу:
+    монитор сам решает, падать на чистые скрины или на текст.
+    """
+    shot_dir = config.STATE_DIR / "dashboard_screens"
+    shot_dir.mkdir(parents=True, exist_ok=True)
+    cache_file = config.STATE_DIR / "diff_screens.json"
+    signature = _diff_signature(diff)
+    cache = _read_json(cache_file)
+    cached = (
+        cache.get("items")
+        if cache.get("fingerprint") == fingerprint and cache.get("signature") == signature
+        else None
+    )
+    if cached and all(Path(str(item.get("path", ""))).exists() for item in cached):
+        return cached
+
+    wanted = {DAY_TO_SHORT.get(day, day) for day in changed_days(diff)}
+    # Изменённые раньше добавленных: при равном счёте строку забирает запись
+    # с полями, а значит подсветится не только строка, но и конкретная ячейка.
+    marks = [*(diff.get("changed") or []), *(diff.get("added") or [])]
+    base = shot_dir / f"6381_diff_{target_date.isoformat()}_{signature[:8]}.png"
+    raw = screenshot_schedule_day_crop_items(
+        html,
+        config.GROUP_URL,
+        base,
+        diff_items=marks,
+        diff_legend=DIFF_SCREEN_LEGEND,
+        only_labels=wanted,
+    )
+    keep = {str(item["path"]) for item in raw}
+    keep |= {str(Path(str(item["path"])).with_suffix(".html")) for item in raw}
+    for stale in (*shot_dir.glob("6381_diff_*.png"), *shot_dir.glob("6381_diff_*.html")):
+        if str(stale) not in keep:
+            try:
+                stale.unlink()
+            except OSError:
+                pass
+    items = [
+        {"label": item["label"], "path": str(item["path"]), "marked": int(item.get("marked") or 0)}
+        for item in raw
+    ]
+    _write_json_atomic(cache_file, {"fingerprint": fingerprint, "signature": signature, "items": items})
+    return items
 
 
 def edit_dashboard_post(

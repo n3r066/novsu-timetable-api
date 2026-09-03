@@ -17,6 +17,25 @@ def day_token(value: object) -> str | None:
     """Каноническая аббревиатура дня из вариантов разделителя ('пн', 'Пн.', 'ПН ')."""
     token = re.sub(r"\s+", "", str(value or "")).casefold().strip(".")
     return _DAY_CANONICAL.get(token)
+_DAY_FULL_TO_SHORT = {
+    "понедельник": "Пн", "вторник": "Вт", "среда": "Ср", "четверг": "Чт",
+    "пятница": "Пт", "суббота": "Сб", "воскресенье": "Вс",
+}
+
+
+def norm_text(value: object) -> str:
+    """Один пробел, без NBSP, без регистра — для сравнения текста ячеек."""
+    return re.sub(r"\s+", " ", str(value or "").replace("\xa0", " ")).strip().casefold()
+
+
+def day_short(value: object) -> str | None:
+    """Короткий день из аббревиатуры («Ср») или полного имени («Среда»)."""
+    token = day_token(value)
+    if token:
+        return token
+    return _DAY_FULL_TO_SHORT.get(norm_text(value).replace("ё", "е"))
+
+
 SCHEDULE_TABLE_HEADERS = {"дата", "время", "предмет", "преподаватель", "ауд."}
 SCHEDULE_OPTIONAL_HEADERS = {"под гр.", "комм."}
 CONTENT_ID = "npe_instance_1103357_npe_content"
@@ -307,7 +326,132 @@ def render_schedule_crop_html(source_html: str, source_url: str) -> str:
     return wrap_schedule_html(str(content), source_url)
 
 
-def render_schedule_day_chunk_htmls(source_html: str, source_url: str, days_per_chunk: int = 1) -> list[dict]:
+DIFF_HIGHLIGHT_CSS = """
+  tr.diff-row > td { background: #fff3c4 !important; }
+  /* td.diff-cell отдельным селектором не перекрывает tr.diff-row > td по
+     специфичности, поэтому правило продублировано с обоими классами. */
+  td.diff-cell, tr.diff-row > td.diff-cell {
+    background: #ffc233 !important; font-weight: 800; box-shadow: inset 0 0 0 3px #e65100;
+  }
+  .diff-legend { margin-top: 16px; font-size: 24px; line-height: 1.3; font-weight: 700; }
+  .diff-legend .swatch { display: inline-block; width: 26px; height: 26px; margin-right: 10px;
+                         vertical-align: -3px; background: #ffc233; border: 3px solid #e65100; }
+"""
+
+_DIFF_TIME_RE = re.compile(r"\d{1,2}:\d{2}")
+_DIFF_MIN_SCORE = 3.0
+
+
+def _diff_row_score(row_norm: str, item: dict) -> float:
+    """Насколько строка портала похожа на запись диффа.
+
+    Предмет обязателен (3 балла), время и аудитория добавляют уверенности.
+    Время в портале живёт в rowspan на несколько строк, поэтому его отсутствие
+    в конкретной строке не отменяет совпадение. Все начала часов на месте —
+    сильное совпадение; часть часов даёт почти ничего, иначе соседняя пара
+    с общим часом («16:00 17:00» против «17:00 18:00») перетянет строку.
+    У изменённых записей нет room/teacher — только поля, поэтому их время
+    обязано совпасть целиком.
+    """
+    subject = norm_text(str(item.get("subject") or "").split("\n", 1)[0])
+    if not subject or subject not in row_norm:
+        return 0.0
+    score = 3.0
+    tokens = _DIFF_TIME_RE.findall(str(item.get("time") or ""))
+    if tokens:
+        hits = sum(1 for token in tokens if token in row_norm)
+        if 0 < hits < len(tokens):
+            # Совпал только один из часов — это соседняя пара («16:00 17:00»
+            # против «17:00 18:00»), а не наша. Нулевые совпадения при этом
+            # допустимы: в портале время живёт в rowspan на несколько строк.
+            return 0.0
+        score += 2.0 if hits == len(tokens) else 0.0
+    room = norm_text(item.get("room"))
+    if room and room != "—" and room in row_norm:
+        score += 1.0
+    teacher = norm_text(item.get("teacher"))
+    if teacher and teacher in row_norm:
+        score += 0.5
+    return score
+
+
+def _diff_cell_values(item: dict) -> list[str]:
+    """Новые значения полей изменённой пары — их подсвечиваем точечно."""
+    values: list[str] = []
+    for field in item.get("fields") or []:
+        if not isinstance(field, (list, tuple)) or len(field) != 3:
+            continue
+        new_value = norm_text(field[2])
+        if new_value and new_value != "—":
+            values.append(new_value)
+    return values
+
+
+def _mark_diff_row(row, item: dict) -> None:
+    row["class"] = [*row.get("class", []), "diff-row"]
+    values = _diff_cell_values(item)
+    if not values:
+        return
+    for cell in row.find_all(["td", "th"], recursive=False):
+        cell_norm = norm_text(cell.get_text(" ", strip=True))
+        if not cell_norm:
+            continue
+        for value in values:
+            # Короткие значения («415», «2») совпадают только целиком: иначе
+            # номер аудитории находится внутри времени или чужой ячейки.
+            if cell_norm == value or (len(value) >= 6 and value in cell_norm):
+                cell["class"] = [*cell.get("class", []), "diff-cell"]
+                break
+
+
+def highlight_day_group(group: list[str], items: list[dict]) -> tuple[list[str], int]:
+    """Подсветить в HTML дня строки и ячейки из диффа.
+
+    Портальную таблицу не перерисовываем: добавляем только классы, поэтому скрин
+    остаётся оригиналом с портала, а правки видно глазом. Возвращает
+    (строки дня, сколько строк помечено). Убранные пары в новом HTML уже не
+    существуют, поэтому помечаются только добавленные и изменённые.
+    """
+    marked_total = 0
+    out: list[str] = []
+    for row_html in group:
+        soup = BeautifulSoup(row_html, "html.parser")
+        rows = soup.find_all("tr")
+        if not rows:
+            out.append(row_html)
+            continue
+        best: dict[int, tuple[dict, float]] = {}
+        for row in rows:
+            row_norm = norm_text(row.get_text(" ", strip=True))
+            top_item, top_score = None, 0.0
+            for item in items:
+                score = _diff_row_score(row_norm, item)
+                if score > top_score:
+                    top_item, top_score = item, score
+            if top_item is not None and top_score >= _DIFF_MIN_SCORE:
+                best[id(row)] = (top_item, top_score)
+        # Порталь вложен в строку дня ещё и первую пару: внешнюю строку не красим,
+        # если совпала вложенная.
+        hits = 0
+        for row in rows:
+            if id(row) not in best:
+                continue
+            if any(id(child) in best for child in row.find_all("tr")):
+                continue
+            _mark_diff_row(row, best[id(row)][0])
+            hits += 1
+        marked_total += hits
+        out.append(str(soup) if hits else row_html)
+    return out, marked_total
+
+
+def render_schedule_day_chunk_htmls(
+    source_html: str,
+    source_url: str,
+    days_per_chunk: int = 1,
+    diff_items: list[dict] | None = None,
+    diff_legend: str = "",
+) -> list[dict]:
     content = source_content_until_print(source_html)
     table = find_schedule_table(content)
     if table is None:
@@ -351,14 +495,35 @@ def render_schedule_day_chunk_htmls(source_html: str, source_url: str, days_per_
     for start in range(0, len(day_groups), days_per_chunk):
         groups = day_groups[start:start + days_per_chunk]
         labels = [_day_label_from_group(group) for group in groups]
+        rendered: list[list[str]] = []
+        marked = 0
+        for group, label in zip(groups, labels):
+            group_items = [
+                item for item in (diff_items or []) if day_short(item.get("day")) == label
+            ]
+            if group_items:
+                group, hits = highlight_day_group(group, group_items)
+                marked += hits
+            rendered.append(group)
         table_html = '<table border="1" class="shedultable" style="border-spacing: 1px">'
         table_html += table_header
-        table_html += "".join("".join(group) for group in groups)
+        table_html += "".join("".join(group) for group in rendered)
         table_html += "</table>"
+        legend = ""
+        if marked and diff_legend:
+            legend = (
+                '<p class="diff-legend"><span class="swatch"></span>'
+                f"{htmlmod.escape(diff_legend)}</p>"
+            )
         suffix = print_html if start + days_per_chunk >= len(day_groups) else ""
         chunks.append({
             "label": " + ".join(labels),
-            "html": wrap_schedule_html("".join(header_parts) + table_html + suffix, source_url),
+            "html": wrap_schedule_html(
+                "".join(header_parts) + table_html + legend + suffix,
+                source_url,
+                extra_css=DIFF_HIGHLIGHT_CSS if marked else "",
+            ),
+            "marked": marked,
         })
     return chunks
 
@@ -372,7 +537,7 @@ def _day_label_from_group(group: list[str]) -> str:
     return (day_token(cells[0]) if cells else None) or "День"
 
 
-def wrap_schedule_html(content_html: str, source_url: str) -> str:
+def wrap_schedule_html(content_html: str, source_url: str, extra_css: str = "") -> str:
     escaped_source_url = htmlmod.escape(source_url, quote=True)
     return f"""<!doctype html>
 <html lang="ru">
@@ -398,7 +563,7 @@ def wrap_schedule_html(content_html: str, source_url: str) -> str:
   td[style*="width:150px"] {{ min-width: 340px; }}
   td[style*="width:100px"] {{ min-width: 180px; }}
   .print-link {{ margin-top: 16px; font-size: 24px; font-weight: 700; }}
-</style>
+{extra_css}</style>
 </head>
 <body><div class="wrap">{content_html}</div></body>
 </html>"""

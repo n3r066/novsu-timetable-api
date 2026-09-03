@@ -197,3 +197,59 @@ def test_dashboard_screens_recreated_when_cache_file_missing(monkeypatch, tmp_pa
     (state / "dashboard_screens.json").unlink()
     post.edit_dashboard_post(1, day, html="html-B", fingerprint="FP-1")
     assert len(calls) == 2
+
+
+def _diff_for_screens():
+    return {
+        "added": [{"day": "Среда", "time": "9:00 10:00", "subject": "Новая пара", "room": "101", "teacher": "Иванов"}],
+        "removed": [{"day": "Четверг", "time": "9:00 10:00", "subject": "Старая пара", "room": "102", "teacher": "Петров"}],
+        "changed": [{"day": "Понедельник", "time": "11:00 12:00", "subject": "Та же пара",
+                     "fields": [["ауд.", "101", "202"]]}],
+        "transition": None,
+    }
+
+
+def test_diff_day_screens_marks_only_visible_changes_and_caches(monkeypatch, tmp_path):
+    import datetime as dt
+
+    state = tmp_path / "state"
+    state.mkdir()
+    monkeypatch.setattr(post.config, "STATE_DIR", state)
+    calls = []
+
+    def fake_crop_items(html, url, out_png, *, diff_items=None, diff_legend="", only_labels=None):
+        calls.append({"diff_items": diff_items, "only_labels": only_labels, "legend": diff_legend})
+        shot_dir = Path(out_png).parent
+        shot_dir.mkdir(parents=True, exist_ok=True)
+        items = []
+        for index, label in enumerate(sorted(only_labels or set()), 1):
+            path = Path(str(Path(out_png).with_suffix("")) + f"_part{index:02d}.png")
+            path.write_bytes(b"png")
+            items.append({"label": label, "path": path, "marked": 1 if label != "Чт" else 0})
+        return items
+
+    monkeypatch.setattr(post, "screenshot_schedule_day_crop_items", fake_crop_items)
+
+    diff = _diff_for_screens()
+    items = post.diff_day_screens("<html>", diff, dt.date(2026, 9, 3), fingerprint="fp1")
+
+    # Скрин дня нужен и там, где пару убрали: подсвечивать нечего, но день показываем.
+    assert calls[0]["only_labels"] == {"Пн", "Ср", "Чт"}
+    # Помечаются только добавленные и изменённые — убранной пары в новом HTML нет.
+    assert [item["subject"] for item in calls[0]["diff_items"]] == ["Та же пара", "Новая пара"]
+    assert calls[0]["legend"]
+    assert sorted(item["label"] for item in items) == ["Пн", "Ср", "Чт"]
+    assert (state / "diff_screens.json").exists()
+
+    # Тот же отпечаток и тот же дифф — кеш, chromium повторно не дёргаем.
+    again = post.diff_day_screens("<html>", diff, dt.date(2026, 9, 3), fingerprint="fp1")
+    assert len(calls) == 1
+    assert again == items
+
+    # Другой дифф — другая подпись: рендерим заново и подчищаем старые файлы.
+    other = copy.deepcopy(diff)
+    other["added"][0]["subject"] = "Совсем другая пара"
+    fresh = post.diff_day_screens("<html>", other, dt.date(2026, 9, 3), fingerprint="fp1")
+    assert len(calls) == 2
+    left = sorted(p.name for p in (state / "dashboard_screens").glob("6381_diff_*.png"))
+    assert left == sorted(Path(item["path"]).name for item in fresh)
