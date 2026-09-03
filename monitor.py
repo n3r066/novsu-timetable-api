@@ -529,27 +529,36 @@ def _run_once_locked(update_post_id: int | None = None, post_date: dt.date | Non
         return {"changed": False, "fingerprint": new_fp, "stub": stub, "posted": None, **event}
 
     changed = previous_fp != new_fp
+
+    # Недоставленный дифф нельзя терять, но и дублировать нельзя. База при
+    # отказе не сдвигается, поэтому свежий дифф «база → сейчас» уже включает
+    # ту правку. Значит устаревший pending выбрасываем как поглощённый, а
+    # добиваем его только когда портал стоит на месте и свежего поста не будет.
+    pending_notif = _read_json(pending_file)
+    if pending_notif.get("diff") is not None and changed:
+        _unlink(pending_file)
+        pending_notif = {}
+        print("[retry pending] поглощён свежим диффом", file=sys.stderr)
+    if pending_notif.get("diff") is not None:
+        try:
+            retry_result = _post_changes_to_channel(
+                pending_notif["diff"],
+                data.get("weeks", []),
+                html=html,
+                fingerprint=new_fp,
+                focus_date=post_date,
+            )
+        except Exception as exc:  # noqa: BLE001
+            retry_result = {"ok": False, "error": str(exc)}
+        if retry_result.get("ok"):
+            _unlink(pending_file)
+            print("[retry pending] diff posted successfully")
+        else:
+            print(f"[retry pending] still failing: {retry_result.get('error', '?')}", file=sys.stderr)
+
     if not changed:
         _save_baseline(event, data)
         _unlink(candidate_file)
-        # Retry a previously failed diff post if one is pending.
-        pending_notif = _read_json(pending_file)
-        if pending_notif.get("diff") is not None:
-            try:
-                retry_result = _post_changes_to_channel(
-                    pending_notif["diff"],
-                    data.get("weeks", []),
-                    html=html,
-                    fingerprint=new_fp,
-                    focus_date=post_date,
-                )
-            except Exception as exc:  # noqa: BLE001
-                retry_result = {"ok": False, "error": str(exc)}
-            if retry_result.get("ok"):
-                _unlink(pending_file)
-                print(f"[retry pending] diff posted successfully")
-            else:
-                print(f"[retry pending] still failing: {retry_result.get('error', '?')}", file=sys.stderr)
         dashboard_ok = None
         if update_post_id:
             dashboard_ok = _try_dashboard(update_post_id, post_date, html, new_fp)
@@ -609,6 +618,34 @@ def _run_once_locked(update_post_id: int | None = None, post_date: dt.date | Non
     new_cache = {**_build_teacher_lookup(all_names), **teacher_cache}
     if new_cache != teacher_cache:
         _save_teacher_cache(new_cache)
+
+    # Отпечаток изменился, а дифф пустой — значит поменялось поле, которого
+    # нет в _DIFF_FIELDS (например link), или парсер перестал видеть правку.
+    # Раньше монитор в этом случае молча сдвигал базу и в канал не писал:
+    # снаружи это выглядит как «расписание поменяли, а бот не сказал».
+    # Теперь база всё равно сдвигается (иначе цикл зацикливается на одном и
+    # том же отпечатке), но улика сохраняется и приходит в личку.
+    if not (diff["added"] or diff["removed"] or diff["changed"] or diff["transition"]):
+        unexplained = config.STATE_DIR / "unexplained_change.json"
+        _write_json_atomic(unexplained, {
+            "event": event,
+            "previous_fingerprint": previous_fp,
+            "old_schedule": old_data.get("schedule"),
+            "new_schedule": data.get("schedule"),
+        })
+        _save_baseline(event, data)
+        _unlink(pending_file)
+        dashboard_ok = _try_dashboard(update_post_id, post_date, html, new_fp) if update_post_id else None
+        _dm(
+            "⚠️ отпечаток расписания изменился, но дифф пустой\n"
+            f"было: <code>{_escape_code(previous_fp, 80)}</code>\n"
+            f"стало: <code>{_escape_code(new_fp, 80)}</code>\n"
+            f"улика: <code>{_escape_code(unexplained)}</code>"
+        )
+        print(f"[unexplained] fingerprint={new_fp} diff empty", file=sys.stderr)
+        return {"changed": True, "fingerprint": new_fp, "stub": stub, "posted": None,
+                "unexplained": True, "dashboard_updated": dashboard_ok, **event}
+
     _write_json_atomic(pending_file, {"event": event, "diff": diff})
     try:
         post_result = _post_changes_to_channel(

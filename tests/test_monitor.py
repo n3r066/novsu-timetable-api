@@ -395,3 +395,70 @@ def test_changed_day_screen_media_prefers_highlight_and_falls_back(monkeypatch, 
 
     monkeypatch.setattr(monitor, "day_screens", boom_clean)
     assert monitor._changed_day_screen_media(diff, "<html>", "fp", target) == ([], {})
+
+
+def test_fingerprint_change_without_diff_is_reported_not_swallowed(monkeypatch, tmp_path):
+    """Отпечаток уехал, а дифф пустой — монитор обязан пожаловаться, а не молчать.
+
+    Так выглядит правка в поле, которого нет в _DIFF_FIELDS (например link),
+    или потеря правки парсером: раньше монитор молча сдвигал базу.
+    """
+    html = Path("tests/fixtures/rowspan_time.html").read_text(encoding="utf-8")
+    monkeypatch.setattr(monitor.config, "STATE_DIR", tmp_path)
+    monkeypatch.setattr(monitor, "fetch_html", lambda *a, **k: html)
+    fingerprints = iter(["fp-old", "fp-new"])
+    monkeypatch.setattr(monitor, "content_fingerprint", lambda *a, **k: next(fingerprints))
+    posts = []
+    monkeypatch.setattr(monitor, "_post_changes_to_channel",
+                        lambda diff, weeks, **kwargs: posts.append(diff) or {"ok": True})
+    dms = []
+    monkeypatch.setattr(monitor, "_dm", lambda text: dms.append(text))
+
+    monitor.run_once()
+    result = monitor.run_once()
+
+    assert result.get("unexplained") is True
+    # в канал пустой дифф не летит
+    assert posts == []
+    # зато в личку летит предупреждение с уликой
+    assert len(dms) == 1
+    assert "дифф пустой" in dms[0]
+    evidence = json.loads((tmp_path / "unexplained_change.json").read_text(encoding="utf-8"))
+    assert evidence["previous_fingerprint"] == "fp-old"
+    assert evidence["event"]["fingerprint"] == "fp-new"
+    assert evidence["new_schedule"]
+    # база сдвинулась, иначе монитор жаловался бы на одно и то же вечно
+    state = json.loads((tmp_path / "monitor_state.json").read_text(encoding="utf-8"))
+    assert state["event"]["fingerprint"] == "fp-new"
+
+
+def test_stale_pending_is_not_posted_twice(monkeypatch, tmp_path):
+    """Если портал уехал дальше, старый недоставленный дифф не дублируем."""
+    html1 = Path("tests/fixtures/rowspan_time.html").read_text(encoding="utf-8")
+    html2 = html1.replace("Предмет Б", "Предмет Ц")
+    html3 = html2.replace("Предмет А", "Предмет Э")
+    pages = iter([html1, html2, html3])
+    monkeypatch.setattr(monitor.config, "STATE_DIR", tmp_path)
+    monkeypatch.setattr(monitor, "fetch_html", lambda *a, **k: next(pages))
+    results = iter([{"ok": False, "error": "down"}, {"ok": True}])
+    posts = []
+    monkeypatch.setattr(monitor, "_post_changes_to_channel",
+                        lambda diff, weeks, **kwargs: posts.append(diff) or next(results))
+    monkeypatch.setattr(monitor, "_dm", lambda text: None)
+
+    monitor.run_once()
+    failed = monitor.run_once()
+    recovered = monitor.run_once()
+
+    assert failed["delivery_pending"] is True
+    assert recovered["posted"] is True
+    # ровно два поста: неудачный и один свежий, включающий обе правки
+    assert len(posts) == 2
+    subjects = {
+        str(item.get("subject") or "")
+        for key in ("added", "removed", "changed")
+        for item in posts[1].get(key) or []
+    }
+    assert any("Предмет Ц" in name for name in subjects)
+    assert any("Предмет Э" in name for name in subjects)
+    assert not (tmp_path / "pending_notification.json").exists()
