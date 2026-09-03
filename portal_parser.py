@@ -327,15 +327,39 @@ def render_schedule_crop_html(source_html: str, source_url: str) -> str:
 
 
 DIFF_HIGHLIGHT_CSS = """
-  tr.diff-row > td { background: #fff3c4 !important; }
+  /* Бледная заливка на скрине почти не отличалась от белого фона, а тип
+     правки был не виден вообще. Поэтому: насыщенный фон, толстая цветная
+     полоса слева у строки и текстовая метка в первой ячейке. */
+  tr.diff-row > td { background: #ffe9a8 !important; }
+  tr.diff-row.diff-added > td { background: #d6f5d6 !important; }
+  /* Полосу рисуем inset-тенью, а не border: border добавляет 12px к ширине
+     таблицы, и правая колонка «комм.» уезжала за край скрина. */
+  tr.diff-row > td:first-child {
+    box-shadow: inset 12px 0 0 0 #c1440e;
+  }
+  tr.diff-row.diff-added > td:first-child {
+    box-shadow: inset 12px 0 0 0 #14682c;
+  }
   /* td.diff-cell отдельным селектором не перекрывает tr.diff-row > td по
      специфичности, поэтому правило продублировано с обоими классами. */
   td.diff-cell, tr.diff-row > td.diff-cell {
-    background: #ffc233 !important; font-weight: 800; box-shadow: inset 0 0 0 3px #e65100;
+    background: #ffb02e !important; font-weight: 800;
+    box-shadow: inset 0 0 0 4px #c1440e;
   }
-  .diff-legend { margin-top: 16px; font-size: 24px; line-height: 1.3; font-weight: 700; }
+  tr.diff-row.diff-added td.diff-cell {
+    background: #56d364 !important; box-shadow: inset 0 0 0 4px #14682c;
+  }
+  .diff-tag {
+    display: block; margin: 0 0 4px 14px; padding: 2px 8px; border-radius: 5px;
+    background: #c1440e; color: #fff; font-size: 20px; font-weight: 800;
+    letter-spacing: 0.3px; white-space: nowrap; width: fit-content;
+  }
+  tr.diff-row.diff-added .diff-tag { background: #14682c; }
+  .diff-legend { margin-top: 16px; font-size: 24px; line-height: 1.45; font-weight: 700; }
+  .diff-legend .row { margin-bottom: 6px; }
   .diff-legend .swatch { display: inline-block; width: 26px; height: 26px; margin-right: 10px;
-                         vertical-align: -3px; background: #ffc233; border: 3px solid #e65100; }
+                         vertical-align: -3px; border: 3px solid #c1440e; background: #ffb02e; }
+  .diff-legend .swatch.added { border-color: #14682c; background: #56d364; }
 """
 
 _DIFF_TIME_RE = re.compile(r"\d{1,2}:\d{2}")
@@ -387,8 +411,21 @@ def _diff_cell_values(item: dict) -> list[str]:
     return values
 
 
+_DIFF_TAG_TEXT = {"added": "НОВАЯ ПАРА", "changed": "ИЗМЕНИЛИ"}
+
+
 def _mark_diff_row(row, item: dict) -> None:
-    row["class"] = [*row.get("class", []), "diff-row"]
+    kind = "added" if item.get("_diff_kind") == "added" else "changed"
+    row["class"] = [*row.get("class", []), "diff-row", f"diff-{kind}"]
+    # Цвет читается только если знать легенду, поэтому пишем словами прямо в
+    # строке: на скрине сразу видно, добавили пару или поправили существующую.
+    cells = row.find_all(["td", "th"], recursive=False)
+    if cells:
+        soup = BeautifulSoup("", "html.parser")
+        tag = soup.new_tag("div")
+        tag["class"] = ["diff-tag"]
+        tag.string = _DIFF_TAG_TEXT[kind]
+        cells[0].insert(0, tag)
     values = _diff_cell_values(item)
     if not values:
         return
@@ -511,9 +548,17 @@ def render_schedule_day_chunk_htmls(
         table_html += "</table>"
         legend = ""
         if marked and diff_legend:
+            # Два цвета — два образца: одна общая плашка не объясняла, чем
+            # новая пара отличается от поправленной.
             legend = (
-                '<p class="diff-legend"><span class="swatch"></span>'
-                f"{htmlmod.escape(diff_legend)}</p>"
+                '<div class="diff-legend">'
+                '<div class="row"><span class="swatch added"></span>'
+                "НОВАЯ ПАРА — зелёная строка: этой пары раньше не было.</div>"
+                '<div class="row"><span class="swatch"></span>'
+                "ИЗМЕНИЛИ — оранжевая строка: пара была, поправили поле; "
+                "яркая ячейка внутри — что именно.</div>"
+                '<div class="row">Убранных пар на скрине уже нет — они перечислены в посте.</div>'
+                "</div>"
             )
         suffix = print_html if start + days_per_chunk >= len(day_groups) else ""
         chunks.append({

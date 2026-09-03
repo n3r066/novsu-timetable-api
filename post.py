@@ -377,8 +377,10 @@ def day_screens(html: str, fingerprint: str, target_date: dt.date) -> list[dict]
 
 
 DIFF_SCREEN_LEGEND = (
-    "Жёлтым подсвечены правки: строка — новая или изменённая пара, яркая ячейка — "
-    "то самое поле. Убранных пар на скрине уже нет."
+    "ЗЕЛЁНАЯ строка с меткой «НОВАЯ ПАРА» — пары раньше не было. "
+    "ОРАНЖЕВАЯ строка с меткой «ИЗМЕНИЛИ» — пара была, но её поправили; "
+    "яркая ячейка внутри — то самое поле, которое поменяли. "
+    "Убранных пар на скрине уже нет."
 )
 
 
@@ -425,7 +427,12 @@ def diff_day_screens(
     wanted = {DAY_TO_SHORT.get(day, day) for day in changed_days(diff)}
     # Изменённые раньше добавленных: при равном счёте строку забирает запись
     # с полями, а значит подсветится не только строка, но и конкретная ячейка.
-    marks = [*(diff.get("changed") or []), *(diff.get("added") or [])]
+    # _diff_kind нужен подсветке, чтобы новая пара и правка существующей
+    # отличались цветом и подписью, а не сливались в один жёлтый.
+    marks = [
+        *({**item, "_diff_kind": "changed"} for item in (diff.get("changed") or [])),
+        *({**item, "_diff_kind": "added"} for item in (diff.get("added") or [])),
+    ]
     base = shot_dir / f"6381_diff_{target_date.isoformat()}_{signature[:8]}.png"
     raw = screenshot_schedule_day_crop_items(
         html,

@@ -114,3 +114,15 @@ def test_day_crop_items_can_filter_days_and_report_marks(monkeypatch, tmp_path):
     assert items[0]["path"].name == "day_part02.png"
     assert len(rendered) == 1
     assert "diff-row" in rendered[0][1]
+
+
+def test_diff_screens_are_wide_enough_for_the_comment_column():
+    """Скрин рендерится шире таблицы: колонка «комм.» не должна уезжать за край."""
+    import inspect
+
+    import screenshot
+
+    src = inspect.getsource(screenshot.screenshot_schedule_day_crop_items)
+    # 1280 CSS-px не хватало на портальную таблицу с колонкой примечаний
+    assert "width=1280" not in src
+    assert "width=1480" in src

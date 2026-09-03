@@ -113,7 +113,9 @@ def screenshot_schedule_day_crop_items(
         ):
             continue
         path = out_png if len(chunks) == 1 else out_png.with_name(f"{stem.name}_part{index:02d}{out_png.suffix}")
-        screenshot_html(chunk["html"], path, width=1280, height=3200, scale_factor=2, bg=(255, 255, 255))
+        # 1280 CSS-px не хватало: правая колонка «комм.» уезжала за край скрина.
+        # Остальные скрины расписания рендерятся в 1480 — держим ту же ширину.
+        screenshot_html(chunk["html"], path, width=1480, height=3200, scale_factor=2, bg=(255, 255, 255))
         items.append({"label": label, "path": path, "marked": int(chunk.get("marked") or 0)})
     return items
 

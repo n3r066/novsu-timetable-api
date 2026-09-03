@@ -72,7 +72,9 @@ def test_day_chunks_without_diff_stay_clean():
 def test_diff_highlight_marks_changed_row_cell_and_added_row():
     chunks = render_schedule_day_chunk_htmls(
         _DIFF_HL_SOURCE, "https://example.test", days_per_chunk=1,
-        diff_items=[_DIFF_CHANGED, _DIFF_ADDED], diff_legend="Жёлтым подсвечены правки",
+        diff_items=[{**_DIFF_CHANGED, "_diff_kind": "changed"},
+                    {**_DIFF_ADDED, "_diff_kind": "added"}],
+        diff_legend="Жёлтым подсвечены правки",
     )
     monday, wednesday = chunks
     # две правки Пн: изменённая 16:00 и добавленная 17:00; Ср не тронута
@@ -83,9 +85,21 @@ def test_diff_highlight_marks_changed_row_cell_and_added_row():
     soup = BeautifulSoup(monday["html"], "html.parser")
     rows = soup.select("tr.diff-row")
     assert len(rows) == 2
-    by_time = {row.select_one("td").get_text(" ", strip=True): row for row in rows}
+    def row_time(row):
+        # В первую ячейку теперь вставляется текстовая метка правки.
+        text = row.select_one("td").get_text(" ", strip=True)
+        for tag in ("НОВАЯ ПАРА", "ИЗМЕНИЛИ"):
+            text = text.replace(tag, "").strip()
+        return text
+
+    by_time = {row_time(row): row for row in rows}
     changed_row = by_time["16:00 17:00"]
     added_row = by_time["17:00 18:00"]
+    # тип правки видно словами и классом, а не только цветом
+    assert "diff-changed" in changed_row.get("class", [])
+    assert "diff-added" in added_row.get("class", [])
+    assert changed_row.select_one(".diff-tag").get_text(strip=True) == "ИЗМЕНИЛИ"
+    assert added_row.select_one(".diff-tag").get_text(strip=True) == "НОВАЯ ПАРА"
     # изменённая пара: подсвечена конкретная ячейка с новым значением
     cells = changed_row.select("td.diff-cell")
     assert [cell.get_text(" ", strip=True) for cell in cells] == ["по верхней неделе Антоново"]
@@ -95,7 +109,9 @@ def test_diff_highlight_marks_changed_row_cell_and_added_row():
     assert "diff-row" not in str(soup.select_one("tr"))
     # CSS и легенда приезжают вместе с подсветкой
     assert "tr.diff-row > td" in monday["html"]
-    assert "Жёлтым подсвечены правки" in monday["html"]
+    legend = monday["html"][monday["html"].find('class="diff-legend"'):]
+    assert "НОВАЯ ПАРА" in legend and "ИЗМЕНИЛИ" in legend
+    assert "swatch added" in legend
 
 
 def test_diff_highlight_prefers_exact_time_over_neighbour_pair():
@@ -107,7 +123,7 @@ def test_diff_highlight_prefers_exact_time_over_neighbour_pair():
     only_changed_soup = BeautifulSoup(only_changed["html"], "html.parser")
     rows = only_changed_soup.select("tr.diff-row")
     assert len(rows) == 1
-    assert rows[0].select_one("td").get_text(" ", strip=True) == "16:00 17:00"
+    assert rows[0].select_one("td").get_text(" ", strip=True) == "ИЗМЕНИЛИ 16:00 17:00"
     assert rows[0].select_one("td.diff-cell").get_text(" ", strip=True) == "по верхней неделе Антоново"
     # без легенды подписи под таблицей нет (сам CSS при диффе остаётся)
-    assert only_changed_soup.select_one("p.diff-legend") is None
+    assert only_changed_soup.select_one(".diff-legend") is None

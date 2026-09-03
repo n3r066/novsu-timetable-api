@@ -681,23 +681,26 @@ def test_changes_post_promises_highlight_only_when_screens_are_marked():
         screenshot_media=[{"label": "Вт", "media": "attach://changes_screenshot_1", "marked": 1}],
     )
     blob = json.dumps(marked, ensure_ascii=False)
-    assert "На скрине дня правки подсвечены жёлтым" in blob
-    assert "жёлтым подсвечены правки" in blob
+    assert "новые пары помечены зелёным" in blob
+    assert "поправленные — оранжевым" in blob
+    assert "зелёным новые пары, оранжевым правки" in blob
 
     clean = build_changes_rich_message(
         diff, [], "https://example.test", now=now,
         screenshot_media=[{"label": "Вт", "media": "attach://changes_screenshot_1", "marked": 0}],
     )
     clean_blob = json.dumps(clean, ensure_ascii=False)
-    # чистый скрин (chromium упал) — никаких обещаний про жёлтый
-    assert "жёлтым" not in clean_blob
+    # чистый скрин (chromium упал) — никаких обещаний про подсветку
+    assert "зелёным" not in clean_blob
+    assert "оранжевым" not in clean_blob
     assert "attach://changes_screenshot_1" in clean_blob
 
     without_media = json.dumps(
         build_changes_rich_message(diff, [], "https://example.test", now=now),
         ensure_ascii=False,
     )
-    assert "жёлтым" not in without_media
+    assert "зелёным" not in without_media
+    assert "оранжевым" not in without_media
 
 
 def test_moved_pair_is_one_card_not_two_rows():
