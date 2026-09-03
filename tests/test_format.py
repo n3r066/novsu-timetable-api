@@ -113,7 +113,14 @@ def test_changes_rich_message_structure():
     # правки сгруппированы по дням в порядке недели, а не по типу изменения
     summaries = [block.get("summary") for block in blocks if block.get("type") == "details"]
     assert summaries[:3] == ["Вторник — 1 изменение", "Среда — 1 изменение", "Четверг — 1 изменение"]
-    assert "Что сделали с расписанием" in blob
+    # структура поста: «Коротко» → дни → «Как это читать»
+    headings = [block.get("text") for block in blocks if block.get("type") == "heading"]
+    assert headings[:2] == ["Коротко", "Что именно поменяли"]
+    overview = next(block for block in blocks if block.get("type") == "list")
+    # список Bot API принимает только в форме items: [{"blocks": [...]}]
+    assert all("blocks" in entry for entry in overview["items"])
+    overview_blob = json.dumps(overview, ensure_ascii=False)
+    assert "Вторник" in overview_blob and "1 изменение" in overview_blob
     assert "(лек.) Новый" in blob
     assert "203 → 415" in blob
     day_blocks = {
@@ -121,13 +128,13 @@ def test_changes_rich_message_structure():
         for block in blocks if block.get("type") == "details"
     }
     wednesday = day_blocks["Среда — 1 изменение"]
-    # правка идёт первой карточкой с глаголом, а не строкой со знаком
-    assert wednesday[0]["type"] == "paragraph"
+    # каждая правка — своя цитата, чтобы отделяться от соседних
+    assert wednesday[0]["type"] == "blockquote"
     first_card = json.dumps(wednesday[0], ensure_ascii=False)
     assert "1. Изменили" in first_card
     assert "203 → 415" in first_card
-    # сводная таблица остаётся, но уже ниже карточек
-    assert any(inner.get("type") == "table" for inner in wednesday)
+    # дублирующая сводная таблица дня убрана: правка уже видна в цитате
+    assert not any(inner.get("type") == "table" for inner in wednesday)
     assert not any(inner.get("type") == "details" for inner in wednesday)
     # убранная пара на новом скрине не появится — предупреждаем текстом
     thursday = day_blocks["Четверг — 1 изменение"]
@@ -135,14 +142,8 @@ def test_changes_rich_message_structure():
     assert any("1. Убрали" in note for note in removed_note)
     assert any("Убрано: 1 пара" in note and "на скрине ниже её уже нет" in note for note in removed_note)
     assert "портал НовГУ" in blob
-    assert '"type": "table"' in blob
-    marks = [
-        cell["text"][0]["text"]
-        for block in blocks if block.get("type") == "details"
-        for inner in block.get("blocks") or [] if inner.get("type") == "table"
-        for row in inner["cells"][1:] for cell in row[:1]
-    ]
-    assert sorted(marks) == sorted(["+", "−", "~"])
+    # знаки +/−/~ больше не нужны: правки подписаны глаголами
+    assert "Сводка дня" not in blob
 
 
 def test_changes_rich_message_hides_empty_sections():
@@ -318,12 +319,11 @@ def test_large_rich_diff_is_chunked_and_within_documented_limits():
     }
     payload = build_changes_rich_message(diff, [], "https://example.test")
     validate_rich_payload(payload)
-    tables = [
+    quotes = [
         block for block in _walk_rich_blocks(payload["rich_message"]["blocks"])
-        if block.get("type") == "table"
+        if block.get("type") == "blockquote"
     ]
-    assert len(tables) > 1
-    assert all(len(table["cells"]) <= 26 for table in tables)  # header + 25 rows
+    assert len(quotes) > 1
     assert "не поместились" in __import__("json").dumps(payload, ensure_ascii=False)
 
 
@@ -681,9 +681,11 @@ def test_changes_post_promises_highlight_only_when_screens_are_marked():
         screenshot_media=[{"label": "Вт", "media": "attach://changes_screenshot_1", "marked": 1}],
     )
     blob = json.dumps(marked, ensure_ascii=False)
-    assert "новые пары помечены зелёным" in blob
-    assert "поправленные — оранжевым" in blob
+    # пояснение про цвета теперь один раз внизу, а не в каждом дне
+    assert "Зелёным помечены новые пары" in blob
+    assert "оранжевым — поправленные" in blob
     assert "зелёным новые пары, оранжевым правки" in blob
+    assert "Как это читать" in blob
 
     clean = build_changes_rich_message(
         diff, [], "https://example.test", now=now,
@@ -722,12 +724,15 @@ def test_moved_pair_is_one_card_not_two_rows():
     # обе записи склеены в один перенос, поэтому и заголовок про одно изменение
     assert day["summary"] == "Четверг — 1 изменение"
     card = json.dumps(day["blocks"][0], ensure_ascii=False)
-    assert "1. Перенесли: (пр.) География туризма" in card
+    assert "1. Перенесли" in card
+    assert "(пр.) География туризма" in card
     assert "время: 11:00–12:45 → 17:00–18:45" in card
     blob = json.dumps(rm, ensure_ascii=False)
     # старую пару не выдаём за отдельное «убрали»
-    assert "Убрали:" not in blob
-    assert "Переносов: 1" in blob
+    assert "Убрали" not in blob
+    # пояснение про перенос — один раз внизу, не в каждом дне
+    assert "Почему «перенесли», а не «убрали и добавили»" in blob
+    assert blob.count("Портал не пишет «перенос»") == 1
 
 
 def test_real_removal_stays_removal():
@@ -743,6 +748,7 @@ def test_real_removal_stays_removal():
                                    now=dt.datetime(2026, 9, 3, 12, 0)),
         ensure_ascii=False,
     )
-    assert "1. Убрали: (лек.) Экономика" in blob
+    assert "1. Убрали" in blob
+    assert "(лек.) Экономика" in blob
     assert "этой пары в новом расписании нет" in blob
     assert "Перенесли" not in blob

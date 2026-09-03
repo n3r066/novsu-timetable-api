@@ -293,7 +293,7 @@ def test_post_changes_attaches_screens_of_changed_days(monkeypatch, tmp_path):
     assert "Новое расписание: Вторник" in blob
     # секция дня открыта сразу: читатель видит правку и картинку рядом
     assert "Вторник — 1 изменение" in blob
-    assert "Что сделали с расписанием" in blob
+    assert "Что именно поменяли" in blob
 
 
 def test_post_changes_retries_without_screens_when_media_rejected(monkeypatch, tmp_path):

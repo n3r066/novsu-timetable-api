@@ -1803,18 +1803,123 @@ def _media_for_day(
     return None, []
 
 
-def _day_sections(
+def _rich_list(items: list[list[object]], *, ordered: bool = False) -> dict:
+    """Список для rich-сообщения.
+
+    Bot API принимает только форму ``items: [{"blocks": [...]}]`` — варианты
+    ``items: [{"text": ...}]`` и простые строки отбиваются с ошибкой.
+    """
+    return {
+        "type": "list",
+        "is_ordered": ordered,
+        "items": [{"blocks": [_rich_paragraph(parts)]} for parts in items],
+    }
+
+
+def _blockquote(title: list[object] | str, body: list[dict], *,
+                expandable: bool = False) -> dict:
+    """Цитата: заголовок в ``text``, содержимое — отдельными блоками.
+
+    Bot API отбивает пустой ``text`` (RICH_MESSAGE_CONTENT_REQUIRED) и цитату
+    без ``blocks`` (RICH_MESSAGE_EMPTY) — нужны обе части непустыми.
+    """
+    return {
+        "type": "expandable_blockquote" if expandable else "blockquote",
+        "text": title,
+        "blocks": body,
+    }
+
+
+def _change_quote(number: int, kind: str, item: dict, partner: dict | None = None) -> dict:
+    """Правка как цитата: заголовок глаголом, под ним «было → стало».
+
+    Цитата отделяет каждую правку от соседних визуально, поэтому нумерованный
+    заголовок читается как подпись, а не как продолжение прошлого абзаца.
+    """
+    subject = str(item.get("subject") or "—").split("\n", 1)[0]
+    when = bells.slot((partner or item).get("time")).label()
+    title: list[object] = [
+        {"type": "bold", "text": f"{number}. {_KIND_TITLE.get(kind, 'Правка')}: "},
+        {"type": "bold", "text": _truncate_rich_text(subject, 200)},
+    ]
+    if when:
+        title += ["  ", {"type": "code", "text": _truncate_rich_text(when, 48)}]
+    body: list[dict] = []
+    for line in _change_lines(kind, item, partner):
+        # Время уже стоит в заголовке цитаты — не повторяем его строкой ниже.
+        if when and line in (f"когда: {when}", f"когда было: {when}"):
+            continue
+        body.append(_rich_paragraph([
+            {"type": "marked", "text": _truncate_rich_text(line, 220)},
+        ]))
+    if not body:
+        body.append(_rich_paragraph([{"type": "marked", "text": "детали не указаны"}]))
+    return _blockquote(title, body)
+
+
+def _kind_counts(by_day: dict[str, list[tuple[str, dict, dict | None]]]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for entries in by_day.values():
+        for kind, _, _ in entries:
+            counts[kind] = counts.get(kind, 0) + 1
+    return counts
+
+
+def _overview_block(by_day: dict[str, list[tuple[str, dict, dict | None]]]) -> dict:
+    """«Коротко» — сколько правок в каком дне, чтобы не читать весь пост."""
+    order = {name: index for index, name in enumerate(DAYS_ORDER)}
+    items: list[list[object]] = []
+    for day in sorted(by_day, key=lambda name: order.get(name, len(order))):
+        entries = by_day[day]
+        kinds = [_KIND_TITLE.get(kind, "правка").lower() for kind, _, _ in entries]
+        seen: list[str] = []
+        for kind in kinds:
+            if kind not in seen:
+                seen.append(kind)
+        items.append([
+            {"type": "bold", "text": day},
+            f" — {len(entries)} {_changes_word(len(entries))}: " + ", ".join(seen),
+        ])
+    return _rich_list(items, ordered=False)
+
+
+def _explainer_block(counts: dict[str, int], marked: bool) -> dict:
+    """Пояснения один раз внизу, а не в каждом дне.
+
+    Раньше про переносы и про цвета скрина писалось в каждом дне — это давало
+    шаблонные абзацы, из-за которых пост читался как полотно.
+    """
+    body: list[dict] = []
+    if counts.get("moved"):
+        body.append(_rich_paragraph([
+            {"type": "bold", "text": "Почему «перенесли», а не «убрали и добавили». "},
+            "Портал не пишет «перенос»: он убирает пару со старого времени и ставит "
+            "на новое. Мы склеиваем это в одну правку, поэтому счётчик сверху "
+            "совпадает с номерами правок.",
+        ]))
+    if counts.get("removed"):
+        body.append(_rich_paragraph([
+            {"type": "bold", "text": "Убранные пары. "},
+            "Их не подсвечиваем на скрине — там их уже просто нет. Смотри строку "
+            "«Убрано» в нужном дне.",
+        ]))
+    if marked:
+        body.append(_rich_paragraph([
+            {"type": "bold", "text": "Цвета на скрине. "},
+            "Зелёным помечены новые пары, оранжевым — поправленные. "
+            "Рядом с полосой стоит подпись словами, чтобы цвет не приходилось угадывать.",
+        ]))
+    if not body:
+        return _paragraph("")
+    return _blockquote("Как читать этот пост", body, expandable=True)
+
+
+def _group_by_day(
     added: list[dict],
     removed: list[dict],
     changed: list[dict],
-    screenshot_media: list[dict] | None,
-    source_url: str,
-) -> list[dict]:
-    """Правки по дням: таблица дня, что именно изменилось и скрин нового дня.
-
-    Читатель видит день целиком: знак правки у каждой записи, расшифровка
-    «было → стало» и рядом картинка нового расписания с портала.
-    """
+) -> dict[str, list[tuple[str, dict, dict | None]]]:
+    """Правки, разложенные по дням и отсортированные для чтения."""
     by_day: dict[str, list[tuple[str, dict, dict | None]]] = {}
     days = {str(item.get("day") or "").strip() or "—"
             for item in (*added, *removed, *changed)}
@@ -1832,48 +1937,44 @@ def _day_sections(
             entries.append(("added", item, None))
         for item in rest_removed:
             entries.append(("removed", item, None))
-        by_day[day] = entries
-    order = {name: index for index, name in enumerate(DAYS_ORDER)}
-    used: set[str] = set()
-    blocks: list[dict] = []
-    for day in sorted(by_day, key=lambda name: order.get(name, len(order))):
-        entries = by_day[day]
         # Сначала по важности правки, потом по времени: читатель видит
         # переносы и изменения раньше мелких добавлений.
         entries.sort(key=lambda triple: (
             _KIND_ORDER.get(triple[0], 9),
             bells.slot(triple[1].get("time")).start,
         ))
+        by_day[day] = entries
+    return by_day
+
+
+def _day_sections(
+    added: list[dict],
+    removed: list[dict],
+    changed: list[dict],
+    screenshot_media: list[dict] | None,
+    source_url: str,
+) -> list[dict]:
+    """Дни как разделы: каждая правка — отдельная цитата, потом скрин дня.
+
+    Сводная таблица убрана намеренно: она повторяла те же правки третий раз
+    после цитаты и скрина. Пояснения про переносы и цвета вынесены один раз
+    в конец поста, а не повторяются в каждом дне.
+    """
+    by_day = _group_by_day(added, removed, changed)
+    order = {name: index for index, name in enumerate(DAYS_ORDER)}
+    used: set[str] = set()
+    blocks: list[dict] = []
+    for day in sorted(by_day, key=lambda name: order.get(name, len(order))):
+        entries = by_day[day]
         content: list[dict] = []
-        # Карточки «что сделали» идут первыми: это ответ на главный вопрос.
         for number, (kind, item, partner) in enumerate(entries, 1):
-            content.append(_change_card(number, kind, item, partner))
-        moved_here = sum(1 for kind, _, _ in entries if kind == "moved")
-        if moved_here:
-            content.append(_paragraph(
-                f"Переносов: {moved_here}. Портал не пишет «перенос» — он убирает пару "
-                "со старого времени и ставит на новое. Мы склеили это в одну правку."
-            ))
+            content.append(_change_quote(number, kind, item, partner))
         removed_here = sum(1 for kind, _, _ in entries if kind == "removed")
         if removed_here:
             pronoun = "её" if removed_here == 1 else "их"
             content.append(_paragraph(
                 f"Убрано: {removed_here} {_pairs_word(removed_here)} — на скрине ниже {pronoun} уже нет."
             ))
-        # Ниже — компактная сводка дня той же таблицей, но уже как итог.
-        rows: list[list[tuple[object, str]]] = []
-        for kind, item, partner in entries:
-            if kind == "moved":
-                rows.append(_day_change_row("removed", item))
-                rows.append(_day_change_row("added", partner or item))
-            else:
-                rows.append(_day_change_row(kind, item))
-        chunks = _chunked(rows, _RICH_DIFF_TABLE_CHUNK)
-        for chunk_index, chunk in enumerate(chunks):
-            if len(chunks) > 1:
-                first = chunk_index * _RICH_DIFF_TABLE_CHUNK + 1
-                content.append(_paragraph(f"Строки {first}–{first + len(chunk) - 1}"))
-            content.append(_table([_DAY_TABLE_HEAD] + chunk))
         media, shared = _media_for_day(day, screenshot_media, used)
         if media:
             caption: list[object] = [
@@ -1887,13 +1988,6 @@ def _day_sections(
             content.append(_paragraph(
                 f"Скрин этого дня общий с {', '.join(shared)} — он в блоке выше."
             ))
-        # В сводке знаки всё же нужны — расшифровываем их рядом с таблицей.
-        content.append(_rich_paragraph([
-            {"type": "bold", "text": "Сводка дня: "},
-            {"type": "code", "text": "+"}, " новое время/пара · ",
-            {"type": "code", "text": "−"}, " старое время/пара · ",
-            {"type": "code", "text": "~"}, " та же пара с правкой.",
-        ]))
         blocks.append(_details_open(
             f"{day} — {len(entries)} {_changes_word(len(entries))}", *content
         ))
@@ -1961,24 +2055,24 @@ def build_changes_rich_message(
         blocks: list[dict] = [_pullquote("\n".join(title_lines))]
         shown = (added[:limits[0]], removed[:limits[1]], changed[:limits[2]])
         if added or removed or changed:
-            tail = (
-                " Ниже по дням: каждая правка пронумерована и подписана глаголом, "
-                "под ней — «было → стало». На скрине дня новые пары помечены зелёным, "
-                "поправленные — оранжевым."
-                if _has_screen_marks(screenshot_media)
-                else " Ниже по дням: каждая правка пронумерована и подписана глаголом, "
-                "под ней — «было → стало»."
-            )
-            blocks.append(_rich_paragraph([
-                {"type": "bold", "text": "Что сделали с расписанием."},
-                tail,
-            ]))
+            by_day = _group_by_day(*shown)
+            # «Коротко» сверху: сколько правок в каком дне — чтобы понять объём
+            # до чтения самих правок.
+            blocks.append(_heading("Коротко", 3))
+            blocks.append(_overview_block(by_day))
+            blocks.append(_heading("Что именно поменяли", 3))
             blocks.extend(_day_sections(*shown, screenshot_media, source_url))
             omitted = total - sum(len(part) for part in shown)
             if omitted > 0:
                 blocks.append(_paragraph(
                     f"Показаны не все правки: ещё {omitted} не поместились в лимит сообщения."
                 ))
+            explainer = _explainer_block(
+                _kind_counts(by_day), _has_screen_marks(screenshot_media)
+            )
+            if explainer.get("blocks"):
+                blocks.append(_heading("Как это читать", 3))
+                blocks.append(explainer)
         if not (added or removed or changed or transition):
             blocks.append(_paragraph("Содержимое страницы изменилось, но состав пар прежний."))
         blocks.append(_divider())
