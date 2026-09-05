@@ -217,15 +217,20 @@ def test_diff_day_screens_marks_only_visible_changes_and_caches(monkeypatch, tmp
     monkeypatch.setattr(post.config, "STATE_DIR", state)
     calls = []
 
-    def fake_crop_items(html, url, out_png, *, diff_items=None, diff_legend="", only_labels=None):
-        calls.append({"diff_items": diff_items, "only_labels": only_labels, "legend": diff_legend})
+    def fake_crop_items(html, url, out_png, *, diff_items=None, diff_legend="", only_labels=None,
+                        diff_removed_note=True):
+        calls.append({"diff_items": diff_items, "only_labels": only_labels, "legend": diff_legend,
+                      "removed_note": diff_removed_note})
         shot_dir = Path(out_png).parent
         shot_dir.mkdir(parents=True, exist_ok=True)
         items = []
         for index, label in enumerate(sorted(only_labels or set()), 1):
             path = Path(str(Path(out_png).with_suffix("")) + f"_part{index:02d}.png")
             path.write_bytes(b"png")
-            items.append({"label": label, "path": path, "marked": 1 if label != "Чт" else 0})
+            entry = {"label": label, "path": path, "marked": 1 if label != "Чт" else 0}
+            if label == "Пн":
+                entry["marked_kinds"] = ["changed"]
+            items.append(entry)
         return items
 
     monkeypatch.setattr(post, "screenshot_schedule_day_crop_items", fake_crop_items)
@@ -238,6 +243,12 @@ def test_diff_day_screens_marks_only_visible_changes_and_caches(monkeypatch, tmp
     # Помечаются только добавленные и изменённые — убранной пары в новом HTML нет.
     assert [item["subject"] for item in calls[0]["diff_items"]] == ["Та же пара", "Новая пара"]
     assert calls[0]["legend"]
+    # В диффе есть убранные пары — строка про них на скрине нужна.
+    assert calls[0]["removed_note"] is True
+    # Типы помеченных правок проходят насквозь: подпись поста обещает только их.
+    by_label = {item["label"]: item for item in items}
+    assert by_label["Пн"]["marked_kinds"] == ["changed"]
+    assert "marked_kinds" not in by_label["Ср"]
     assert sorted(item["label"] for item in items) == ["Пн", "Ср", "Чт"]
     assert (state / "diff_screens.json").exists()
 
@@ -253,3 +264,91 @@ def test_diff_day_screens_marks_only_visible_changes_and_caches(monkeypatch, tmp
     assert len(calls) == 2
     left = sorted(p.name for p in (state / "dashboard_screens").glob("6381_diff_*.png"))
     assert left == sorted(Path(item["path"]).name for item in fresh)
+
+
+def _rollover_stubs(monkeypatch, tmp_path, weeks, today):
+    """Обвязка для проверки ролловера закрепа: chromium и Telegram не дёргаем."""
+    import datetime as dt
+
+    state = tmp_path / "state"
+    state.mkdir()
+    monkeypatch.setattr(post.config, "STATE_DIR", state)
+    monkeypatch.setattr(post, "_today_msk", lambda: today)
+    monkeypatch.setattr(post, "parse_all", lambda html: {"schedule": {"days": {}}, "weeks": weeks})
+    monkeypatch.setattr(post, "content_fingerprint", lambda data: "FP-ROLL")
+    monkeypatch.setattr(post, "edit_rich_message", lambda *a, **k: {"ok": True})
+
+    def bounds(week):
+        fmt = "%d.%m.%Y"
+        return (dt.datetime.strptime(week["start"], fmt).date(), dt.datetime.strptime(week["end"], fmt).date())
+
+    def fake_lessons(schedule, weeks_arg, target):
+        for week in weeks:
+            start, end = bounds(week)
+            if start <= target <= end:
+                return week, [{"subject": "Пара"}]
+        # Воскресенье между неделями: пар нет, фокус уедет на понедельник.
+        return None, []
+
+    monkeypatch.setattr("schedule_logic.lessons_for_date", fake_lessons)
+
+    def fake_crops(source_html, source_url, out_png, **kwargs):
+        out = Path(out_png)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        items = []
+        for index, label in enumerate(["Пн", "Вт", "Ср", "Чт", "Пт", "Сб"], 1):
+            path = Path(str(out.with_suffix("")) + f"_part{index:02d}.png")
+            path.write_bytes(b"png")
+            items.append({"label": label, "path": str(path)})
+        return items
+
+    monkeypatch.setattr(post, "screenshot_schedule_day_crop_items", fake_crops)
+
+    seen = {}
+
+    def fake_build(schedule, weeks_arg, url, target_date, **kwargs):
+        seen["target"] = target_date
+        seen["current_date"] = kwargs.get("current_date")
+        seen["media"] = [item["label"] for item in kwargs.get("screenshot_media") or []]
+        return {"rich_message": {"blocks": []}}
+
+    monkeypatch.setattr(post, "build_dashboard_rich_message", fake_build)
+
+    def fake_edit(rich, *, token, chat_id, message_id, files=None, timeout=30):
+        seen["files"] = sorted(files or {})
+        return {"ok": True}
+
+    monkeypatch.setattr(post, "edit_rich_message", fake_edit)
+    return seen
+
+
+def test_dashboard_rollover_attaches_only_live_days(monkeypatch, tmp_path):
+    """Пятница: в закреплённый пост идут только скрины пт и сб."""
+    import datetime as dt
+
+    weeks = [{"week": 1, "half": "top", "start": "31.08.2026", "end": "05.09.2026"}]
+    seen = _rollover_stubs(monkeypatch, tmp_path, weeks, dt.date(2026, 9, 4))
+
+    result = post.edit_dashboard_post(1, dt.date(2026, 9, 4), html="html-A", fingerprint="FP-ROLL")
+
+    assert result["ok"] is True
+    assert seen["current_date"] == dt.date(2026, 9, 4)
+    assert seen["media"] == ["Пт", "Сб"]
+    assert seen["files"] == ["site_screenshot_1", "site_screenshot_2"]
+
+
+def test_dashboard_rollover_switches_to_next_week_on_sunday(monkeypatch, tmp_path):
+    """В воскресенье фокус уезжает на понедельник, и видна вся следующая неделя."""
+    import datetime as dt
+
+    weeks = [
+        {"week": 1, "half": "top", "start": "31.08.2026", "end": "05.09.2026"},
+        {"week": 2, "half": "bottom", "start": "07.09.2026", "end": "12.09.2026"},
+    ]
+    seen = _rollover_stubs(monkeypatch, tmp_path, weeks, dt.date(2026, 9, 6))
+
+    post.edit_dashboard_post(1, dt.date(2026, 9, 6), html="html-A", fingerprint="FP-ROLL")
+
+    assert seen["target"] == dt.date(2026, 9, 7)
+    assert seen["media"] == ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб"]
+    assert seen["files"] == [f"site_screenshot_{index}" for index in range(1, 7)]

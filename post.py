@@ -31,6 +31,7 @@ import config  # noqa: E402
 from fetch import content_fingerprint, fetch_html, hash_html  # noqa: E402
 from parse import parse_all  # noqa: E402
 from format import (  # noqa: E402
+    DAY_SHORT_TO_FULL,
     DAY_TO_SHORT,
     build_dashboard_rich_message,
     changed_days,
@@ -38,8 +39,14 @@ from format import (  # noqa: E402
     format_schedule_post,
     render_schedule_html,
 )
+from schedule_logic import visible_week_days  # noqa: E402
 from screenshot import screenshot_html, screenshot_schedule_day_crop_items  # noqa: E402
 from telegram_api import edit_rich_message  # noqa: E402
+
+
+def _today_msk() -> dt.date:
+    """Сегодня по Москве: сервер живёт в UTC, а ролловер закрепа — в 00:00 Мск."""
+    return dt.datetime.now(zoneinfo.ZoneInfo("Europe/Moscow")).date()
 
 
 def _tg_api(method: str, **fields) -> dict[str, Any]:
@@ -441,6 +448,7 @@ def diff_day_screens(
         diff_items=marks,
         diff_legend=DIFF_SCREEN_LEGEND,
         only_labels=wanted,
+        diff_removed_note=bool(diff.get("removed")),
     )
     keep = {str(item["path"]) for item in raw}
     keep |= {str(Path(str(item["path"])).with_suffix(".html")) for item in raw}
@@ -451,7 +459,14 @@ def diff_day_screens(
             except OSError:
                 pass
     items = [
-        {"label": item["label"], "path": str(item["path"]), "marked": int(item.get("marked") or 0)}
+        {
+            "label": item["label"],
+            "path": str(item["path"]),
+            "marked": int(item.get("marked") or 0),
+            # Какие правки легли на этот скрин: подпись в посте обещает только
+            # реально помеченные цвета.
+            **({"marked_kinds": list(item["marked_kinds"])} if item.get("marked_kinds") else {}),
+        }
         for item in raw
     ]
     _write_json_atomic(cache_file, {"fingerprint": fingerprint, "signature": signature, "items": items})
@@ -488,7 +503,26 @@ def edit_dashboard_post(
             continue
         break
 
-    shot_items = _dashboard_screens(html, fp, target_date)
+    # Скрины прошедших дней в пост не кладём. День живёт в закрепе до конца
+    # своей последней пары (вариант 2), поэтому фильтруем по московскому времени.
+    tz_msk = zoneinfo.ZoneInfo("Europe/Moscow")
+    # Дата берётся через тестируемый helper: rollover и ручной --edit-rich
+    # должны одинаково определять «живые» дни, независимо от даты запуска теста.
+    current_date = _today_msk()
+    clock_now = dt.datetime.now(tz_msk)
+    now_msk = dt.datetime.combine(current_date, clock_now.timetz())
+    live_days = set(
+        visible_week_days(weeks, target_date, current_date, schedule=schedule, now=now_msk)
+    )
+
+    def _day_still_live(item: dict) -> bool:
+        label = str(item.get("label") or "")
+        day_name = DAY_SHORT_TO_FULL.get(label)
+        # Подпись без известного дня («с сайта») не фильтруем: иначе пост
+        # остался бы совсем без картинок.
+        return day_name is None or day_name in live_days
+
+    shot_items = [item for item in _dashboard_screens(html, fp, target_date) if _day_still_live(item)]
     screenshot_media = [
         {"label": item["label"], "media": f"attach://site_screenshot_{index}"}
         for index, item in enumerate(shot_items, 1)
@@ -499,7 +533,10 @@ def edit_dashboard_post(
     if monitor_state_path.exists():
         try:
             monitor_data = json.loads(monitor_state_path.read_text(encoding="utf-8"))
-            event = monitor_data.get("event", {})
+            # event — последний опрос; last_change_event — последнее
+            # семантическое изменение расписания. Старые state-файлы
+            # совместимы: при отсутствии нового поля используем event.
+            event = monitor_data.get("last_change_event") or monitor_data.get("event", {})
             ts = event.get("ts", "")
             if ts:
                 # Формат: 2026-08-27T15:45:25+00:00 -> 27.08.2026 15:45
@@ -519,7 +556,8 @@ def edit_dashboard_post(
         target_date,
         group_name="6381",
         screenshot_media=screenshot_media,
-        current_date=dt.datetime.now(zoneinfo.ZoneInfo("Europe/Moscow")).date(),
+        current_date=current_date,
+        now=now_msk,
         last_updated=last_updated,
     )
     files = {f"site_screenshot_{index}": item["path"] for index, item in enumerate(shot_items, 1)}
@@ -541,9 +579,31 @@ if __name__ == "__main__":
     ap.add_argument("--alert", help="короткий пост-уведомление об изменениях")
     ap.add_argument("--edit-rich", type=int, metavar="MESSAGE_ID", help="отредактировать существующий пост dashboard-rich форматом")
     ap.add_argument("--date", default="2026-09-02", help="дата фокуса для --edit-rich, YYYY-MM-DD")
+    _env_roll = os.environ.get("NOVSU_DASHBOARD_POST_ID", "").strip()
+    _default_roll = int(_env_roll) if _env_roll and _env_roll not in ("0", "None") else None
+    ap.add_argument(
+        "--roll",
+        nargs="?",
+        const=_default_roll,
+        default=None,
+        type=int,
+        metavar="MESSAGE_ID",
+        help="ролловер закрепа на сегодняшнюю дату Мск: прошедшие дни недели исчезают "
+             "(в 00:00 Мск в посте остаются только будущие дни, в воскресенье — уже следующая неделя). "
+             "Без значения берёт NOVSU_DASHBOARD_POST_ID из окружения",
+    )
     args = ap.parse_args()
 
-    if args.edit_rich:
+    # nargs="?" даёт None и когда флага нет, и когда он без значения, —
+    # поэтому смотрим в argv: ролловер без id закрепа делать некуда.
+    if "--roll" in sys.argv:
+        if not args.roll:
+            print("нужен MESSAGE_ID: --roll 3 или NOVSU_DASHBOARD_POST_ID в окружении")
+            raise SystemExit(2)
+        today_msk = _today_msk()
+        r = edit_dashboard_post(args.roll, today_msk)
+        print(json.dumps({"rolled_to": today_msk.isoformat(), **r}, ensure_ascii=False))
+    elif args.edit_rich:
         target_date = dt.datetime.strptime(args.date, "%Y-%m-%d").date()
         r = edit_dashboard_post(args.edit_rich, target_date)
         print(json.dumps(r, ensure_ascii=False))

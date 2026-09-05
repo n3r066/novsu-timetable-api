@@ -147,10 +147,17 @@ def test_run_once_posts_diff_to_channel_on_change(monkeypatch, tmp_path):
     assert result["changed"] is True
     assert len(posts) == 1
     diff = posts[0]
-    added = [x["subject"].split("\n")[0] for x in diff["added"]]
-    removed = [x["subject"].split("\n")[0] for x in diff["removed"]]
-    assert any("Предмет Ц" in s for s in added)
-    assert any("Предмет Б" in s for s in removed)
+    # Переименование пары в том же слоте — одна правка поля «предмет», а не
+    # «убрали» + «добавили»: пара никуда не делась, у неё сменилось название.
+    assert diff["added"] == [] and diff["removed"] == []
+    changed = diff["changed"]
+    assert len(changed) == 1
+    assert [field[0] for field in changed[0]["fields"]] == ["предмет"]
+    _, was, now_subject = changed[0]["fields"][0]
+    assert "Предмет Б" in was and "Предмет Ц" in now_subject
+    # контекст пары остаётся в записи: пост печатает где и кто ведёт
+    assert changed[0]["room"] == "102"
+    assert changed[0]["teacher"] == "Петров П. П."
     assert dms == []  # личка молчит про содержимое
 
 
@@ -386,7 +393,9 @@ def test_changed_day_screen_media_prefers_highlight_and_falls_back(monkeypatch, 
     monkeypatch.setattr(monitor, "diff_day_screens", boom)
     media, files = monitor._changed_day_screen_media(diff, "<html>", "fp", target)
     assert calls == ["highlight", "clean"]
-    assert media == [{"label": "Ср", "media": "attach://changes_screenshot_1", "marked": 0}]
+    # Чистый скрин помечен как неподсвеченный: пост не должен обещать цвета.
+    assert media == [{"label": "Ср", "media": "attach://changes_screenshot_1", "marked": 0,
+                      "highlighted": False}]
     assert files == {"changes_screenshot_1": clean}
 
     # Рендер не получился вовсе — пост уходит текстом, как и раньше.

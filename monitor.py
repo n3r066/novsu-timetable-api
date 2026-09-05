@@ -6,7 +6,7 @@
    (иммунитет к волатильным таймстемпам .xls-ссылок портала)
 3. сравнить с атомарным baseline из state/monitor_state.json
 4. если изменилось:
-   - дописать событие в state/changes.jsonl
+   - записать наблюдение в state/changes.jsonl (журнал опросов)
    - построить дифф (добавлено/убрано/изменено, stub-переходы)
    - запостить rich-сообщение в КАНАЛ (фоллбек — plain HTML)
    - опционально обновить закреплённый rich-пост с расписанием
@@ -38,6 +38,7 @@ from contextlib import contextmanager
 from pathlib import Path
 import zoneinfo
 
+import bells  # noqa: E402
 import config  # noqa: E402
 from fetch import content_fingerprint, fetch_html, hash_html, is_stub  # noqa: E402
 from format import build_changes_rich_message, changes_fallback_text, pick_day_screens  # noqa: E402
@@ -122,6 +123,104 @@ def _change_signature(lesson: dict) -> tuple:
     return tuple(str(lesson.get(field) or "").strip() for field, _ in _DIFF_FIELDS)
 
 
+#: Поля пары, которые пост показывает как контекст правки (место, кто ведёт).
+_CONTEXT_FIELDS = ("room", "teacher", "location", "note", "delivery_mode")
+
+
+def _change_item(item: dict, fields: list[tuple[str, str, str]]) -> dict:
+    """Запись «изменили» вместе с контекстом пары.
+
+    Раньше в записи были только день, время, предмет и список полей, поэтому
+    пост не мог показать, где именно стоит правленая пара и кто её ведёт, —
+    приходилось печатать «ауд. —» вместо настоящего места.
+    """
+    record = {
+        "day": item.get("day"),
+        "time": item.get("time"),
+        "subject": item.get("subject"),
+        "subgroup": _subgroup(item),
+        "fields": fields,
+    }
+    for field in _CONTEXT_FIELDS:
+        record[field] = item.get(field)
+    return record
+
+
+def _slot_key(lesson: dict) -> tuple:
+    """Место пары в сетке без предмета: день, академические часы, подгруппа, препод.
+
+    Часы берём через ``bells.parse_hours``, а не по сырой строке «9:00 10:00»:
+    портал может перепечатать то же время иначе, и это не делает пару другой.
+    """
+    return (
+        str(lesson.get("day") or "").strip(),
+        tuple(bells.parse_hours(lesson.get("time"))),
+        _subgroup(lesson),
+        str(lesson.get("teacher") or "").strip().casefold(),
+    )
+
+
+def _rename_score(gone: dict, arrived: dict) -> int:
+    """Сколько полей пары совпало: чем больше, тем ближе запись к переименованию."""
+    return sum(
+        1
+        for field, _ in _DIFF_FIELDS
+        if str(gone.get(field) or "").strip() == str(arrived.get(field) or "").strip()
+    )
+
+
+def _rename_fields(gone: dict, arrived: dict) -> list[tuple[str, str, str]]:
+    """Что именно поменялось в паре, которая осталась на своём месте."""
+    fields: list[tuple[str, str, str]] = []
+    old_subject, new_subject = _subject(gone), _subject(arrived)
+    if old_subject != new_subject:
+        fields.append(("предмет", old_subject, new_subject))
+    for field, label in _DIFF_FIELDS:
+        old_value = str(gone.get(field) or "").strip()
+        new_value = str(arrived.get(field) or "").strip()
+        if old_value != new_value:
+            fields.append((label, old_value, new_value))
+    return fields
+
+
+def _match_renames(
+    removed: list[dict], added: list[dict]
+) -> tuple[list[dict], list[dict], list[dict]]:
+    """Склеить «убрали» + «добавили» на том же месте сетки в одну правку.
+
+    Портал не умеет сообщать о переименовании: он печатает новое название в
+    той же строке, и для наивного диффа это выглядит как исчезнувшая пара и
+    появившаяся пара. Читатель видит «добавили 2, убрали 2» там, где ровно
+    одна пара осталась на месте и просто сменила название. Поэтому записи с
+    одинаковым местом (день, часы, подгруппа, преподаватель) сводим в одну
+    правку «изменили», а настоящие добавления и убирания оставляем как есть.
+    """
+    renamed: list[dict] = []
+    free_added = list(added)
+    rest_removed: list[dict] = []
+    for gone in removed:
+        key = _slot_key(gone)
+        if not key[1]:
+            rest_removed.append(gone)
+            continue
+        candidates = [
+            (index, candidate)
+            for index, candidate in enumerate(free_added)
+            if _slot_key(candidate) == key
+        ]
+        if not candidates:
+            rest_removed.append(gone)
+            continue
+        index, arrived = max(candidates, key=lambda pair: _rename_score(gone, pair[1]))
+        fields = _rename_fields(gone, arrived)
+        if not fields:
+            rest_removed.append(gone)
+            continue
+        free_added.pop(index)
+        renamed.append(_change_item(arrived, fields))
+    return renamed, rest_removed, free_added
+
+
 def diff_schedules(
     old: dict | None,
     new: dict | None,
@@ -167,13 +266,7 @@ def diff_schedules(
                 if str(old_item.get(field) or "").strip() != str(new_item.get(field) or "").strip()
             ]
             if fields:
-                changed.append({
-                    "day": new_item["day"],
-                    "time": new_item.get("time"),
-                    "subject": new_item.get("subject"),
-                    "subgroup": _subgroup(new_item),
-                    "fields": fields,
-                })
+                changed.append(_change_item(new_item, fields))
         removed.extend(unmatched_before[pair_count:])
         added.extend(after[pair_count:])
 
@@ -202,6 +295,14 @@ def diff_schedules(
             enriched = _enrich_teacher(str(item.get("teacher") or ""), lookup)
             if enriched != str(item.get("teacher") or ""):
                 item["teacher"] = enriched
+
+    # Переименованная пара остаётся на месте: это одна правка, а не
+    # «убрали» + «добавили». Сводим после обогащения ФИО, чтобы совпали
+    # записи, где фамилия с одной стороны напечатана сокращённо.
+    renamed, removed, added = _match_renames(removed, added)
+    changed.extend(renamed)
+
+    if lookup:
         for item in changed:
             new_fields = []
             for field in (item.get("fields") or []):
@@ -243,8 +344,10 @@ def _changed_day_screen_media(
         return [], {}
     target = focus_date or dt.datetime.now(zoneinfo.ZoneInfo("Europe/Moscow")).date()
     picked: list[dict] = []
+    highlighted = False
     try:
         picked = diff_day_screens(html, diff, target, fingerprint=fingerprint)
+        highlighted = bool(picked)
         if picked:
             print(f"[diff screens] подсветка: {[(item.get('label'), item.get('marked')) for item in picked]}")
     except Exception as exc:  # noqa: BLE001
@@ -255,14 +358,20 @@ def _changed_day_screen_media(
         except Exception as exc:  # noqa: BLE001
             print(f"[diff screens] render failed: {exc}", file=sys.stderr)
             return [], {}
-    media = [
-        {
+    media: list[dict] = []
+    for index, item in enumerate(picked, 1):
+        entry = {
             "label": item.get("label", ""),
             "media": f"attach://changes_screenshot_{index}",
             "marked": int(item.get("marked") or 0),
         }
-        for index, item in enumerate(picked, 1)
-    ]
+        # Пост обещает только те цвета, которые реально легли на скрин.
+        kinds = [str(kind) for kind in (item.get("marked_kinds") or [])]
+        if kinds:
+            entry["kinds"] = kinds
+        if not highlighted:
+            entry["highlighted"] = False
+        media.append(entry)
     files = {
         f"changes_screenshot_{index}": Path(item["path"])
         for index, item in enumerate(picked, 1)
@@ -381,8 +490,19 @@ def _load_baseline() -> dict:
     return {}
 
 
-def _save_baseline(event: dict, data: dict) -> None:
-    state = {"event": event, "stub": bool(data.get("stub")), "schedule": data.get("schedule"), "weeks": data.get("weeks", [])}
+def _save_baseline(event: dict, data: dict, *, last_change_event: dict | None = None) -> None:
+    # ``event`` описывает последний опрос. Отдельно сохраняем событие,
+    # которое действительно сдвинуло семантический baseline, чтобы UI не
+    # выдавал время очередного poll за время изменения расписания.
+    if last_change_event is None:
+        last_change_event = event
+    state = {
+        "event": event,
+        "last_change_event": last_change_event,
+        "stub": bool(data.get("stub")),
+        "schedule": data.get("schedule"),
+        "weeks": data.get("weeks", []),
+    }
     _write_json_atomic(config.STATE_DIR / "monitor_state.json", state)
     # Compatibility for existing tooling. The combined file above is the
     # authoritative atomic baseline.
@@ -525,14 +645,16 @@ def _run_once_locked(update_post_id: int | None = None, post_date: dt.date | Non
     try:
         if changes_log.stat().st_size > 1_000_000:
             lines = changes_log.read_text(encoding="utf-8").splitlines()
-            changes_log.write_text("\n".join(lines[-500:]) + "\n", encoding="utf-8")
+            temporary = changes_log.with_name(f".{changes_log.name}.{os.getpid()}.tmp")
+            temporary.write_text("\n".join(lines[-500:]) + "\n", encoding="utf-8")
+            os.replace(temporary, changes_log)
     except Exception:  # noqa: BLE001
         pass
 
     previous_event = baseline.get("event") or {}
     previous_fp = previous_event.get("fingerprint")
     if previous_fp is None:
-        _save_baseline(event, data)
+        _save_baseline(event, data, last_change_event=event)
         _unlink(candidate_file)
         _unlink(pending_file)
         print(f"[baseline] fingerprint={new_fp} stub={stub}")
@@ -567,7 +689,11 @@ def _run_once_locked(update_post_id: int | None = None, post_date: dt.date | Non
             print(f"[retry pending] still failing: {retry_result.get('error', '?')}", file=sys.stderr)
 
     if not changed:
-        _save_baseline(event, data)
+        _save_baseline(
+            event,
+            data,
+            last_change_event=baseline.get("last_change_event") or previous_event or event,
+        )
         _unlink(candidate_file)
         dashboard_ok = None
         if update_post_id:
@@ -643,7 +769,7 @@ def _run_once_locked(update_post_id: int | None = None, post_date: dt.date | Non
             "old_schedule": old_data.get("schedule"),
             "new_schedule": data.get("schedule"),
         })
-        _save_baseline(event, data)
+        _save_baseline(event, data, last_change_event=event)
         _unlink(pending_file)
         dashboard_ok = _try_dashboard(update_post_id, post_date, html, new_fp) if update_post_id else None
         _dm(
@@ -673,7 +799,7 @@ def _run_once_locked(update_post_id: int | None = None, post_date: dt.date | Non
         print(f"[delivery pending] fingerprint={new_fp}")
         return {"changed": True, "fingerprint": new_fp, "stub": stub, "posted": False, "delivery_pending": True, **event}
 
-    _save_baseline(event, data)
+    _save_baseline(event, data, last_change_event=event)
     _unlink(pending_file)
     dashboard_ok = _try_dashboard(update_post_id, post_date, html, new_fp) if update_post_id else None
     total = len(diff["added"]) + len(diff["removed"]) + len(diff["changed"])

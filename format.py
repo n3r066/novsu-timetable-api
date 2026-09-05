@@ -10,7 +10,7 @@ import urllib.request
 import zoneinfo
 
 import bells
-from schedule_logic import day_view, find_week as find_schedule_week, week_view
+from schedule_logic import day_is_live, day_view, find_week as find_schedule_week, week_view
 
 WEEK_HALF_NAME = {"top": "верхняя", "bottom": "нижняя"}
 DAY_SHORT_TO_FULL = {
@@ -137,9 +137,12 @@ def _pairs_word(count: int) -> str:
     return "пар"
 
 
-def _week_summary() -> list[object]:
+def _week_summary(dropped_past: bool = False) -> list[object]:
+    # Прошедшие дни из закрепа исчезают, поэтому «полным» расписание бывает
+    # только в начале недели — иначе подпись врёт читателю.
+    label = "Расписание до конца недели" if dropped_past else "Полное расписание"
     return [
-        {"type": "marked", "text": {"type": "bold", "text": "Полное расписание"}},
+        {"type": "marked", "text": {"type": "bold", "text": label}},
     ]
 
 
@@ -239,6 +242,28 @@ def _parity_word(parity: str) -> str:
     return {"upper": "верхней", "lower": "нижней", "every": "каждую"}[parity]
 
 
+#: Короткие названия недели для строки «где» внутри одной карточки правки.
+_WEEK_SHORT = {"upper": "верхняя неделя", "lower": "нижняя неделя", "every": "каждую неделю"}
+
+
+def _lesson_place(item: dict) -> str:
+    """Место пары для таблицы дня: аудитория, а у дистанта — сам формат."""
+    room = str(item.get("room") or "").strip().strip(".").strip()
+    if room.casefold() not in _EMPTY_ROOM:
+        return room
+    mode = str(item.get("delivery_mode") or "").strip().casefold()
+    if mode.startswith("remote") or _DOT_RE.search(str(item.get("note") or "")):
+        return "дистанционно"
+    return "—"
+
+
+def _day_note(item: dict) -> str:
+    """Примечание дня без фразы про ДОТ — формат уже показан в «место»."""
+    note = str(item.get("note") or "").strip()
+    note = _DOT_RE.sub(" ", note)
+    return re.sub(r"\s{2,}", " ", note).strip(" ,;.")
+
+
 def _lesson_table(lessons: list[dict]) -> dict:
     body = [[
         ("№", "bold"), ("предмет", "bold"), ("время", "bold"),
@@ -246,13 +271,13 @@ def _lesson_table(lessons: list[dict]) -> dict:
     ]]
     for index, lesson in enumerate(lessons, 1):
         subject = lesson.get("subject") or "—"
-        if lesson.get("note"):
+        if _day_note(lesson):
             subject += " *"
         body.append([
             (lesson.get("number") or index, "code"),
             (subject, "accent"),
             (_time_display(lesson), "code"),
-            (lesson.get("room") or "—", "code"),
+            (_lesson_place(lesson), "code"),
             (lesson.get("teacher") or "—", "bold"),
         ])
     return _table(body)
@@ -276,7 +301,11 @@ def _day_blocks(
             blocks.append(_screenshot_block(day["day"], screenshot_media, is_today, source_url))
     else:
         blocks.append(_lesson_table(lessons))
-        notes = [(item.get("subject") or "—", item.get("note") or "") for item in lessons if item.get("note")]
+        notes = [
+            (item.get("subject") or "—", _day_note(item))
+            for item in lessons
+            if _day_note(item)
+        ]
         note_blocks = [_note(subject, note) for subject, note in notes]
         if screenshot_media:
             scr = _screenshot_block(day["day"], screenshot_media, is_today, source_url)
@@ -953,16 +982,21 @@ def _time_legend() -> dict:
     Один раз на пост объясняет сетку 45 + 15 + 45 и вариант «препод ведёт без
     перерыва», чтобы в таблицах не повторять это у каждой пары.
     """
+    # Три короткие строки вместо одного абзаца на пять строк: легенду
+    # читают по диагонали, сплошной текст в конце поста просто пролистывают.
     return _rich_paragraph([
         {"type": "bold", "text": "Время: "},
-        f"{bells.PAIR_STRUCTURE} — пара ", {"type": "code", "text": "09:00–10:45"},
+        f"пара — это {bells.PAIR_STRUCTURE}, то есть ",
+        {"type": "code", "text": "09:00–10:45"},
         ". Если препод ведёт без перерыва, конец на 15 минут раньше: ",
-        {"type": "code", "text": "09:00–10:30"},
-        ". Между парами перерыв полчаса, поэтому следующая начинается в ",
-        {"type": "code", "text": "11:00"},
-        ". На портале в колонке «время» стоят начала академических часов, "
-        "поэтому ", {"type": "code", "text": "14:00 15:00 16:00 17:00"},
-        " — это две пары: ", {"type": "code", "text": "14:00–15:45"}, " и ",
+        {"type": "code", "text": "09:00–10:30"}, ".",
+        "\n",
+        "Между парами перерыв полчаса, поэтому следующая начинается в ",
+        {"type": "code", "text": "11:00"}, ".",
+        "\n",
+        "На портале в колонке «время» стоят начала академических часов: ",
+        {"type": "code", "text": "14:00 15:00 16:00 17:00"},
+        " — это две пары, ", {"type": "code", "text": "14:00–15:45"}, " и ",
         {"type": "code", "text": "16:00–17:45"}, ".",
     ])
 
@@ -976,6 +1010,7 @@ def build_dashboard_rich_message(
     group_name: str = "6381",
     screenshot_media: str | list[str] | list[dict] | None = None,
     current_date: dt.date | None = None,
+    now: dt.datetime | None = None,
     last_updated: str = "",
 ) -> dict:
     """Build pinned dashboard: diary + current week, date-aware."""
@@ -997,15 +1032,25 @@ def build_dashboard_rich_message(
         if last_updated:
             title += f"\n\nПоследние изменения: {last_updated}"
 
-    current_date = current_date or dt.date.today()
+    # Сервер живёт в UTC, поэтому «сегодня» берём именно по Москве: иначе
+    # между 00:00 и 03:00 Мск вчерашний день оставался бы в посте. В варианте
+    # «день исчезает после последней пары» нужен и момент, а не только дата;
+    # когда тест передаёт лишь дату, граница по умолчанию остаётся 00:00 Мск.
+    if now is not None:
+        now_msk = now.astimezone(zoneinfo.ZoneInfo("Europe/Moscow")) if now.tzinfo else now
+    elif current_date is not None:
+        now_msk = dt.datetime.combine(current_date, dt.time(0, 0))
+    else:
+        now_msk = dt.datetime.now(zoneinfo.ZoneInfo("Europe/Moscow"))
+    current_date = current_date or now_msk.date()
 
     blocks: list[dict] = [_pullquote(title), _time_legend()]
 
     if target_week:
         week = week_view(schedule, weeks, target_week, group=group_name, source_url=source_url)
         day_media: dict[str, str] = {}
+        current_day = None if current_date.weekday() == 6 else DAYS_ORDER[current_date.weekday()]
         if screenshot_media:
-            current_day = None if current_date.weekday() == 6 else DAYS_ORDER[current_date.weekday()]
             if isinstance(screenshot_media, str):
                 media_items = [{"label": "с сайта", "media": screenshot_media}]
             else:
@@ -1014,8 +1059,11 @@ def build_dashboard_rich_message(
                 label = str(item.get("label") or "с сайта")
                 day_label = DAY_SHORT_TO_FULL.get(label, label)
                 day_media[day_label] = item["media"]
-        else:
-            current_day = None
+        # Прошедшие дни из закрепа исчезают, а сегодняшний доживает до конца
+        # своей последней пары: в пятницу после пар читатель видит только сб.
+        lesson_days = [day for day in week["days"] if day["lessons"]]
+        live_days = [day for day in lesson_days if day_is_live(day, now_msk)]
+        dropped_past = len(live_days) < len(lesson_days)
         week_blocks = [
             _day_blocks(
                 day,
@@ -1024,12 +1072,17 @@ def build_dashboard_rich_message(
                 is_today=(day["day"] == current_day),
                 source_url=source_url,
             )
-            for day in week["days"]
-            if day["lessons"]
+            for day in live_days
         ]
         if not week_blocks:
-            week_blocks = [_paragraph("На эту учебную неделю пары не найдены.")]
-        blocks.append(_details(_week_summary(), *week_blocks))
+            week_blocks = [
+                _paragraph(
+                    "Пары этой учебной недели уже прошли — впереди следующая."
+                    if dropped_past
+                    else "На эту учебную неделю пары не найдены."
+                )
+            ]
+        blocks.append(_details(_week_summary(dropped_past), *week_blocks))
         blocks.append(_divider())
 
     return {"rich_message": {"blocks": blocks}}
@@ -1672,15 +1725,107 @@ def _day_change_row(kind: str, item: dict) -> list[tuple[object, str]]:
     ]
 
 
+#: Так портал печатает пустую аудиторию: прочерк, точка, дефис.
+_EMPTY_ROOM = {"", "—", "–", "-", ".", "нет", "не указано"}
+
+#: «с использованием ДОТ» — не примечание, а формат: пост и так пишет «дистанционно».
+_DOT_RE = re.compile(r"\s*[;,]?\s*с\s+использованием\s+дот\b\.?", re.I)
+
+#: Портал сокращает язык в примечании, и «немец. яз» без контекста пары
+#: читается как шум. Раскрываем только эти сокращения, остальное не трогаем.
+_LANGUAGE_ABBREV = {
+    "англ": "английский язык",
+    "нем": "немецкий язык",
+    "кит": "китайский язык",
+    "исп": "испанский язык",
+    "фр": "французский язык",
+    "итал": "итальянский язык",
+    "япон": "японский язык",
+    "кор": "корейский язык",
+}
+#: Портал сокращает по-разному: «нем. яз» и «немец. яз» — одно и то же.
+_LANGUAGE_RE = re.compile(
+    r"\b(англ|нем(?:ец)?|кит|исп|фр(?:анц)?|итал|япон|кор)\.\s*яз\.?", re.I
+)
+
+
+def _expand_language(match: "re.Match[str]") -> str:
+    stem = match.group(1).lower()
+    if stem.startswith("нем"):
+        stem = "нем"
+    elif stem.startswith("фр"):
+        stem = "фр"
+    return _LANGUAGE_ABBREV[stem]
+
+
 def _where(item: dict) -> str:
-    """Место пары одной строкой: аудитория и место проведения."""
-    room = str(item.get("room") or "").strip()
+    """Место пары одной строкой: аудитория и место проведения.
+
+    Пустую аудиторию портал печатает прочерком, и «ауд. —» в посте читалось
+    как опечатка. У дистанционной пары место — это сам формат, поэтому вместо
+    прочерка пишем «дистанционно».
+    """
+    room = str(item.get("room") or "").strip().strip(".").strip()
     location = str(item.get("location") or "").strip()
-    if room and location and location.casefold() not in room.casefold():
-        return f"ауд. {room}, {location}"
-    if room:
-        return f"ауд. {room}"
-    return location or "место не указано"
+    parts: list[str] = []
+    if room.casefold() not in _EMPTY_ROOM:
+        parts.append(f"ауд. {room}")
+    if location and location.casefold() not in " ".join(parts).casefold():
+        parts.append(location)
+    if parts:
+        return ", ".join(parts)
+    mode = str(item.get("delivery_mode") or "").strip().casefold()
+    if mode.startswith("remote") or _DOT_RE.search(str(item.get("note") or "")):
+        return "дистанционно"
+    return "место не указано"
+
+
+def _subject_first(item: dict) -> str:
+    """Название пары без хвоста-примечания (первая строка поля subject)."""
+    return str(item.get("subject") or "—").split("\n", 1)[0].strip()
+
+
+def _note_brief(item: dict) -> str:
+    """Примечание пары без повторов: место и формат пост уже назвал отдельно."""
+    note = _strip_parity(str(item.get("note") or ""))
+    note = _DOT_RE.sub(" ", note)
+    note = _LANGUAGE_RE.sub(_expand_language, note)
+    location = str(item.get("location") or "").strip()
+    if location:
+        note = re.sub(rf"[;,]?\s*{re.escape(location)}\b", " ", note, flags=re.I)
+    return re.sub(r"\s{2,}", " ", note).strip(" ,;.")
+
+
+def _variants_of(item: dict) -> list[dict]:
+    """Записи недели, которые схлопнулись в одну карточку (верх и низ)."""
+    variants = [v for v in (item.get("_variants") or []) if isinstance(v, dict)]
+    return variants or [item]
+
+
+def _parities_of(item: dict) -> list[str]:
+    return [str(p) for p in (item.get("_parities") or [])]
+
+
+def _covers_both_weeks(item: dict) -> bool:
+    """Правка приехала сразу в верхней и нижней неделе — пишем «обе недели»."""
+    return {"upper", "lower"} <= set(_parities_of(item))
+
+
+def _change_verb(kind: str, item: dict) -> str:
+    """Глагол правки.
+
+    «Изменили» на переименовании пары читалось невнятно: меняется ровно
+    название, остальное на месте. Глагол берём из набора полей.
+    """
+    if kind == "changed":
+        labels = {
+            str(field[0])
+            for field in (item.get("fields") or [])
+            if isinstance(field, (list, tuple)) and len(field) == 3
+        }
+        if labels == {"предмет"}:
+            return "Переименовали"
+    return _KIND_TITLE.get(kind, "Правка")
 
 
 def _change_lines(kind: str, item: dict, partner: dict | None = None) -> list[str]:
@@ -1699,41 +1844,46 @@ def _change_lines(kind: str, item: dict, partner: dict | None = None) -> list[st
             lines.append(f"примечание: {old_note or '—'} → {new_note or '—'}")
         return lines
     if kind == "changed":
+        labels: set[str] = set()
         for field in item.get("fields") or []:
             if not isinstance(field, (list, tuple)) or len(field) != 3:
                 continue
             label, old, new = field
-            lines.append(f"{label}: {old or '—'} → {new or '—'}")
-        return lines or ["изменение без деталей"]
+            labels.add(str(label))
+            if str(label) == "предмет":
+                # Новое название уже стоит в заголовке карточки — показываем,
+                # чем пара была раньше, и не печатаем его второй раз.
+                lines.append(f"было: {old or '—'}")
+            else:
+                lines.append(f"{label}: {old or '—'} → {new or '—'}")
+        if not lines:
+            return ["изменение без деталей"]
+        if not labels & {"ауд.", "место", "формат"}:
+            lines.append(_place_line(item))
+        note_line = _note_line(item)
+        if note_line and not labels & {"примечание"}:
+            lines.append(note_line)
+        teacher = str(item.get("teacher") or "").strip()
+        if teacher and "преподаватель" not in labels:
+            lines.append(f"кто ведёт: {teacher}")
+        return lines
     if kind == "added":
         lines.append(f"когда: {bells.slot(item.get('time')).label()}")
-        lines.append(f"где: {_where(item)}")
+        lines.append(_place_line(item))
         teacher = str(item.get("teacher") or "").strip()
         if teacher:
             lines.append(f"кто ведёт: {teacher}")
-        note = str(item.get("note") or "").strip()
-        if note:
-            lines.append(f"примечание: {note}")
+        note_line = _note_line(item)
+        if note_line:
+            lines.append(note_line)
         return lines
     lines.append(f"когда было: {bells.slot(item.get('time')).label()}")
-    lines.append(f"где было: {_where(item)}")
+    lines.append(_place_line(item, "где было"))
+    teacher = str(item.get("teacher") or "").strip()
+    if teacher:
+        lines.append(f"кто вёл: {teacher}")
     lines.append("этой пары в новом расписании нет")
     return lines
-
-
-def _change_card(number: int, kind: str, item: dict, partner: dict | None = None) -> dict:
-    """Одна правка как карточка: «1. Перенесли ...» и строки «было → стало».
-
-    Знаки ``+ − ~`` заставляли читателя держать легенду в голове, поэтому
-    заголовок пишем глаголом, а детали — отдельными строками под ним.
-    """
-    subject = str(item.get("subject") or "—").split("\n", 1)[0]
-    title = f"{number}. {_KIND_TITLE.get(kind, 'Правка')}: {_truncate_rich_text(subject, 200)}"
-    parts: list[object] = [{"type": "bold", "text": title}]
-    for line in _change_lines(kind, item, partner):
-        parts.append("\n")
-        parts.append({"type": "marked", "text": _truncate_rich_text(line, 220)})
-    return _rich_paragraph(parts)
 
 
 def _changed_note(item: dict, *, with_day: bool = True) -> dict:
@@ -1762,6 +1912,29 @@ def _changed_note(item: dict, *, with_day: bool = True) -> dict:
     return _note(header, "\n".join(field_lines) or "изменение")
 
 
+#: Какие цвета подсветки что значат: подпись скрина обещает только реально помеченное.
+_MARK_COLOR = {"added": "зелёным новые пары", "changed": "оранжевым правки"}
+
+
+def _marks_caption(media: dict) -> str:
+    """Часть подписи скрина про подсветку.
+
+    Раньше подпись всегда перечисляла оба цвета, и на посте с одним
+    переименованием читатель искал зелёные «новые пары», которых там нет.
+    Если портал отдал скрин без информации о типах правок, оставляем общую
+    формулировку — она честная, просто менее точная.
+    """
+    if not int(media.get("marked") or 0):
+        return ""
+    known = [_MARK_COLOR[str(kind)] for kind in (media.get("kinds") or []) if str(kind) in _MARK_COLOR]
+    if known:
+        return " · " + ", ".join(known)
+    if media.get("highlighted") is False:
+        # Чистый скрин дня из общего кеша: красок на нём нет, обещать их — врать.
+        return ""
+    return " · зелёным новые пары, оранжевым правки"
+
+
 def _has_screen_marks(screenshot_media: list[dict] | None) -> bool:
     """Есть ли хоть один скрин с машинной подсветкой правок.
 
@@ -1769,7 +1942,7 @@ def _has_screen_marks(screenshot_media: list[dict] | None) -> bool:
     отрендерилась: при падении chromium монитор присылает чистые скрины.
     """
     return any(
-        int(item.get("marked") or 0) > 0
+        int(item.get("marked") or 0) > 0 and item.get("highlighted") is not False
         for item in (screenshot_media or [])
         if isinstance(item, dict)
     )
@@ -1830,30 +2003,51 @@ def _blockquote(title: list[object] | str, body: list[dict], *,
     }
 
 
+def _styled_line(line: str) -> list[object]:
+    """Строка правки с акцентами: подпись жирным, новое значение жирным.
+
+    Раньше вся строка подсвечивалась «marked»: когда подсвечено всё, не
+    подсвечено ничего, и глаз не находил, что именно поменялось.
+    """
+    label, sep, rest = line.partition(": ")
+    if not sep:
+        return [_truncate_rich_text(line, 220)]
+    parts: list[object] = [{"type": "bold", "text": f"{_truncate_rich_text(label, 60)}:"}, " "]
+    old_value, arrow, new_value = rest.partition(" → ")
+    if arrow:
+        parts += [_truncate_rich_text(old_value, 180), " → ",
+                  {"type": "bold", "text": _truncate_rich_text(new_value, 180)}]
+    else:
+        parts.append(_truncate_rich_text(rest, 220))
+    return parts
+
+
 def _change_quote(number: int, kind: str, item: dict, partner: dict | None = None) -> dict:
     """Правка как цитата: заголовок глаголом, под ним «было → стало».
 
     Цитата отделяет каждую правку от соседних визуально, поэтому нумерованный
     заголовок читается как подпись, а не как продолжение прошлого абзаца.
     """
-    subject = str(item.get("subject") or "—").split("\n", 1)[0]
+    subject = _subject_first(item)
     when = bells.slot((partner or item).get("time")).label()
+    # Один жирный фрагмент на заголовок: два соседних bold-рана на рендере
+    # превращались в «****» между подписью и названием пары.
     title: list[object] = [
-        {"type": "bold", "text": f"{number}. {_KIND_TITLE.get(kind, 'Правка')}: "},
-        {"type": "bold", "text": _truncate_rich_text(subject, 200)},
+        {"type": "bold",
+         "text": f"{number}. {_change_verb(kind, item)}: {_truncate_rich_text(subject, 200)}"},
     ]
     if when:
         title += ["  ", {"type": "code", "text": _truncate_rich_text(when, 48)}]
+    if _covers_both_weeks(item):
+        title += ["  ", {"type": "italic", "text": "обе недели"}]
     body: list[dict] = []
     for line in _change_lines(kind, item, partner):
         # Время уже стоит в заголовке цитаты — не повторяем его строкой ниже.
         if when and line in (f"когда: {when}", f"когда было: {when}"):
             continue
-        body.append(_rich_paragraph([
-            {"type": "marked", "text": _truncate_rich_text(line, 220)},
-        ]))
+        body.append(_rich_paragraph(_styled_line(line)))
     if not body:
-        body.append(_rich_paragraph([{"type": "marked", "text": "детали не указаны"}]))
+        body.append(_rich_paragraph([{"type": "italic", "text": "детали не указаны"}]))
     return _blockquote(title, body)
 
 
@@ -1871,11 +2065,13 @@ def _overview_block(by_day: dict[str, list[tuple[str, dict, dict | None]]]) -> d
     items: list[list[object]] = []
     for day in sorted(by_day, key=lambda name: order.get(name, len(order))):
         entries = by_day[day]
-        kinds = [_KIND_TITLE.get(kind, "правка").lower() for kind, _, _ in entries]
+        # Глаголы берём те же, что в карточках ниже: «изменили» в сводке и
+        # «переименовали» в карточке читались как две разные правки.
         seen: list[str] = []
-        for kind in kinds:
-            if kind not in seen:
-                seen.append(kind)
+        for kind, item, _partner in entries:
+            verb = _change_verb(kind, item).lower()
+            if verb not in seen:
+                seen.append(verb)
         items.append([
             {"type": "bold", "text": day},
             f" — {len(entries)} {_changes_word(len(entries))}: " + ", ".join(seen),
@@ -1883,35 +2079,137 @@ def _overview_block(by_day: dict[str, list[tuple[str, dict, dict | None]]]) -> d
     return _rich_list(items, ordered=False)
 
 
-def _explainer_block(counts: dict[str, int], marked: bool) -> dict:
+def _screen_kinds(screenshot_media: list[dict] | None) -> set[str]:
+    """Какие типы правок реально подсвечены на скринах поста."""
+    kinds: set[str] = set()
+    for media in screenshot_media or []:
+        if not isinstance(media, dict) or media.get("highlighted") is False:
+            continue
+        if int(media.get("marked") or 0) <= 0:
+            continue
+        kinds |= {str(kind) for kind in (media.get("kinds") or []) if str(kind) in _MARK_COLOR}
+    return kinds
+
+
+def _explainer_block(counts: dict[str, int], marked: bool, kinds: set[str] | None = None) -> dict:
     """Пояснения один раз внизу, а не в каждом дне.
 
     Раньше про переносы и про цвета скрина писалось в каждом дне — это давало
-    шаблонные абзацы, из-за которых пост читался как полотно.
+    шаблонные абзацы, из-за которых пост читался как полотно. Про цвета пишем
+    только то, что на скрине есть: обещание зелёного на посте без новых пар
+    уводило читателя искать несуществующие строки.
     """
     body: list[dict] = []
     if counts.get("moved"):
         body.append(_rich_paragraph([
-            {"type": "bold", "text": "Почему «перенесли», а не «убрали и добавили». "},
-            "Портал не пишет «перенос»: он убирает пару со старого времени и ставит "
+            {"type": "bold", "text": "Почему «перенесли», а не «убрали и добавили»."},
+            " Портал не пишет «перенос»: он убирает пару со старого времени и ставит "
             "на новое. Мы склеиваем это в одну правку, поэтому счётчик сверху "
             "совпадает с номерами правок.",
         ]))
     if counts.get("removed"):
         body.append(_rich_paragraph([
-            {"type": "bold", "text": "Убранные пары. "},
-            "Их не подсвечиваем на скрине — там их уже просто нет. Смотри строку "
+            {"type": "bold", "text": "Убранные пары."},
+            " Их не подсвечиваем на скрине — там их уже просто нет. Смотри строку "
             "«Убрано» в нужном дне.",
         ]))
     if marked:
+        known = kinds or set()
+        if known == {"added"}:
+            colors = "Зелёным помечены новые пары."
+        elif known == {"changed"}:
+            colors = "Оранжевым помечены поправленные пары."
+        else:
+            colors = "Зелёным помечены новые пары, оранжевым — поправленные."
         body.append(_rich_paragraph([
-            {"type": "bold", "text": "Цвета на скрине. "},
-            "Зелёным помечены новые пары, оранжевым — поправленные. "
-            "Рядом с полосой стоит подпись словами, чтобы цвет не приходилось угадывать.",
+            {"type": "bold", "text": "Цвета на скрине."},
+            f" {colors} Рядом с полосой стоит подпись словами, чтобы цвет не приходилось угадывать.",
         ]))
     if not body:
         return _paragraph("")
-    return _blockquote("Как читать этот пост", body, expandable=True)
+    return _blockquote("Как это читать", body, expandable=True)
+
+
+def _variant_signature(kind: str, item: dict, partner: dict | None) -> tuple:
+    """Подпись правки без указания верхней/нижней недели.
+
+    Портал хранит пару двумя строками — верх и низ, — и правка приезжает сразу
+    в обеих. Без склейки пост печатает две одинаковые карточки вместо одной
+    правки «на обеих неделях».
+    """
+    fields = tuple(
+        (str(field[0]), _strip_parity(str(field[1])), _strip_parity(str(field[2])))
+        for field in (item.get("fields") or [])
+        if isinstance(field, (list, tuple)) and len(field) == 3
+    )
+    return (
+        kind,
+        bells.slot(item.get("time")).start,
+        _strip_parity(_subject_first(item)),
+        str(item.get("subgroup") or "").strip().casefold(),
+        str(item.get("teacher") or "").strip().casefold(),
+        _strip_parity(_subject_first(partner)) if partner else "",
+        fields,
+    )
+
+
+def _merge_week_variants(
+    entries: list[tuple[str, dict, dict | None]],
+) -> list[tuple[str, dict, dict | None]]:
+    """Свести верх и низ одной недели в одну карточку.
+
+    Варианты уезжают в ``_variants`` первой записи, поэтому пост показывает
+    правку один раз, а место и формат каждой недели печатает строкой ниже.
+    Записи с одинаковой подписью, но одной и той же неделей не склеиваем:
+    это не верх/низ одной пары, а две отдельные строки портала.
+    """
+    merged: list[tuple[str, dict, dict | None]] = []
+    positions: dict[tuple, list[int]] = {}
+    for kind, item, partner in entries:
+        signature = _variant_signature(kind, item, partner)
+        parity = _parity_of(str(item.get("note") or ""))
+        candidates = positions.setdefault(signature, [])
+        target = next(
+            (index for index in candidates if parity not in _parities_of(merged[index][1])),
+            None,
+        )
+        if target is None:
+            candidates.append(len(merged))
+            merged.append((kind, {**item, "_variants": [item], "_parities": [parity]}, partner))
+            continue
+        first_kind, first_item, first_partner = merged[target]
+        merged[target] = (
+            first_kind,
+            {
+                **first_item,
+                "_variants": [*_variants_of(first_item), item],
+                "_parities": [*_parities_of(first_item), parity],
+            },
+            first_partner,
+        )
+    return merged
+
+
+def _place_line(item: dict, prefix: str = "где") -> str:
+    """Строка «где»: у пары на обеих неделях место своё для каждой."""
+    variants = _variants_of(item)
+    if len(variants) == 1:
+        return f"{prefix}: {_where(item)}"
+    places = [
+        f"{_WEEK_SHORT.get(_parity_of(str(variant.get('note') or '')), 'неделя')} — {_where(variant)}"
+        for variant in variants
+    ]
+    return f"{prefix}: " + " · ".join(places)
+
+
+def _note_line(item: dict) -> str:
+    """Строка «примечание» без повторов места, формата и недели."""
+    notes: list[str] = []
+    for variant in _variants_of(item):
+        brief = _note_brief(variant)
+        if brief and brief not in notes:
+            notes.append(brief)
+    return "примечание: " + " · ".join(notes) if notes else ""
 
 
 def _group_by_day(
@@ -1943,7 +2241,7 @@ def _group_by_day(
             _KIND_ORDER.get(triple[0], 9),
             bells.slot(triple[1].get("time")).start,
         ))
-        by_day[day] = entries
+        by_day[day] = _merge_week_variants(entries)
     return by_day
 
 
@@ -1981,8 +2279,9 @@ def _day_sections(
                 {"type": "bold", "text": f"Новое расписание: {day}"},
                 " · оригинал на ", {"type": "url", "text": "портале", "url": source_url},
             ]
-            if int(media.get("marked") or 0):
-                caption.append(" · зелёным новые пары, оранжевым правки")
+            marks = _marks_caption(media)
+            if marks:
+                caption.append(marks)
             content.append(_photo(str(media.get("media")), caption))
         elif shared:
             content.append(_paragraph(
@@ -2019,15 +2318,12 @@ def build_changes_rich_message(
     changed = list(diff.get("changed") or [])
     transition = diff.get("transition")
     # Считаем правки так же, как их видит читатель: перенос — одна правка,
-    # а не «убрали» + «добавили», иначе шапка спорит с номерами карточек.
-    moves_total = 0
-    for day in {str(item.get("day") or "").strip() for item in (*added, *removed)}:
-        day_moves, _, _ = _pair_moves(
-            [item for item in removed if str(item.get("day") or "").strip() == day],
-            [item for item in added if str(item.get("day") or "").strip() == day],
-        )
-        moves_total += len(day_moves)
-    total = len(added) + len(removed) + len(changed) - moves_total
+    # а не «убрали» + «добавили», и верх с низом одной недели — тоже одна
+    # правка. Иначе шапка спорит с номерами карточек.
+    total = sum(
+        len(entries) for entries in _group_by_day(added, removed, changed).values()
+    )
+    raw_total = len(added) + len(removed) + len(changed)
 
     title_lines = ["Поменяли расписание"]
     if transition == "published":
@@ -2062,25 +2358,26 @@ def build_changes_rich_message(
             blocks.append(_overview_block(by_day))
             blocks.append(_heading("Что именно поменяли", 3))
             blocks.extend(_day_sections(*shown, screenshot_media, source_url))
-            omitted = total - sum(len(part) for part in shown)
+            # Лимиты режут записи портала, а не карточки: считаем в записях.
+            omitted = raw_total - sum(len(part) for part in shown)
             if omitted > 0:
                 blocks.append(_paragraph(
                     f"Показаны не все правки: ещё {omitted} не поместились в лимит сообщения."
                 ))
             explainer = _explainer_block(
-                _kind_counts(by_day), _has_screen_marks(screenshot_media)
+                _kind_counts(by_day),
+                _has_screen_marks(screenshot_media),
+                _screen_kinds(screenshot_media),
             )
             if explainer.get("blocks"):
-                blocks.append(_heading("Как это читать", 3))
+                # Заголовок уже находится внутри expandable_blockquote
+                # («Как читать этот пост»); внешний дубликат не добавляем.
                 blocks.append(explainer)
         if not (added or removed or changed or transition):
             blocks.append(_paragraph("Содержимое страницы изменилось, но состав пар прежний."))
         blocks.append(_divider())
         blocks.append(_time_legend())
-        blocks.append(_rich_paragraph([
-            {"type": "bold", "text": "Источник: "},
-            {"type": "url", "text": "портал НовГУ", "url": source_url},
-        ]))
+
         return {"rich_message": {"blocks": blocks}}
 
     payload = assemble()
@@ -2257,10 +2554,6 @@ def build_changes_html(
 
     if not (added or removed or changed or transition):
         parts.append("Содержимое страницы изменилось, но состав пар прежний.")
-
-    # --- Source ---
-    escaped_url = _html.escape(str(source_url), quote=True)
-    parts.append(f"—\n<b>Источник:</b> <a href=\"{escaped_url}\">портал НовГУ</a>")
 
     text = "\n\n".join(parts)
     if len(text) > 4096:

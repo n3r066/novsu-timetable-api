@@ -33,7 +33,7 @@ def test_random_ua_is_full_browser_ua():
         assert "Chrome/" in ua or "Edg/" in ua
 
 
-def test_fetch_html_pins_one_ua_across_retries(monkeypatch):
+def test_fetch_html_falls_back_to_desktop_ua_after_failure(monkeypatch):
     monkeypatch.setattr(fetch, "RETRY_DELAY_S", 0.0)
     used: list[str] = []
 
@@ -49,7 +49,9 @@ def test_fetch_html_pins_one_ua_across_retries(monkeypatch):
     monkeypatch.setattr(fetch.subprocess, "run", fake_run)
     assert fetch.fetch_html("https://example.test") == SCHEDULE_HTML
     assert len(used) == 2
-    assert used[0] == used[1] == config.IPHONE_UA
+    assert used[0] == config.IPHONE_UA
+    assert used[1] != config.IPHONE_UA
+    assert "Chrome/" in used[1] or "Edg/" in used[1]
 
 
 def test_fetch_html_uses_fail_and_iphone_safari_headers(monkeypatch):

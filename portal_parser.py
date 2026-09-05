@@ -488,6 +488,7 @@ def render_schedule_day_chunk_htmls(
     days_per_chunk: int = 1,
     diff_items: list[dict] | None = None,
     diff_legend: str = "",
+    removed_note: bool = True,
 ) -> list[dict]:
     content = source_content_until_print(source_html)
     table = find_schedule_table(content)
@@ -546,20 +547,39 @@ def render_schedule_day_chunk_htmls(
         table_html += table_header
         table_html += "".join("".join(group) for group in rendered)
         table_html += "</table>"
+        # Какие именно правки легли на скрин: подпись в посте обещает только
+        # те цвета, которые реально помечены.
+        kinds: set[str] = set()
+        for group in rendered:
+            joined = "".join(group)
+            if "diff-added" in joined:
+                kinds.add("added")
+            if "diff-changed" in joined:
+                kinds.add("changed")
         legend = ""
         if marked and diff_legend:
-            # Два цвета — два образца: одна общая плашка не объясняла, чем
-            # новая пара отличается от поправленной.
-            legend = (
-                '<div class="diff-legend">'
-                '<div class="row"><span class="swatch added"></span>'
-                "НОВАЯ ПАРА — зелёная строка: этой пары раньше не было.</div>"
-                '<div class="row"><span class="swatch"></span>'
-                "ИЗМЕНИЛИ — оранжевая строка: пара была, поправили поле; "
-                "яркая ячейка внутри — что именно.</div>"
-                '<div class="row">Убранных пар на скрине уже нет — они перечислены в посте.</div>'
-                "</div>"
-            )
+            # Два цвета — два образца, но показываем только те, которые реально
+            # есть на скрине: при одном переименовании зелёный образец уводил
+            # читателя искать несуществующие «новые пары».
+            rows = []
+            if "added" in kinds:
+                rows.append(
+                    '<div class="row"><span class="swatch added"></span>'
+                    "НОВАЯ ПАРА — зелёная строка: этой пары раньше не было.</div>"
+                )
+            if "changed" in kinds:
+                rows.append(
+                    '<div class="row"><span class="swatch"></span>'
+                    "ИЗМЕНИЛИ — оранжевая строка: пара была, поправили поле; "
+                    "яркая ячейка внутри — что именно.</div>"
+                )
+            if removed_note:
+                # Строка про убранные пары нужна, только если их правда убирали:
+                # на посте с одним переименованием она пугала пропажей пары.
+                rows.append(
+                    '<div class="row">Убранных пар на скрине уже нет — они перечислены в посте.</div>'
+                )
+            legend = '<div class="diff-legend">' + "".join(rows) + "</div>"
         suffix = print_html if start + days_per_chunk >= len(day_groups) else ""
         chunks.append({
             "label": " + ".join(labels),
@@ -569,6 +589,7 @@ def render_schedule_day_chunk_htmls(
                 extra_css=DIFF_HIGHLIGHT_CSS if marked else "",
             ),
             "marked": marked,
+            **({"marked_kinds": sorted(kinds)} if kinds else {}),
         })
     return chunks
 

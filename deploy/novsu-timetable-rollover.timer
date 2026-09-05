@@ -1,0 +1,14 @@
+[Unit]
+Description=Roll the pinned NovSU timetable post over at 00:00 Europe/Moscow
+
+[Timer]
+# Ровно в полночь по Москве: день сменился — вчерашние дни недели исчезают из
+# закреплённого поста. Сервер живёт в UTC, поэтому часовой пояс указан явно.
+OnCalendar=*-*-* 00:00:00 Europe/Moscow
+Unit=novsu-timetable-rollover.service
+# Если машина спала/стояла в момент срабатывания — догоняем при загрузке.
+Persistent=true
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target

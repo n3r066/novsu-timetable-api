@@ -3,10 +3,42 @@ from __future__ import annotations
 
 import json
 import mimetypes
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Any
+
+
+def _call_with_retries(request: urllib.request.Request, *, timeout: int, attempts: int = 3) -> dict[str, Any]:
+    """Повторить временную сетевую ошибку и уважить Telegram retry_after."""
+    last: dict[str, Any] = {"ok": False, "error": "request failed"}
+    for attempt in range(1, max(1, attempts) + 1):
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                return json.loads(response.read())
+        except urllib.error.HTTPError as exc:
+            raw = exc.read().decode(errors="replace")[:1000]
+            try:
+                body = json.loads(raw)
+            except json.JSONDecodeError:
+                body = {}
+            last = {"ok": False, "error_code": exc.code, "description": raw}
+            retry_after = body.get("parameters", {}).get("retry_after") if isinstance(body, dict) else None
+            if exc.code == 429 and retry_after is not None and attempt < attempts:
+                time.sleep(min(float(retry_after), 60.0))
+                continue
+            if exc.code >= 500 and attempt < attempts:
+                time.sleep(min(2 ** (attempt - 1), 8))
+                continue
+            return last
+        except Exception as exc:  # noqa: BLE001
+            last = {"ok": False, "error": str(exc)}
+            if attempt < attempts:
+                time.sleep(min(2 ** (attempt - 1), 8))
+                continue
+            return last
+    return last
 
 
 def call(token: str, method: str, payload: dict[str, Any], *, timeout: int = 30) -> dict[str, Any]:
@@ -17,17 +49,7 @@ def call(token: str, method: str, payload: dict[str, Any], *, timeout: int = 30)
         headers={"Content-Type": "application/json"},
         method="POST",
     )
-    try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            return json.loads(response.read())
-    except urllib.error.HTTPError as exc:
-        return {
-            "ok": False,
-            "error_code": exc.code,
-            "description": exc.read().decode(errors="replace")[:1000],
-        }
-    except Exception as exc:  # noqa: BLE001
-        return {"ok": False, "error": str(exc)}
+    return _call_with_retries(request, timeout=timeout)
 
 
 def call_multipart(
@@ -64,13 +86,7 @@ def call_multipart(
         headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
         method="POST",
     )
-    try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            return json.loads(response.read())
-    except urllib.error.HTTPError as exc:
-        return {"ok": False, "error_code": exc.code, "description": exc.read().decode(errors="replace")[:1000]}
-    except Exception as exc:  # noqa: BLE001
-        return {"ok": False, "error": str(exc)}
+    return _call_with_retries(request, timeout=timeout)
 
 
 

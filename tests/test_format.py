@@ -19,6 +19,27 @@ def _load():
     return parse_all(html)
 
 
+def _plain(node) -> str:
+    """Текст rich-блока без разметки.
+
+    Акценты рвут строку на несколько ранов («время:» жирным, значение обычным),
+    поэтому по json-дампу фразу «время: 11:00–12:45 → 17:00–18:45» не найти —
+    проверяем смысл по склеенному тексту.
+    """
+    if isinstance(node, str):
+        return node
+    if isinstance(node, list):
+        return "".join(_plain(part) for part in node)
+    if isinstance(node, dict):
+        # Только текстовые ключи: «type» и «url» в читаемый текст не входят.
+        return "".join(
+            _plain(node[key])
+            for key in ("rich_message", "text", "summary", "caption", "blocks", "items")
+            if node.get(key) is not None
+        )
+    return ""
+
+
 def test_build_rich_message_groups_lessons_by_parity():
     import json
     data = _load()
@@ -122,7 +143,7 @@ def test_changes_rich_message_structure():
     overview_blob = json.dumps(overview, ensure_ascii=False)
     assert "Вторник" in overview_blob and "1 изменение" in overview_blob
     assert "(лек.) Новый" in blob
-    assert "203 → 415" in blob
+    assert "203 → 415" in _plain(rm)
     day_blocks = {
         block["summary"]: block.get("blocks") or []
         for block in blocks if block.get("type") == "details"
@@ -130,7 +151,7 @@ def test_changes_rich_message_structure():
     wednesday = day_blocks["Среда — 1 изменение"]
     # каждая правка — своя цитата, чтобы отделяться от соседних
     assert wednesday[0]["type"] == "blockquote"
-    first_card = json.dumps(wednesday[0], ensure_ascii=False)
+    first_card = _plain(wednesday[0])
     assert "1. Изменили" in first_card
     assert "203 → 415" in first_card
     # дублирующая сводная таблица дня убрана: правка уже видна в цитате
@@ -141,7 +162,7 @@ def test_changes_rich_message_structure():
     removed_note = [json.dumps(inner, ensure_ascii=False) for inner in thursday]
     assert any("1. Убрали" in note for note in removed_note)
     assert any("Убрано: 1 пара" in note and "на скрине ниже её уже нет" in note for note in removed_note)
-    assert "портал НовГУ" in blob
+    assert "портал НовГУ" not in blob
     # знаки +/−/~ больше не нужны: правки подписаны глаголами
     assert "Сводка дня" not in blob
 
@@ -386,6 +407,7 @@ def test_dashboard_week_before_diary():
     weeks = [{"week": 1, "half": "top", "start": "01.09.2026", "end": "05.09.2026"}]
     rm = build_dashboard_rich_message(
         data["schedule"], weeks, "https://example.test", dt.date(2026, 9, 2),
+        current_date=dt.date(2026, 8, 31),
     )
     blocks = rm["rich_message"]["blocks"]
     # block 0 = pullquote (title), block 1 = легенда времени, дальше разделы
@@ -461,6 +483,7 @@ def test_dashboard_keeps_odd_hour_visible():
     )
     rm = build_dashboard_rich_message(
         data["schedule"], WEEK_1, "https://example.test", dt.date(2026, 8, 31),
+        current_date=dt.date(2026, 8, 31),
     )
     blob = json.dumps(rm, ensure_ascii=False)
     assert "16:00–17:45" in blob
@@ -723,7 +746,7 @@ def test_moved_pair_is_one_card_not_two_rows():
     day = next(b for b in blocks if b.get("type") == "details")
     # обе записи склеены в один перенос, поэтому и заголовок про одно изменение
     assert day["summary"] == "Четверг — 1 изменение"
-    card = json.dumps(day["blocks"][0], ensure_ascii=False)
+    card = _plain(day["blocks"][0])
     assert "1. Перенесли" in card
     assert "(пр.) География туризма" in card
     assert "время: 11:00–12:45 → 17:00–18:45" in card
@@ -752,3 +775,210 @@ def test_real_removal_stays_removal():
     assert "(лек.) Экономика" in blob
     assert "этой пары в новом расписании нет" in blob
     assert "Перенесли" not in blob
+
+
+def test_rename_on_both_weeks_is_one_card():
+    """Переименование пришло в верх и низ недели — одна карточка, а не две."""
+    base = {
+        "day": "Понедельник", "time": "09:00 10:00", "subgroup": "",
+        "teacher": "Барышева Ангелина Алексеевна",
+        "fields": [["предмет",
+                    "(пр.) Иностранные языки в сфере профессиональной коммуникации",
+                    "(пр.) Иностранный язык"]],
+    }
+    diff = {
+        "added": [], "removed": [], "transition": None,
+        "changed": [
+            {**base,
+             "subject": "(пр.) Иностранный язык\nнемец. яз. по верхней неделе, Антоново",
+             "note": "немец. яз. по верхней неделе, Антоново",
+             "room": "1318", "location": "Антоново", "delivery_mode": "in_person"},
+            {**base,
+             "subject": "(пр.) Иностранный язык\nнемец. яз. по нижней неделе с использованием ДОТ",
+             "note": "немец. яз. по нижней неделе с использованием ДОТ",
+             "room": "—", "location": None, "delivery_mode": "remote_or_hybrid"},
+        ],
+    }
+    rm = build_changes_rich_message(diff, [], "https://example.test",
+                                    now=dt.datetime(2026, 9, 4, 11, 33))
+    blocks = rm["rich_message"]["blocks"]
+    day = next(b for b in blocks if b.get("type") == "details")
+    assert day["summary"] == "Понедельник — 1 изменение"
+    cards = [b for b in day["blocks"] if b.get("type") == "blockquote"]
+    assert len(cards) == 1
+    card = _plain(cards[0])
+    # глагол по смыслу правки: название сменилось, остальное на месте
+    assert "1. Переименовали: (пр.) Иностранный язык" in card
+    assert "обе недели" in card
+    assert "было: (пр.) Иностранные языки в сфере профессиональной коммуникации" in card
+    assert "верхняя неделя — ауд. 1318, Антоново" in card
+    # пустая аудитория портала — прочерк, поэтому место названо форматом
+    assert "нижняя неделя — дистанционно" in card
+    assert "немецкий язык" in card
+    assert "немец. яз" not in card
+    assert "кто ведёт: Барышева Ангелина Алексеевна" in card
+    # шапка и «Коротко» считают одну правку, а не четыре записи портала
+    assert "1 изменение" in _plain(blocks[0])
+    overview = _plain(next(b for b in blocks if b.get("type") == "list"))
+    assert "переименовали" in overview
+    assert "изменили" not in overview
+
+
+def test_changes_post_names_only_the_colors_actually_marked():
+    """Подпись и пояснение обещают только те цвета, что легли на скрин."""
+    diff = {
+        "added": [], "removed": [], "transition": None,
+        "changed": [{"day": "Понедельник", "time": "09:00 10:00", "subject": "(пр.) Иностранный язык",
+                     "room": "1318", "teacher": "Барышева А. А.", "location": "Антоново",
+                     "note": "", "delivery_mode": "in_person",
+                     "fields": [["предмет", "старое", "новое"]]}],
+    }
+    now = dt.datetime(2026, 9, 4, 11, 33)
+    changed_only = json.dumps(build_changes_rich_message(
+        diff, [], "https://example.test", now=now,
+        screenshot_media=[{"label": "Пн", "media": "attach://changes_screenshot_1",
+                           "marked": 2, "kinds": ["changed"]}],
+    ), ensure_ascii=False)
+    assert "оранжевым правки" in changed_only
+    assert "Оранжевым помечены поправленные пары" in changed_only
+    assert "зелёным" not in changed_only and "Зелёным" not in changed_only
+
+    clean = json.dumps(build_changes_rich_message(
+        diff, [], "https://example.test", now=now,
+        screenshot_media=[{"label": "Пн", "media": "attach://changes_screenshot_1",
+                           "marked": 1, "highlighted": False}],
+    ), ensure_ascii=False)
+    # чистый скрин из общего кеша: красок на нём нет, обещать их нельзя
+    assert "зелёным" not in clean and "оранжевым" not in clean
+    assert "attach://changes_screenshot_1" in clean
+
+
+def _week_tail_timetable() -> dict:
+    """Пары на Чт, Пт и Сб учебной недели 01.09—05.09.2026.
+
+    Понедельник 01.09.2026 в HOLIDAYS (День знаний), поэтому для проверки
+    исчезающих прошедших дней берём хвост недели.
+    """
+    html = (
+        "<table>"
+        "<tr><th>дата</th><th>время</th><th>под гр.</th><th>предмет</th>"
+        "<th>преподаватель</th><th>ауд.</th><th>комм.</th></tr>"
+        "<tr><td>Чт</td><td>11:00 12:00</td><td></td><td>(пр.) Философия</td>"
+        "<td>Петров П. П.</td><td>202</td><td></td></tr>"
+        "<tr><td>Пт</td><td>14:00 15:00</td><td></td><td>(лек.) История</td>"
+        "<td>Сидоров С. С.</td><td>303</td><td></td></tr>"
+        "<tr><td>Сб</td><td>9:00 10:00</td><td></td><td>(пр.) Английский</td>"
+        "<td>Кузнецова К. К.</td><td>404</td><td></td></tr>"
+        "</table>"
+    )
+    return parse_all(html)
+
+
+WEEK_TAIL = [{"week": 1, "half": "top", "start": "01.09.2026", "end": "05.09.2026"}]
+
+
+def _dashboard_day_summaries(rm) -> list[str]:
+    def walk(blocks):
+        for block in blocks:
+            yield block
+            if block.get("type") == "details":
+                yield from walk(block.get("blocks") or [])
+
+    return [
+        str(block.get("summary"))
+        for block in walk(rm["rich_message"]["blocks"])
+        if block.get("type") == "details" and isinstance(block.get("summary"), str)
+    ]
+
+
+def test_dashboard_shows_whole_week_before_it_starts():
+    data = _week_tail_timetable()
+    rm = build_dashboard_rich_message(
+        data["schedule"], WEEK_TAIL, "https://example.test", dt.date(2026, 9, 3),
+        current_date=dt.date(2026, 9, 1),
+    )
+    days = _dashboard_day_summaries(rm)
+    assert [item for item in days if "Скрин" not in item] == [
+        "Четверг — 03.09: 1 пара", "Пятница — 04.09: 1 пара", "Суббота — 05.09: 1 пара",
+    ]
+    assert "Полное расписание" in json.dumps(rm, ensure_ascii=False)
+
+
+def test_dashboard_drops_past_days_after_midnight_msk():
+    """В пятницу в закрепе остаются только пт и сб — прошедшие дни уезжают в 00:00 Мск."""
+    data = _week_tail_timetable()
+    rm = build_dashboard_rich_message(
+        data["schedule"], WEEK_TAIL, "https://example.test", dt.date(2026, 9, 4),
+        screenshot_media=[{"label": "Пт", "media": "attach://site_screenshot_1"}],
+        current_date=dt.date(2026, 9, 4),
+    )
+    days = _dashboard_day_summaries(rm)
+    assert [item for item in days if "Скрин" not in item] == [
+        "Пятница — 04.09: 1 пара", "Суббота — 05.09: 1 пара",
+    ]
+    assert "Четверг" not in json.dumps(rm, ensure_ascii=False)
+    blob = json.dumps(rm, ensure_ascii=False)
+    # Подпись раздела не обещает полное расписание, если часть дней уже прошла.
+    assert "Расписание до конца недели" in blob
+    assert "Полное расписание" not in blob
+
+
+def test_dashboard_says_week_is_over_when_every_day_is_past():
+    data = _week_tail_timetable()
+    rm = build_dashboard_rich_message(
+        data["schedule"], WEEK_TAIL, "https://example.test", dt.date(2026, 9, 5),
+        current_date=dt.date(2026, 9, 6),
+    )
+    blob = json.dumps(rm, ensure_ascii=False)
+    assert "уже прошли" in blob
+    assert _dashboard_day_summaries(rm) == []
+
+
+def _timetable_with_dot_and_room() -> dict:
+    """Дистанционная (ДОТ) пара и обычная с аудиторией на Ср/Чт недели 01.09—05.09.2026."""
+    html = (
+        "<table>"
+        "<tr><th>дата</th><th>время</th><th>под гр.</th><th>предмет</th>"
+        "<th>преподаватель</th><th>ауд.</th><th>комм.</th></tr>"
+        "<tr><td>Ср</td><td>19:00 20:00</td><td></td><td>(лек.) История России</td>"
+        "<td>Сидоров С. С.</td><td>—</td><td>с использованием ДОТ</td></tr>"
+        "<tr><td>Чт</td><td>11:00 12:00</td><td></td><td>(пр.) Философия</td>"
+        "<td>Петров П. П.</td><td>202</td><td></td></tr>"
+        "</table>"
+    )
+    return parse_all(html)
+
+
+def test_dashboard_dot_pair_shows_place_and_drops_dot_note():
+    data = _timetable_with_dot_and_room()
+    rm = build_dashboard_rich_message(
+        data["schedule"], WEEK_TAIL, "https://example.test", dt.date(2026, 9, 2),
+        current_date=dt.date(2026, 9, 1),
+    )
+    blob = json.dumps(rm, ensure_ascii=False)
+    # Предмет без [ДОТ], формат передан местом, примечание про ДОТ не дублируется.
+    assert "[ДОТ]" not in blob
+    assert "дистанционно" in blob
+    assert "с использованием ДОТ" not in blob
+    assert "(лек.) История России" in blob
+    assert "(пр.) Философия" in blob
+
+
+def test_dashboard_today_disappears_after_last_pair():
+    """Вариант 2: после конца последней пары сегодняшний день уходит из закрепа."""
+    data = _week_tail_timetable()
+    friday = dt.date(2026, 9, 4)
+    before = build_dashboard_rich_message(
+        data["schedule"], WEEK_TAIL, "https://example.test", friday,
+        current_date=friday, now=dt.datetime(2026, 9, 4, 14, 30),
+    )
+    assert [s for s in _dashboard_day_summaries(before) if "Скрин" not in s] == [
+        "Пятница — 04.09: 1 пара", "Суббота — 05.09: 1 пара",
+    ]
+    after = build_dashboard_rich_message(
+        data["schedule"], WEEK_TAIL, "https://example.test", friday,
+        current_date=friday, now=dt.datetime(2026, 9, 4, 15, 46),
+    )
+    assert [s for s in _dashboard_day_summaries(after) if "Скрин" not in s] == [
+        "Суббота — 05.09: 1 пара",
+    ]

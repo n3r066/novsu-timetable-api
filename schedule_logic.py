@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import datetime as dt
 import re
+import zoneinfo
 from typing import Any
 
 import bells
@@ -106,6 +107,49 @@ def calendar_bounds(weeks: list[dict]) -> tuple[dt.date, dt.date] | None:
         return None
     starts, ends = zip(*valid)
     return min(starts), max(ends)
+
+
+def visible_week_days(
+    weeks: list[dict],
+    target_date: dt.date,
+    current_date: dt.date | None = None,
+    *,
+    schedule: dict | None = None,
+    now: dt.datetime | None = None,
+) -> list[str]:
+    """Дни учебной недели фокуса, которые ещё видны в закрепе.
+
+    Прошедшие дни скрыты. Сегодняшний день держится до конца последней пары,
+    а не до полуночи (вариант 2): когда переданы ``schedule`` и ``now``, после
+    конца последней пары день тоже исчезает. Без этих данных граница — 00:00 Мск.
+    Неделю без дат не фильтруем: лучше показать всё, чем пустой пост.
+    """
+    current_date = current_date or dt.datetime.now(zoneinfo.ZoneInfo("Europe/Moscow")).date()
+    week = find_week(weeks, target_date)
+    bounds = _week_dates(week) if week else None
+    if not bounds:
+        return list(DAYS_ORDER)
+    start = bounds[0]
+    live: list[str] = []
+    for index in range(7):
+        day_date = start + dt.timedelta(days=index)
+        if day_date > bounds[1]:
+            break
+        # Неделя не обязана начинаться в понедельник (01.09.2026 — вторник),
+        # поэтому имя дня берём из реальной даты, а не из номера смещения.
+        if day_date > current_date:
+            live.append(DAY_BY_INDEX[day_date.weekday()])
+            continue
+        if day_date < current_date:
+            continue
+        # Сегодня: вариант 2 — после конца последней пары день тоже уезжает.
+        if schedule is not None and now is not None:
+            _, lessons = lessons_for_date(schedule, weeks, day_date)
+            end = day_last_pair_end(lessons)
+            if end is not None and now.time() >= end:
+                continue
+        live.append(DAY_BY_INDEX[day_date.weekday()])
+    return live
 
 
 def _parse_note_date(
@@ -363,6 +407,42 @@ def lesson_pairs(lesson: dict) -> list[tuple[dt.time, dict]]:
     return [(pair.start, {**lesson, **time_labels(pair)}) for pair in pairs]
 
 
+def day_last_pair_end(lessons: list[dict]) -> dt.time | None:
+    """Конец последней пары дня по сетке портала.
+
+    Ячейка «14:00 15:00 16:00 17:00» — две пары, последняя кончается в 17:45.
+    По этому моменту день уезжает из закрепа, а не в полночь.
+    """
+    ends: list[dt.time] = []
+    for lesson in lessons:
+        for _, pair in lesson_pairs(lesson):
+            raw = pair.get("time_end")
+            try:
+                ends.append(dt.time.fromisoformat(str(raw)))
+            except (TypeError, ValueError):
+                continue
+    return max(ends) if ends else None
+
+
+def day_is_live(day: dict, now: dt.datetime) -> bool:
+    """День ещё виден: прошедшие скрыты, сегодня — пока идёт последняя пара.
+
+    ``now`` — локальное московское время (naive) или осведомлённое о зоне.
+    """
+    try:
+        when = dt.date.fromisoformat(str(day.get("date") or ""))
+    except ValueError:
+        return True
+    if when < now.date():
+        return False
+    if when > now.date():
+        return True
+    end = day_last_pair_end(day.get("lessons") or [])
+    if end is None:
+        return True  # без читаемых пар день не скрываем: иначе пустой пост
+    return now.time() < end
+
+
 def _lesson_number(lesson: dict) -> int:
     value = lesson.get("number")
     try:
@@ -382,9 +462,6 @@ def _clean_note(lesson: dict) -> str:
 def normalise_lesson(lesson: dict) -> dict:
     note = _clean_note(lesson)
     subject = _lesson_subject(lesson)
-    # Пара с использованием ДОТ — помечаем [ДОТ] в начале названия предмета
-    if "ДОТ" in note and not subject.startswith("[ДОТ]"):
-        subject = f"[ДОТ] {subject}"
     return {
         "number": lesson.get("number"),
         "subject": subject,
@@ -392,6 +469,8 @@ def normalise_lesson(lesson: dict) -> dict:
         **time_labels(lesson),
         "room": lesson.get("room") or "—",
         "teacher": lesson.get("teacher") or "—",
+        "location": lesson.get("location") or "",
+        "delivery_mode": lesson.get("delivery_mode") or "",
         "note": note,
         "raw_note": lesson.get("note") or lesson.get("raw_comment") or "",
         "parity": lesson_parity(lesson),

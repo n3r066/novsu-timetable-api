@@ -112,6 +112,9 @@ def test_diff_highlight_marks_changed_row_cell_and_added_row():
     legend = monday["html"][monday["html"].find('class="diff-legend"'):]
     assert "НОВАЯ ПАРА" in legend and "ИЗМЕНИЛИ" in legend
     assert "swatch added" in legend
+    # типы помеченных правок уходят в пост: подпись обещает только свои цвета
+    assert monday["marked_kinds"] == ["added", "changed"]
+    assert "marked_kinds" not in wednesday
 
 
 def test_diff_highlight_prefers_exact_time_over_neighbour_pair():
@@ -127,3 +130,19 @@ def test_diff_highlight_prefers_exact_time_over_neighbour_pair():
     assert rows[0].select_one("td.diff-cell").get_text(" ", strip=True) == "по верхней неделе Антоново"
     # без легенды подписи под таблицей нет (сам CSS при диффе остаётся)
     assert only_changed_soup.select_one(".diff-legend") is None
+    assert only_changed["marked_kinds"] == ["changed"]
+
+
+def test_diff_legend_drops_removal_note_when_nothing_was_removed():
+    """Строка про убранные пары нужна только когда их правда убирали."""
+    chunk = render_schedule_day_chunk_htmls(
+        _DIFF_HL_SOURCE, "https://example.test", days_per_chunk=1,
+        diff_items=[_DIFF_CHANGED], diff_legend="Жёлтым подсвечены правки",
+        removed_note=False,
+    )[0]
+    legend = chunk["html"][chunk["html"].find('class="diff-legend"'):]
+    assert "ИЗМЕНИЛИ" in legend
+    assert "Убранных пар на скрине уже нет" not in legend
+    # зелёного образца тоже нет: новых пар на этом скрине не помечали
+    assert "swatch added" not in legend
+    assert chunk["marked_kinds"] == ["changed"]

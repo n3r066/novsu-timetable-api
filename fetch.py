@@ -92,8 +92,14 @@ def fetch_html(
     """Загрузить и структурно проверить страницу с ретраями и полными headers."""
     attempts = max(1, int(retries))
     last_exc: Exception | None = None
-    ua, headers = config.pinned_profile()
     for attempt in range(1, attempts + 1):
+        # Первый запрос сохраняет стабильный профиль, но повторная попытка
+        # должна уметь пережить блокировку конкретного UA порталом.
+        if attempt == 1:
+            ua, headers = config.pinned_profile()
+        else:
+            ua = config.random_ua()
+            headers = config.chromium_headers(ua)
         try:
             html = _curl(url, ua, headers)
             validate_portal_response(html, page_kind)

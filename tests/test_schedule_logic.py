@@ -2,7 +2,17 @@ import datetime as dt
 
 import pytest
 
-from schedule_logic import calendar_bounds, day_view, lesson_applies_on, next_lessons, parse_user_date, week_view
+from schedule_logic import (
+    calendar_bounds,
+    day_is_live,
+    day_last_pair_end,
+    day_view,
+    lesson_applies_on,
+    next_lessons,
+    parse_user_date,
+    visible_week_days,
+    week_view,
+)
 
 
 WEEKS = [
@@ -274,3 +284,75 @@ def test_lesson_carries_machine_readable_times():
     assert lesson["time_end"] == "17:45"
     assert lesson["time_label"] == "14:00–15:45 + 16:00–17:45"
     assert lesson["time_cell"] == "14:00–15:45\n16:00–17:45"
+
+
+def test_visible_week_days_drops_past_days_at_midnight_msk():
+    """Граница — 00:00 Мск: в пятницу остаются только пт и сб."""
+    assert visible_week_days(WEEKS, dt.date(2026, 9, 4), dt.date(2026, 9, 4)) == ["Пятница", "Суббота"]
+    assert visible_week_days(WEEKS, dt.date(2026, 9, 2), dt.date(2026, 9, 2)) == [
+        "Среда", "Четверг", "Пятница", "Суббота",
+    ]
+    # Первая неделя 2026 года начинается во вторник (01.09) — имя дня берём
+    # из реальной даты, иначе фильтр сдвинулся бы на понедельник.
+    assert visible_week_days(WEEKS, dt.date(2026, 9, 1), dt.date(2026, 9, 1)) == [
+        "Вторник", "Среда", "Четверг", "Пятница", "Суббота",
+    ]
+
+
+def test_visible_week_days_shows_whole_next_week_from_sunday():
+    """В ночь на воскресенье фокус уезжает на понедельник — видна вся неделя."""
+    monday = dt.date(2026, 9, 7)
+    assert visible_week_days(WEEKS, monday, monday) == [
+        "Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота",
+    ]
+    # Смотрим на следующую неделю ещё из воскресенья: фильтр ей не мешает.
+    assert visible_week_days(WEEKS, monday, dt.date(2026, 9, 6)) == [
+        "Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота",
+    ]
+
+
+def test_visible_week_days_keeps_everything_outside_calendar():
+    """Дата между неделями (воскресенье) — не фильтруем, чтобы не получить пустой пост."""
+    sunday = dt.date(2026, 9, 6)
+    assert visible_week_days(WEEKS, sunday, sunday) == [
+        "Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота", "Воскресенье",
+    ]
+
+
+def test_day_last_pair_end_and_day_is_live():
+    day = {
+        "date": "2026-09-04",
+        "lessons": [
+            {"number": 1, "subject": "Пара", "time": "11:00 12:00", "note": ""},
+            {"number": 2, "subject": "Двойная", "time": "14:00 15:00 16:00 17:00", "note": ""},
+        ],
+    }
+    assert day_last_pair_end(day["lessons"]) == dt.time(17, 45)
+    assert day_is_live(day, dt.datetime(2026, 9, 4, 17, 44))
+    assert not day_is_live(day, dt.datetime(2026, 9, 4, 17, 45))
+    assert not day_is_live(day, dt.datetime(2026, 9, 5, 0, 0))
+    assert day_is_live(day, dt.datetime(2026, 9, 3, 12, 0))
+
+
+def test_visible_week_days_hides_today_after_last_pair():
+    """Вариант 2: сегодня держится до конца последней пары, потом исчезает."""
+    schedule = {
+        "days": {
+            "Пятница": [
+                {"number": 3, "subject": "История", "time": "14:00 15:00", "note": ""},
+            ],
+            "Суббота": [
+                {"number": 1, "subject": "Английский", "time": "09:00", "note": ""},
+            ],
+        }
+    }
+    weeks = [{"week": 1, "half": "top", "start": "01.09.2026", "end": "05.09.2026"}]
+    friday = dt.date(2026, 9, 4)
+    assert visible_week_days(
+        weeks, friday, friday,
+        schedule=schedule, now=dt.datetime(2026, 9, 4, 14, 30),
+    ) == ["Пятница", "Суббота"]
+    assert visible_week_days(
+        weeks, friday, friday,
+        schedule=schedule, now=dt.datetime(2026, 9, 4, 15, 46),
+    ) == ["Суббота"]

@@ -88,8 +88,9 @@ def screenshot_schedule_day_crop_items(
     diff_items: list[dict] | None = None,
     diff_legend: str = "",
     only_labels: set[str] | None = None,
+    diff_removed_note: bool = True,
 ) -> list[dict]:
-    """Return [{label, path, marked}] screenshots split by whole timetable days.
+    """Return [{label, path, marked[, marked_kinds]}] screenshots split by whole timetable days.
 
     *diff_items* — записи диффа (добавленные/изменённые): их строки и ячейки
     подсвечиваются прямо в портальной таблице, поэтому на скрине видно, что
@@ -103,6 +104,7 @@ def screenshot_schedule_day_crop_items(
         days_per_chunk=1,
         diff_items=diff_items,
         diff_legend=diff_legend,
+        removed_note=diff_removed_note,
     )
     items: list[dict] = []
     stem = out_png.with_suffix("")
@@ -116,7 +118,14 @@ def screenshot_schedule_day_crop_items(
         # 1280 CSS-px не хватало: правая колонка «комм.» уезжала за край скрина.
         # Остальные скрины расписания рендерятся в 1480 — держим ту же ширину.
         screenshot_html(chunk["html"], path, width=1480, height=3200, scale_factor=2, bg=(255, 255, 255))
-        items.append({"label": label, "path": path, "marked": int(chunk.get("marked") or 0)})
+        items.append({
+            "label": label,
+            "path": path,
+            "marked": int(chunk.get("marked") or 0),
+            # Типы помеченных правок идут дальше в пост: подпись обещает
+            # только те цвета, которые реально легли на скрин.
+            **({"marked_kinds": list(chunk["marked_kinds"])} if chunk.get("marked_kinds") else {}),
+        })
     return items
 
 
@@ -186,6 +195,8 @@ def _trim_bottom_whitespace(out_png: Path, bg: tuple[int, int, int] = (238, 241,
 
 
 if __name__ == "__main__":
-    out = Path("/tmp/novsu-tt-monitor/state/6381_screenshot.png")
+    # Snap Chromium имеет отдельный /tmp namespace. Держим probe под /root,
+    # иначе Chromium успешно пишет файл в snap-private-tmp, а хост его не видит.
+    out = config.STATE_DIR / "_screenshot_probe.png"
     p = screenshot_url(config.GROUP_URL, out)
     print(f"saved {p} ({p.stat().st_size} bytes)")

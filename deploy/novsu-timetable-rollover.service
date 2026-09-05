@@ -1,0 +1,21 @@
+[Unit]
+Description=NovSU timetable pinned-post midnight rollover (Europe/Moscow)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/root/novsu-timetable-api
+EnvironmentFile=/root/novsu-timetable-api/.env
+# Без этого python буферизует stdout и в журнале ничего не видно.
+Environment=PYTHONUNBUFFERED=1
+# Ролловер закрепа: прошедшие дни учебной недели убираются из поста, а в
+# ночь на воскресенье пост переключается на следующую неделю. MESSAGE_ID
+# берётся из NOVSU_DASHBOARD_POST_ID в .env.
+ExecStart=/usr/bin/python3 /root/novsu-timetable-api/post.py --roll
+# chromium — снап, поэтому NoNewPrivileges здесь включать нельзя (см. комментарий
+# в novsu-timetable-monitor.service): snap-confine не сможет сменить профиль
+# AppArmor и скрины не отрендерятся.
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/root/novsu-timetable-api/state
