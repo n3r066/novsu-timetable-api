@@ -40,7 +40,7 @@ import zoneinfo
 
 import bells  # noqa: E402
 import config  # noqa: E402
-from fetch import content_fingerprint, fetch_html, hash_html, is_stub  # noqa: E402
+from fetch import content_fingerprint, fetch_html, hash_html, is_stub, save_html  # noqa: E402
 from format import build_changes_rich_message, changes_fallback_text, pick_day_screens  # noqa: E402
 from parse import extract_teacher_ids, parse_all  # noqa: E402
 from portal_parser import count_schedule_lessons  # noqa: E402
@@ -624,6 +624,9 @@ def _run_once_locked(update_post_id: int | None = None, post_date: dt.date | Non
     baseline = _load_baseline()
 
     html = fetch_html()
+    # Держим последний успешный сырой ответ доступным для ручной диагностики
+    # и screenshot CLI, а не оставляем state/6381.html старым ручным снапшотом.
+    save_html(html)
     data = parse_all(html)
     if not data.get("stub"):
         expected = count_schedule_lessons(html)

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import subprocess
 import sys
 import time
@@ -116,8 +117,11 @@ def fetch_html(
 
 
 def save_html(html: str, label: str = "6381") -> Path:
+    """Сохранить последний успешный сырой ответ атомарно."""
     out = STATE_DIR / f"{label}.html"
-    out.write_text(html, encoding="utf-8")
+    temporary = out.with_name(f".{out.name}.{os.getpid()}.tmp")
+    temporary.write_text(html, encoding="utf-8")
+    os.replace(temporary, out)
     return out
 
 

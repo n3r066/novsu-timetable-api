@@ -1,5 +1,5 @@
 [Unit]
-Description=NovSU timetable change monitor
+Description=NovSU timetable JSON API
 Wants=network-online.target
 After=network-online.target
 
@@ -8,10 +8,9 @@ Type=simple
 WorkingDirectory=/root/novsu-timetable-api
 EnvironmentFile=/root/novsu-timetable-api/.env
 Environment=PYTHONUNBUFFERED=1
-ExecStart=/usr/bin/python3 /root/novsu-timetable-api/monitor.py --interval 10 --jitter 2 --update-post 3
+ExecStart=/usr/bin/python3 /root/novsu-timetable-api/api.py --host 127.0.0.1 --port 8787
 Restart=always
 RestartSec=20
-TimeoutStopSec=20
 PrivateTmp=true
 ProtectSystem=strict
 ReadWritePaths=/root/novsu-timetable-api/state

@@ -116,7 +116,9 @@ pip install -r requirements.txt      # beautifulsoup4, pillow, fake-useragent
 python3 -m pytest -q                 # тесты
 python3 api.py --once                # разовый JSON группы 6381
 python3 api.py --host 127.0.0.1 --port 8787
-python3 monitor.py --interval 30 --jitter 3  # мониторинг + уведомления в канал
+# или установить systemd-юниты (monitor + API + rollover)
+sudo ./deploy/install-monitor-service.sh
+python3 monitor.py --interval 10 --jitter 2 --update-post 3  # мониторинг + уведомления в канал
 python3 post.py --force              # пост расписания со скрином
 ```
 

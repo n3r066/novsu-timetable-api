@@ -11,7 +11,8 @@
 6. заглушка портала → stub-сообщение через sendMessage
 
 Идемпотентность: не постить если с прошлого поста ничего не изменилось.
-Состояние "последний пост" хранится в state/last_post.json:
+Состояние последнего alert-поста хранится в state/last_post.json.
+Состояние dashboard-поста хранится отдельно в state/last_dashboard_post.json:
   { hash, fingerprint, ts, message_ids: [int,...] }
 """
 
@@ -119,6 +120,17 @@ def _read_last_post() -> dict:
 def _write_last_post(data: dict) -> None:
     path = config.STATE_DIR / "last_post.json"
     path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    with temporary.open("w", encoding="utf-8") as handle:
+        json.dump(data, handle, ensure_ascii=False, indent=2)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temporary, path)
+
+
+def _write_dashboard_post_state(data: dict) -> None:
+    """Состояние последнего успешного обновления дашборда отдельно от алертов."""
+    path = config.STATE_DIR / "last_dashboard_post.json"
     temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     with temporary.open("w", encoding="utf-8") as handle:
         json.dump(data, handle, ensure_ascii=False, indent=2)
@@ -561,7 +573,7 @@ def edit_dashboard_post(
         last_updated=last_updated,
     )
     files = {f"site_screenshot_{index}": item["path"] for index, item in enumerate(shot_items, 1)}
-    return edit_rich_message(
+    result = edit_rich_message(
         rich,
         token=config.TG_BOT_TOKEN,
         chat_id=config.TG_CHANNEL_ID,
@@ -569,6 +581,14 @@ def edit_dashboard_post(
         files=files,
         timeout=120,
     )
+    if result.get("ok"):
+        _write_dashboard_post_state({
+            "message_id": message_id,
+            "fingerprint": fp,
+            "target_date": target_date.isoformat(),
+            "ts": dt.datetime.now(tz_msk).isoformat(timespec="seconds"),
+        })
+    return result
 
 
 if __name__ == "__main__":
