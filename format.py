@@ -2029,7 +2029,12 @@ def _change_quote(number: int, kind: str, item: dict, partner: dict | None = Non
     заголовок читается как подпись, а не как продолжение прошлого абзаца.
     """
     subject = _subject_first(item)
-    when = bells.slot((partner or item).get("time")).label()
+    raw_when = bells.slot((partner or item).get("time")).label()
+    # Портал не всегда даёт время правки (например, чистое переименование
+    # без переноса) — «слот» тогда возвращает «—», и пустой code-бейдж рядом
+    # с заголовком выглядел как мусор. Показываем время, только когда оно
+    # реально есть.
+    when = raw_when if raw_when and raw_when != "—" else ""
     # Один жирный фрагмент на заголовок: два соседних bold-рана на рендере
     # превращались в «****» между подписью и названием пары.
     title: list[object] = [
