@@ -63,7 +63,17 @@ def _structured_comment(comment: str) -> dict:
     elif re.search(r"\bАнтоново\b", comment, re.I):
         location = "Антоново"
     else:
-        address = re.search(r"(?:ул\.\s*)?[А-ЯЁA-Z][А-Яа-яЁёA-Za-z.\- ]*,\s*\d+[А-Яа-яA-Za-z/-]*", comment)
+        # Портал вставляет номер дома по-разному: «ул. Псковская, д.3»,
+        # «ул. Псковская д.3» (без запятой), «ул. Псковская .д.3» (опечатка
+        # с точкой), реже совсем без «ул.» перед названием — «Б.С.-
+        # Петербургская, 41». Первая ветка ловит любую форму с «ул.» и
+        # «д.»/без него, вторая — старый формат «Название, число» как
+        # запасной вариант для адресов без явного «ул.».
+        address = re.search(
+            r"(?:\bул\.?\s*[А-ЯЁ][А-Яа-яЁё.\- ]*?(?:,\s*\.?\s*д\.?\s*|\s+\.?\s*д\.?\s*|,\s*)\d+[А-Яа-яA-Za-z/-]*"
+            r"|[А-ЯЁA-Z][А-Яа-яЁёA-Za-z.\- ]*?,\s*\d+[А-Яа-яA-Za-z/-]*)",
+            comment,
+        )
         if address:
             location = address.group(0).strip(" ,")
     return {"location": location, "delivery_mode": delivery_mode, "link": urls[0] if urls else None}

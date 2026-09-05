@@ -101,6 +101,22 @@ def test_comment_metadata_handles_real_locations_and_url_punctuation():
     assert rows[1]["link"] == "https://x.test/a"
 
 
+def test_comment_metadata_extracts_addresses_without_comma_before_house_number():
+    # Реальные формулировки портала: "д." после названия улицы без запятой
+    # перед номером дома, а также опечатка "." перед "д.". До фикса regex
+    # требовал запятую сразу перед цифрой и пропускал ~92% таких адресов.
+    html = """<table><tr><th>дата</th><th>время</th><th>под гр.</th><th>предмет</th><th>преподаватель</th><th>ауд.</th><th>комм.</th></tr>
+    <tr><td rowspan="4">Пт</td></tr>
+    <tr><td>09:00</td><td></td><td>А</td><td>Иванов</td><td>1</td><td>ул. Псковская д.3</td></tr>
+    <tr><td>10:00</td><td></td><td>Б</td><td>Петров</td><td>2</td><td>ХТИ, ул. Советской Армии, д.7</td></tr>
+    <tr><td>11:00</td><td></td><td>В</td><td>Сидоров</td><td>3</td><td>ИНТЦ-Валдай, ул. Великая, д.18А</td></tr>
+    </table>"""
+    rows = parse_schedule(html)["days"]["Пятница"]
+    assert rows[0]["location"] == "ул. Псковская д.3"
+    assert rows[1]["location"] == "ул. Советской Армии, д.7"
+    assert rows[2]["location"] == "ул. Великая, д.18А"
+
+
 def test_new_day_clears_stale_rowspans_in_all_columns():
     html = """<table><tr><th>дата</th><th>время</th><th>под гр.</th><th>предмет</th><th>преподаватель</th><th>ауд.</th><th>комм.</th></tr>
     <tr><td rowspan="5">Пн</td></tr>

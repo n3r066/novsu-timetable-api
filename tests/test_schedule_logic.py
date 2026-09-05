@@ -63,6 +63,56 @@ def test_day_view_filters_exact_dates_and_after_week():
     assert [lesson["subject"] for lesson in after["lessons"]] == ["После 9"]
 
 
+def test_lesson_applies_on_handles_from_week_note():
+    # Реальный пример с портала: "с 10 недели" / "с 9 недели, с использованием
+    # ДОТ" — пара начинается не с первой учебной недели. До фикса
+    # _FROM_WEEK_RE не существовал, и такие пары показывались с недели 1.
+    lesson = {"note": "с 10 недели"}
+    week_9 = {"week": 9, "half": "top"}
+    week_10 = {"week": 10, "half": "bottom"}
+    bounds_9 = (dt.date(2026, 10, 26), dt.date(2026, 11, 1))
+    bounds_10 = (dt.date(2026, 11, 2), dt.date(2026, 11, 8))
+    assert lesson_applies_on(lesson, dt.date(2026, 10, 26), week_9, bounds_9) is False
+    assert lesson_applies_on(lesson, dt.date(2026, 11, 2), week_10, bounds_10) is True
+
+    lesson_dot = {"note": "с 9 недели, с использованием ДОТ"}
+    week_8 = {"week": 8, "half": "bottom"}
+    bounds_8 = (dt.date(2026, 10, 19), dt.date(2026, 10, 25))
+    assert lesson_applies_on(lesson_dot, dt.date(2026, 10, 19), week_8, bounds_8) is False
+    assert lesson_applies_on(lesson_dot, dt.date(2026, 10, 26), week_9, bounds_9) is True
+
+
+def test_lesson_applies_on_handles_bare_end_date_note():
+    # Реальные примеры: "По 30.09" и "ул. Псковская д.3 по нижней неделе по
+    # 21.10" — одиночное «по DD.MM» без парного «с» задаёт последний день
+    # действия пары. До фикса такой комментарий не давал верхней границы
+    # вообще, и пара оставалась видимой бесконечно.
+    lesson = {"note": "По 30.09"}
+    week_in_range = {"week": 4, "half": "top"}
+    bounds_in_range = (dt.date(2026, 9, 21), dt.date(2026, 9, 27))
+    week_after = {"week": 6, "half": "top"}
+    bounds_after = (dt.date(2026, 10, 5), dt.date(2026, 10, 11))
+    assert lesson_applies_on(lesson, dt.date(2026, 9, 21), week_in_range, bounds_in_range) is True
+    assert lesson_applies_on(lesson, dt.date(2026, 10, 5), week_after, bounds_after) is False
+
+    lesson_addr = {"note": "ул. Псковская д.3 по нижней неделе  по 21.10"}
+    week_ok = {"week": 4, "half": "bottom"}
+    bounds_ok = (dt.date(2026, 9, 21), dt.date(2026, 9, 27))
+    week_late = {"week": 10, "half": "bottom"}
+    bounds_late = (dt.date(2026, 11, 2), dt.date(2026, 11, 8))
+    assert lesson_applies_on(lesson_addr, dt.date(2026, 9, 22), week_ok, bounds_ok) is True
+    assert lesson_applies_on(lesson_addr, dt.date(2026, 11, 3), week_late, bounds_late) is False
+
+    # Диапазон "с X по Y" не должен путаться с одиночным "по Y".
+    range_lesson = {"note": "с 05.10., по нижней неделе, ул. Б.С.-Петербургская, 41"}
+    week_before = {"week": 5, "half": "bottom"}
+    bounds_before = (dt.date(2026, 9, 28), dt.date(2026, 10, 4))
+    week_during = {"week": 6, "half": "bottom"}
+    bounds_during = (dt.date(2026, 10, 5), dt.date(2026, 10, 11))
+    assert lesson_applies_on(range_lesson, dt.date(2026, 9, 28), week_before, bounds_before) is False
+    assert lesson_applies_on(range_lesson, dt.date(2026, 10, 6), week_during, bounds_during) is True
+
+
 def test_week_and_next_views_are_human_readable():
     week = week_view(SCHEDULE, WEEKS, WEEKS[1], group="6381", source_url="https://example.test")
     assert "неделя 2 (нижняя)" in week["summary"]

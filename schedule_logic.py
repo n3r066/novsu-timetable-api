@@ -43,8 +43,15 @@ _MONTHS = {
     "мая": 5, "июня": 6, "июля": 7, "августа": 8,
     "сентября": 9, "октября": 10, "ноября": 11, "декабря": 12,
 }
+_END_DATE_RE = re.compile(rf"(?<!с\s)\bпо\s+({_DATE_TOKEN})", re.I)
 _AFTER_WEEK_RE = re.compile(r"после\s+(\d+)\s+недел", re.I)
 _UNTIL_WEEK_RE = re.compile(r"до\s+(\d+)\s+недел", re.I)
+# «с 10 недели» — портал так отмечает пары, которые начинаются не с первой
+# учебной недели (реальный пример: «с 10 недели», «с 9 недели, с
+# использованием ДОТ»). До этого фикса такие пары молча показывались с 1
+# недели — сравнение было строгое неравенство (>) вместо (>=), потому что
+# сама неделя N уже включена в диапазон действия пары.
+_FROM_WEEK_RE = re.compile(r"\bс\s+(\d+)\s+недел", re.I)
 
 
 def parse_user_date(value: str | None, *, today: dt.date | None = None) -> dt.date:
@@ -296,6 +303,9 @@ def lesson_applies_on(
     until_match = _UNTIL_WEEK_RE.search(low)
     if until_match and week_number >= int(until_match.group(1)):
         return False
+    from_match = _FROM_WEEK_RE.search(low)
+    if from_match and week_number < int(from_match.group(1)):
+        return False
 
     date_parts = _date_condition_parts(lesson)
     ranges: list[tuple[dt.date, dt.date]] = []
@@ -342,6 +352,23 @@ def lesson_applies_on(
             if parsed is not None:
                 start_dates.append(parsed)
     if start_dates and target < max(start_dates):
+        return False
+
+    # A bare "по DD.MM" (no matching "с DD.MM" range) marks the last date the
+    # lesson happens — portal example: «По 30.09», «ул. Псковская д.3 по
+    # нижней неделе по 21.10». Ranges are already stripped from
+    # ``without_ranges``, and «по верхней/нижней неделе» never matches
+    # because it has no digits, so this only catches the standalone form.
+    end_dates = [
+        parsed
+        for text in without_ranges
+        for parsed in (
+            _parse_note_date(match.group(1), target.year, bounds)
+            for match in _END_DATE_RE.finditer(text)
+        )
+        if parsed is not None
+    ]
+    if end_dates and target > min(end_dates):
         return False
 
     has_exact_context, exact_dates = _explicit_lesson_dates(lesson, target, bounds)
