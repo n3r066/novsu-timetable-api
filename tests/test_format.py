@@ -708,7 +708,7 @@ def test_changes_post_promises_highlight_only_when_screens_are_marked():
     assert "Зелёным помечены новые пары" in blob
     assert "оранжевым — поправленные" in blob
     assert "зелёным новые пары, оранжевым правки" in blob
-    assert "Как это читать" in blob
+    assert "Пояснения" in blob
 
     clean = build_changes_rich_message(
         diff, [], "https://example.test", now=now,

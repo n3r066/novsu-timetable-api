@@ -2126,8 +2126,8 @@ def _explainer_block(counts: dict[str, int], marked: bool, kinds: set[str] | Non
             f" {colors} Рядом с полосой стоит подпись словами, чтобы цвет не приходилось угадывать.",
         ]))
     if not body:
-        return _paragraph("")
-    return _blockquote("Как это читать", body, expandable=True)
+        return {}
+    return _blockquote("Пояснения", body, expandable=True)
 
 
 def _variant_signature(kind: str, item: dict, partner: dict | None) -> tuple:
@@ -2375,9 +2375,6 @@ def build_changes_rich_message(
                 blocks.append(explainer)
         if not (added or removed or changed or transition):
             blocks.append(_paragraph("Содержимое страницы изменилось, но состав пар прежний."))
-        blocks.append(_divider())
-        blocks.append(_time_legend())
-
         return {"rich_message": {"blocks": blocks}}
 
     payload = assemble()
