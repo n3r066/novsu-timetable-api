@@ -186,6 +186,36 @@ def _validate_rich_block(block: Any, path: str, state: dict[str, int], depth: in
         for index, child in enumerate(nested):
             _validate_rich_block(child, f"{path}.blocks[{index}]", state, depth + 1)
 
+    if block_type in {"blockquote", "expandable_blockquote"} and "blocks" in block:
+        nested = block["blocks"]
+        if not isinstance(nested, list) or not nested:
+            raise _rich_error(path, f"{block_type} blocks must be a non-empty array")
+        for index, child in enumerate(nested):
+            _validate_rich_block(child, f"{path}.blocks[{index}]", state, depth + 1)
+
+    if block_type == "list":
+        items = block.get("items")
+        if not isinstance(items, list) or not items:
+            raise _rich_error(path, "list block requires a non-empty items array")
+        for item_index, item in enumerate(items):
+            nested = item.get("blocks") if isinstance(item, dict) else None
+            if not isinstance(nested, list) or not nested:
+                raise _rich_error(f"{path}.items[{item_index}]", "list item requires blocks")
+            for index, child in enumerate(nested):
+                _validate_rich_block(child, f"{path}.items[{item_index}].blocks[{index}]", state, depth + 1)
+
+    if block_type in {"collage", "slideshow"}:
+        nested = block.get("blocks")
+        if not isinstance(nested, list) or not nested:
+            raise _rich_error(path, f"{block_type} block requires a non-empty blocks array")
+        for index, child in enumerate(nested):
+            _validate_rich_block(child, f"{path}.blocks[{index}]", state, depth + 1)
+        caption = block.get("caption")
+        if caption is not None:
+            if not isinstance(caption, dict) or "text" not in caption:
+                raise _rich_error(path, f"{block_type} caption must be a RichBlockCaption object")
+            _validate_rich_text(caption["text"], f"{path}.caption.text", state, depth + 1)
+
     if block_type == "table":
         rows = block.get("cells")
         if not isinstance(rows, list):

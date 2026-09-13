@@ -2,6 +2,8 @@ import json
 from pathlib import Path
 import datetime as dt
 
+import pytest
+
 from format import (
     build_changes_rich_message,
     build_dashboard_rich_message,
@@ -122,49 +124,38 @@ def _sample_diff():
 
 
 def test_changes_rich_message_structure():
-    import json
     rm = build_changes_rich_message(_sample_diff(), [], "https://example.test",
                                     now=dt.datetime(2026, 9, 2, 12, 0))
+    validate_rich_payload(rm)
     assert "rich_message" in rm
     blocks = rm["rich_message"]["blocks"]
-    assert blocks[0]["type"] == "pullquote"
-    blob = json.dumps(rm, ensure_ascii=False)
-    assert "Поменяли расписание" in blob
-    assert "3 изменения" in blob
-    # правки сгруппированы по дням в порядке недели, а не по типу изменения
-    summaries = [block.get("summary") for block in blocks if block.get("type") == "details"]
-    assert summaries[:3] == ["Вторник — 1 изменение", "Среда — 1 изменение", "Четверг — 1 изменение"]
-    # структура поста: «Коротко» → дни → «Как это читать»
-    headings = [block.get("text") for block in blocks if block.get("type") == "heading"]
-    assert headings[:2] == ["Коротко", "Что именно поменяли"]
-    overview = next(block for block in blocks if block.get("type") == "list")
-    # список Bot API принимает только в форме items: [{"blocks": [...]}]
-    assert all("blocks" in entry for entry in overview["items"])
-    overview_blob = json.dumps(overview, ensure_ascii=False)
-    assert "Вторник" in overview_blob and "1 изменение" in overview_blob
-    assert "(лек.) Новый" in blob
-    assert "203 → 415" in _plain(rm)
-    day_blocks = {
-        block["summary"]: block.get("blocks") or []
-        for block in blocks if block.get("type") == "details"
-    }
-    wednesday = day_blocks["Среда — 1 изменение"]
-    # каждая правка — своя цитата, чтобы отделяться от соседних
-    assert wednesday[0]["type"] == "blockquote"
-    first_card = _plain(wednesday[0])
-    assert "1. Изменили" in first_card
-    assert "203 → 415" in first_card
-    # дублирующая сводная таблица дня убрана: правка уже видна в цитате
-    assert not any(inner.get("type") == "table" for inner in wednesday)
-    assert not any(inner.get("type") == "details" for inner in wednesday)
-    # убранная пара на новом скрине не появится — предупреждаем текстом
-    thursday = day_blocks["Четверг — 1 изменение"]
-    removed_note = [json.dumps(inner, ensure_ascii=False) for inner in thursday]
-    assert any("1. Убрали" in note for note in removed_note)
-    assert any("Убрано: 1 пара" in note and "на скрине ниже её уже нет" in note for note in removed_note)
-    assert "портал НовГУ" not in blob
-    # знаки +/−/~ больше не нужны: правки подписаны глаголами
-    assert "Сводка дня" not in blob
+    # Каждый день — раскрывающийся раздел, сводка называет конкретную правку.
+    days = [block for block in blocks if block.get("type") == "details"]
+    assert [day["summary"] for day in days] == [
+        "Вторник (добавили пару)", "Среда (сменили аудиторию)", "Четверг (убрали пару)",
+    ]
+    change = next(
+        block for day in days for block in day["blocks"]
+        if "поменяли аудиторию: 203 → 415" in _plain(block)
+    )
+    assert change["type"] == "paragraph"
+    assert {"type": "strikethrough", "text": "203"} in change["text"]
+    assert {"type": "bold", "text": "415"} in change["text"]
+    # Убранная пара: зачёркнуты время и место, отдельного предложения нет.
+    assert "В новом расписании этого занятия нет." not in _plain(rm)
+    assert _plain(rm).count("в 15:00–16:45, ауд. 202") == 1
+    # Неизменённый преподаватель в пост не попадает.
+    assert "Иванов" not in _plain(rm) and "Петров" not in _plain(rm)
+    assert not any(node.get("type") in {
+        "pullquote", "blockquote", "expandable_blockquote", "list", "table",
+    } for node in _rich_nodes(rm))
+    for obsolete in ("Поменяли расписание", "Коротко", "Что именно поменяли", "Как это читать",
+                     "Сводка дня", "Пояснения", "1. ", "Убрано:", "на скрине ниже", "портал НовГУ"):
+        assert obsolete not in _plain(rm)
+    assert blocks[-1]["type"] == "footer"
+    assert _plain(blocks[-1]) == "Группа 6381 · 3 изменения · На портале"
+    assert "Группа" not in _plain(blocks[:-1])
+    assert "изменения" not in _plain(blocks[:-1])
 
 
 def test_changes_rich_message_hides_empty_sections():
@@ -193,6 +184,15 @@ def test_changes_fallback_text_is_valid_and_bounded():
     assert "<script>" not in text
     assert "&lt;script&gt;" in text
     assert "открыть на портале" in text
+    assert [line for line in text.splitlines() if line.startswith("<b>") and "(" in line] == [
+        "<b>Вторник (добавили пару)</b>",
+        "<b>Среда (сменили аудиторию)</b>",
+        "<b>Четверг (убрали пару)</b>",
+    ]
+    assert "поменяли аудиторию: <s>203</s> → <b>415</b>" in text
+    assert "<s>в 15:00–16:45, ауд. 202</s>" in text
+    assert "В новом расписании этого занятия нет." not in text
+    assert not any(line.startswith(("+", "-", "−", "~")) for line in text.splitlines())
     big = _sample_diff()
     big["added"] = big["added"] * 300
     assert len(changes_fallback_text(big, "https://example.test")) <= 4096
@@ -207,17 +207,21 @@ def test_dashboard_rich_message_has_week_section():
     ]
     rm = build_dashboard_rich_message(data["schedule"], weeks, "https://example.test", dt.date(2026, 9, 2), screenshot_media=screenshots, current_date=dt.date(2026, 8, 24))
     blob = json.dumps(rm, ensure_ascii=False)
-    assert "Расписание группы 6381" in blob
-    assert "Фокус: 02.09.2026" in blob
+    assert "Расписание · группа 6381" in blob
+    assert "Фокус:" not in blob
     assert "Дневник" not in blob  # removed from dashboard
-    assert "Полное расписание" in blob
-    assert "Неделя 1 (верхняя)" in blob
-    assert "Как читать" not in blob  # moved to separate guide post
+    assert "На неделе:" in blob
+    assert "НЕДЕЛЯ 1 · ВЕРХНЯЯ" in blob
+    assert "1–5 сентября · нечётная учебная неделя" in blob
+    assert "очно" not in blob.casefold()
+    assert "Пн · 07.09" not in blob  # fixture contains only Thursday lessons
+    assert "Как читать недели" not in blob  # guide stays out of the dashboard
+    assert "Как читать время" not in blob
     assert "портал НовГУ" not in blob  # moved to separate guide post
     assert '"type": "footer"' not in blob
     assert "Среда — 02.09: 0 пар" not in blob  # diary removed
     assert "Скрины · оригинал по дням" not in blob
-    assert "Скрин: Четверг" in blob
+    assert "Скрин:" not in blob
     assert "Скрин с сайта" not in blob
     assert '"text": "день"' not in blob
     assert '"text": "скрин"' not in blob
@@ -225,8 +229,10 @@ def test_dashboard_rich_message_has_week_section():
     assert "attach://site_screenshot_1" in blob
     assert "Четверг" in blob
     assert "Среда" not in blob  # diary removed; 0-lesson day hidden from week view
-    assert "оригинальное" in blob
-    assert '"text": "расписание"' in blob
+    assert "полный оригинал" in blob
+    assert "Скрин с портала · 03.09" in blob
+    assert "прошедшие разовые занятия скрыты" in blob
+    assert '"text": "полный оригинал"' in blob
     assert '"type": "photo"' in blob
     assert '"header"' not in blob
     assert "details" in blob and "table" in blob
@@ -236,7 +242,7 @@ def test_dashboard_rich_message_has_week_section():
     assert "Скрин: Среда" not in blob
 
 
-def test_dashboard_screenshot_section_is_the_only_open_section():
+def test_dashboard_day_and_screenshot_sections_are_closed():
     data = _load()
     weeks = [{"week": 1, "half": "top", "start": "01.09.2026", "end": "05.09.2026"}]
     screenshots = [
@@ -253,7 +259,7 @@ def test_dashboard_screenshot_section_is_the_only_open_section():
 
     walk(rm["rich_message"]["blocks"])
     open_sections = [block.get("summary") for block in details if block.get("is_open") or block.get("open")]
-    assert open_sections == ["Скрин: Четверг"]
+    assert open_sections == []
 
 
 def test_dashboard_has_no_open_sections_on_sunday():
@@ -270,7 +276,8 @@ def test_dashboard_has_no_open_sections_on_sunday():
                 walk(block.get("blocks", []))
 
     walk(rm["rich_message"]["blocks"])
-    assert [block.get("summary") for block in details if block.get("is_open") or block.get("open")] == []
+    open_sections = [block.get("summary") for block in details if block.get("is_open") or block.get("open")]
+    assert open_sections == []
 
 
 
@@ -340,12 +347,16 @@ def test_large_rich_diff_is_chunked_and_within_documented_limits():
     }
     payload = build_changes_rich_message(diff, [], "https://example.test")
     validate_rich_payload(payload)
-    quotes = [
-        block for block in _walk_rich_blocks(payload["rich_message"]["blocks"])
-        if block.get("type") == "blockquote"
-    ]
-    assert len(quotes) > 1
-    assert "не поместились" in __import__("json").dumps(payload, ensure_ascii=False)
+    blocks = payload["rich_message"]["blocks"]
+    days = [block for block in blocks if block.get("type") == "details"]
+    assert [day["summary"] for day in days] == [
+        "Среда (изменили условия ×17, добавили пару ×15, убрали пару ×17)"]
+    text = _plain(payload)
+    for action in ("изменились условия", "Добавили пару", "убрали совсем"):
+        assert text.count(action) > 1
+    assert not any(block.get("type") in {"blockquote", "expandable_blockquote"}
+                   for block in _walk_rich_blocks(blocks))
+    assert "не поместились" in text
 
 
 def test_schedule_fallback_splits_one_huge_row_without_broken_html():
@@ -388,7 +399,7 @@ def test_dashboard_last_updated_in_title():
     )
     import json
     blob = json.dumps(rm, ensure_ascii=False)
-    assert "Последние изменения: 27.08.2026 18:45" in blob
+    assert "Обновлено: 27.08.2026 18:45 МСК" in blob
 
 
 def test_dashboard_no_last_updated_when_empty():
@@ -410,13 +421,73 @@ def test_dashboard_week_before_diary():
         current_date=dt.date(2026, 8, 31),
     )
     blocks = rm["rich_message"]["blocks"]
-    # block 0 = pullquote (title), block 1 = легенда времени, дальше разделы
     assert blocks[0]["type"] == "pullquote"
-    week = next(block for block in blocks if block["type"] == "details")
-    assert "Полное расписание" in json.dumps(week, ensure_ascii=False)
-    assert "Дневник" not in json.dumps(week, ensure_ascii=False)
+    assert blocks[1]["type"] == "paragraph"
+    assert blocks[2]["type"] == "details"
+    assert not blocks[2].get("is_open")
+    assert not any(block["type"] == "expandable_blockquote" for block in blocks)
     # дневник из дашборда убран: его не должно быть ни в одном блоке
     assert all("Дневник" not in json.dumps(block, ensure_ascii=False) for block in blocks)
+
+
+def test_dashboard_lower_week_has_day_tables_and_arithmetic_summary():
+    data = _mini_timetable()
+    lower = [{"week": 2, "half": "bottom", "start": "07.09.2026", "end": "12.09.2026"}]
+    rm = build_dashboard_rich_message(
+        data["schedule"], lower, "https://example.test", dt.date(2026, 9, 7),
+        current_date=dt.date(2026, 9, 5),
+    )
+    validate_rich_payload(rm)
+    blob = json.dumps(rm, ensure_ascii=False)
+    assert "НЕДЕЛЯ 2 · НИЖНЯЯ" in blob
+    assert "7–12 сентября · чётная учебная неделя" in blob
+    assert "На неделе:" in blob
+    assert "2 пары" in blob and "очно" not in blob.casefold()
+    assert "ПОНЕДЕЛЬНИК · 07.09" in blob
+    assert "ВТОРНИК · 08.09" in blob
+    assert "Матан" in blob and "Проект" in blob
+    assert len(_tables(rm)) == 2
+    assert all(block.get("type") == "details" for block in rm["rich_message"]["blocks"][2:])
+
+
+def test_dashboard_inlines_common_location_and_simple_condition_without_notes_section():
+    data = parse_all(
+        "<table>"
+        "<tr><th>дата</th><th>время</th><th>под гр.</th><th>предмет</th>"
+        "<th>преподаватель</th><th>ауд.</th><th>комм.</th></tr>"
+        "<tr><td>Пн</td><td>9:00 10:00</td><td></td><td>(лек.) Проект с 07.09.</td>"
+        "<td>Иванов И. И.</td><td>303</td><td>Антоново</td></tr>"
+        "</table>"
+    )
+    week = [{"week": 2, "half": "bottom", "start": "07.09.2026", "end": "12.09.2026"}]
+    rm = build_dashboard_rich_message(
+        data["schedule"], week, "https://example.test", dt.date(2026, 9, 7),
+        current_date=dt.date(2026, 9, 7),
+    )
+    blob = json.dumps(rm, ensure_ascii=False)
+    assert "Проект" in blob and "с 07.09" in blob
+    assert '"text": "303"' in blob and "Антоново" in blob
+    assert "ОЧНО" not in blob
+    assert "Важно" not in blob
+
+
+def test_dashboard_keeps_date_lists_and_unknown_addresses_in_important_section():
+    data = parse_all(
+        "<table>"
+        "<tr><th>дата</th><th>время</th><th>под гр.</th><th>предмет</th>"
+        "<th>преподаватель</th><th>ауд.</th><th>комм.</th></tr>"
+        "<tr><td>Сб</td><td>11:00 12:00</td><td></td><td>(пр.) Практика</td>"
+        "<td>Иванов И. И.</td><td>216</td><td>ул. Псковская, 3; 12.09, 19.09</td></tr>"
+        "</table>"
+    )
+    week = [{"week": 2, "half": "bottom", "start": "07.09.2026", "end": "12.09.2026"}]
+    rm = build_dashboard_rich_message(
+        data["schedule"], week, "https://example.test", dt.date(2026, 9, 12),
+        current_date=dt.date(2026, 9, 7),
+    )
+    blob = json.dumps(rm, ensure_ascii=False)
+    assert '"text": "216"' in blob and "ул. Псковская, 3" in blob
+    assert "Важно · 1" in blob and "12.09, 19.09" in blob
 
 
 def _mini_timetable() -> dict:
@@ -453,8 +524,10 @@ def _tables(node) -> list:
 
 def test_dashboard_shows_real_pair_intervals_instead_of_portal_hour_starts():
     data = _mini_timetable()
+    week = [{"week": 2, "half": "bottom", "start": "07.09.2026", "end": "12.09.2026"}]
     rm = build_dashboard_rich_message(
-        data["schedule"], WEEK_1, "https://example.test", dt.date(2026, 8, 31),
+        data["schedule"], week, "https://example.test", dt.date(2026, 9, 7),
+        current_date=dt.date(2026, 9, 7),
     )
     blob = json.dumps(rm, ensure_ascii=False)
     validate_rich_payload(rm)
@@ -467,9 +540,7 @@ def test_dashboard_shows_real_pair_intervals_instead_of_portal_hour_starts():
     assert "09:00–10:45" in blob
     # Четыре академических часа — две пары, а не одно занятие до 17:45.
     assert "14:00–15:45" in blob and "16:00–17:45" in blob
-    # Легенда объясняет сетку и вариант без перерыва.
-    assert "45 + 15 перерыв + 45" in blob
-    assert "09:00–10:30" in blob
+    assert "Как читать время" not in blob
 
 
 def test_dashboard_keeps_odd_hour_visible():
@@ -487,7 +558,51 @@ def test_dashboard_keeps_odd_hour_visible():
     )
     blob = json.dumps(rm, ensure_ascii=False)
     assert "16:00–17:45" in blob
-    assert "18:00–18:45 (1 ак. ч.)" in blob
+    assert "18:00–18:45" in blob
+    assert "ак. ч." not in blob
+
+
+@pytest.mark.parametrize("portal_time,room,note,place,when", [
+    ("14:00 15:00", "1331", "Антоново", "1331\nАнтоново", "14:00–15:45"),
+    ("14:00 15:00", ".", "с использованием ДОТ", "ДОТ", "14:00–15:45"),
+    ("14:00 15:00 16:00 17:00", "202", "Антоново", "202\nАнтоново", "14:00–15:45\n16:00–17:45"),
+    ("16:00 17:00 18:00", "Спортзал", "", "Спортзал", "16:00–17:45\n18:00–18:45"),
+    ("09:00 10:00", ".", "", "место уточняется", "09:00–10:45"),
+])
+def test_dashboard_stacks_place_above_time_in_separate_cells(portal_time, room, note, place, when):
+    data = parse_all(
+        "<table>"
+        "<tr><th>дата</th><th>время</th><th>под гр.</th><th>предмет</th>"
+        "<th>преподаватель</th><th>ауд.</th><th>комм.</th></tr>"
+        f"<tr><td>Пн</td><td>{portal_time}</td><td></td><td>(пр.) Проект</td>"
+        f"<td>Иванов И. И.</td><td>{room}</td><td>{note}</td></tr>"
+        "</table>"
+    )
+    rm = build_dashboard_rich_message(
+        data["schedule"], WEEK_1, "https://example.test", dt.date(2026, 8, 31),
+        current_date=dt.date(2026, 8, 31),
+    )
+    table = next(
+        block
+        for day in rm["rich_message"]["blocks"]
+        if day.get("type") == "details"
+        for block in day.get("blocks", [])
+        if block.get("type") == "table"
+    )
+    validate_rich_payload(rm)
+
+    assert len(table["cells"]) == 3
+    assert _plain({"text": table["cells"][0][2]["text"]}) == "место / время"
+    place_row, time_row = table["cells"][1:]
+    assert len(place_row) == 3
+    assert place_row[0]["rowspan"] == 2
+    assert place_row[1]["rowspan"] == 2
+    assert _plain({"text": place_row[2]["text"]}) == place
+    assert len(time_row) == 1
+    assert _plain({"text": time_row[0]["text"]}) == when
+    assert time_row[0]["text"] == [{"type": "code", "text": when}]
+    assert table["is_bordered"] is True
+    assert "ак. ч." not in when
 
 
 def test_semester_post_and_html_screenshot_use_the_same_intervals():
@@ -509,14 +624,16 @@ def _all_day_media():
 
 
 def _photos_by_day(blocks):
-    """Фото внутри дневных секций: [(summary секции, media, caption)]."""
+    """Одиночные скрины внутри раскрывающихся разделов дней."""
     out = []
     for block in blocks:
-        if block.get("type") != "details" or not block.get("summary"):
+        if block.get("type") != "details":
             continue
+        day = _plain(block.get("summary")).partition(" (")[0]
+        assert not block.get("is_open") and not block.get("open")
         for inner in block.get("blocks") or []:
-            if inner.get("type") == "photo":
-                out.append((block["summary"], inner["photo"]["media"], inner.get("caption", {}).get("text")))
+            if inner.get("type") == "photo" and "photo" in inner:
+                out.append((day, inner["photo"]["media"], inner.get("caption", {}).get("text")))
     return out
 
 
@@ -524,18 +641,20 @@ def test_changes_post_attaches_screens_only_for_changed_days():
     rm = build_changes_rich_message(
         _sample_diff(), [], "https://example.test",
         now=dt.datetime(2026, 9, 2, 12, 0),
-        screenshot_media=_all_day_media(),
+        screenshot_media=list(reversed(_all_day_media())),
     )
     blocks = rm["rich_message"]["blocks"]
     shots = _photos_by_day(blocks)
     # В диффе Вторник, Среда и Четверг — значит и скринов ровно три, по порядку недели.
-    assert [summary for summary, _, _ in shots] == [
-        "Вторник — 1 изменение", "Среда — 1 изменение", "Четверг — 1 изменение",
+    assert [day for day, _, _ in shots] == [
+        "Вторник", "Среда", "Четверг",
     ]
     assert [media for _, media, _ in shots] == [
         "attach://changes_screenshot_2", "attach://changes_screenshot_3", "attach://changes_screenshot_4",
     ]
-    assert all("Новое расписание" in json.dumps(caption, ensure_ascii=False) for _, _, caption in shots)
+    for day, _, caption in shots:
+        assert _plain(caption) == f"Новое расписание: {day} · оригинал на портале"
+        assert caption[2] == {"type": "url", "text": "портале", "url": "https://example.test"}
     blob = json.dumps(rm, ensure_ascii=False)
     # Понедельник, Пятница и Суббота не менялись — их скрины в пост не попали.
     for unused in ("changes_screenshot_1", "changes_screenshot_5", "changes_screenshot_6"):
@@ -558,7 +677,7 @@ def test_changes_post_reuses_one_screen_for_combined_day_label():
     )
     shots = _photos_by_day(rm["rich_message"]["blocks"])
     # одна картинка на два дня: вставляется в первый день, второму — пометка
-    assert [summary for summary, _, _ in shots] == ["Понедельник — 1 изменение"]
+    assert [day for day, _, _ in shots] == ["Понедельник"]
     blob = json.dumps(rm, ensure_ascii=False)
     assert "Скрин этого дня общий с Пн" in blob
     assert blob.count("attach://changes_screenshot_1") == 1
@@ -570,6 +689,173 @@ def test_changes_post_without_screens_stays_text_only():
                                     now=dt.datetime(2026, 9, 2, 12, 0))
     assert _photos_by_day(rm["rich_message"]["blocks"]) == []
     assert "photo" not in json.dumps(rm, ensure_ascii=False)
+
+
+def test_changes_post_comparisons_are_closed_and_ordered_before_after():
+    rm = build_changes_rich_message(
+        _sample_diff(), [], "https://example.test",
+        now=dt.datetime(2026, 9, 2, 12, 0),
+        screenshot_media=[
+            {"label": label, "source_url": "https://example.test", "after_media": f"attach://after_{index}",
+             "before_media": f"attach://before_{index}"}
+            for index, label in reversed(list(enumerate(["Вт", "Среда", "Чт"])))
+        ],
+    )
+    validate_rich_payload(rm)
+    # Сравнение живёт внутри раскрывающегося раздела дня, без вложенного details.
+    days = [block for block in rm["rich_message"]["blocks"] if block.get("type") == "details"]
+    assert [day["summary"].partition(" (")[0] for day in days] == ["Вторник", "Среда", "Четверг"]
+    slideshows = [
+        block for day in days for block in day["blocks"] if block.get("type") == "slideshow"
+    ]
+    assert len(slideshows) == 3
+    for index, slideshow in enumerate(slideshows):
+        assert [photo["photo"]["media"] for photo in slideshow["blocks"]] == [
+            f"attach://before_{index}", f"attach://after_{index}",
+        ]
+        day = ["Вторник", "Среда", "Четверг"][index]
+        assert [_plain(photo["caption"]) for photo in slideshow["blocks"]] == [
+            f"Было · {day}", f"Стало · {day}",
+        ]
+        assert "сначала старая версия, затем новая" in _plain(slideshow["caption"])
+    text = _plain(rm)
+    for legend in ("Жёлтым выделены", "светло-красным", "зелёным",
+                   "подсветка добавлена ботом", "Таблицы из сохранённых"):
+        assert legend not in text
+    assert "Их не подсвечиваем на скрине" not in text
+
+
+@pytest.mark.parametrize("versions", [("before", "after"), ("before",), ("after",)])
+@pytest.mark.parametrize("count", [1, 2])
+@pytest.mark.parametrize("highlighted", [None, False])
+def test_changes_post_comparison_removals_show_old_not_new(versions, count, highlighted):
+    diff = _sample_diff()
+    diff["added"] = []
+    diff["changed"] = []
+    diff["removed"] *= count
+    rm = build_changes_rich_message(
+        diff, [], "https://example.test", now=dt.datetime(2026, 9, 2, 12, 0),
+        screenshot_media=[{
+            "label": "Чт", "source_url": "https://example.test/snapshot",
+            "highlighted": highlighted,
+            **{f"{version}_media": f"attach://{version}" for version in versions},
+        }],
+    )
+    validate_rich_payload(rm)
+    text = _plain(rm)
+    assert "В новом расписании этого занятия нет." not in text
+    assert text.count("(пр.) Старый") == 0  # префикс вида выносится в контекст
+    assert text.count("«Старый» убрали совсем") == count
+    # Пропавшая пара показана одним зачёркнутым рядом «время, место».
+    assert text.count("в 15:00–16:45, ауд. 202") == count
+    struck = [node for node in _rich_nodes(rm) if node.get("type") == "strikethrough"]
+    assert [node["text"] for node in struck] == ["в 15:00–16:45, ауд. 202"] * count
+    assert "Убрано:" not in text
+    assert "В новом расписании её уже нет" not in text
+    assert "В новом расписании их уже нет" not in text
+    footer = rm["rich_message"]["blocks"][-1]
+    assert footer["type"] == "footer"
+    assert _plain(footer) == (
+        "Группа 6381 · 2 изменения · На портале" if count == 2 else "Группа 6381 · На портале"
+    )
+    assert "на скрине ниже" not in text
+    assert "Их не подсвечиваем" not in text
+    days = [block for block in rm["rich_message"]["blocks"] if block.get("type") == "details"]
+    assert len(days) == 1 and days[0]["summary"].startswith("Четверг (убрали пару")
+    assert not days[0].get("is_open") and not days[0].get("open")
+    photos = [node for node in _rich_nodes(rm) if node.get("type") == "photo" and "photo" in node]
+    assert [photo["photo"]["media"] for photo in photos] == [
+        f"attach://{version}" for version in versions
+    ]
+    # Текстовой легенды у сравнения больше нет: цвета видны на самих скринах.
+    assert "В «Стало» убранных строк уже нет" not in text
+    if len(versions) == 1:
+        assert not any(node.get("type") == "slideshow" for node in _rich_nodes(rm))
+        assert "Листай" not in text
+
+
+def test_changes_post_keeps_legacy_legends_separate_from_comparisons():
+    rm = build_changes_rich_message(
+        _sample_diff(), [], "https://example.test", now=dt.datetime(2026, 9, 2, 12, 0),
+        screenshot_media=[
+            {"label": "Вт", "media": "attach://legacy_added", "marked": 1, "kinds": ["added"]},
+            {"label": "Ср", "before_media": "attach://before", "after_media": "attach://after",
+             "source_url": "https://example.test", "marked": 1, "kinds": ["changed"]},
+            {"label": "Чт", "media": "attach://legacy_removed"},
+        ],
+    )
+    validate_rich_payload(rm)
+    text = _plain(rm)
+    # Сравнение «Было/Стало» больше не печатает текстовую легенду: только скрины.
+    assert "Жёлтым выделены" not in text
+    assert "зелёным новые пары" in text
+    assert "оранжевым" not in text.casefold()
+    assert "Зелёным помечены новые пары" not in text
+    assert "Пояснения" not in text
+    assert "на скрине ниже её уже нет" not in text
+    assert "Их не подсвечиваем на скрине" not in text
+    shots = _photos_by_day(rm["rich_message"]["blocks"])
+    assert [(day, media) for day, media, _ in shots] == [
+        ("Вторник", "attach://legacy_added"), ("Четверг", "attach://legacy_removed"),
+    ]
+    assert _plain(shots[0][2]).endswith(" · зелёным новые пары")
+    assert _plain(shots[1][2]) == "Новое расписание: Четверг · оригинал на портале"
+    assert all("жёлтым" not in _plain(caption).casefold() for _, _, caption in shots)
+
+
+@pytest.mark.parametrize("metadata", [
+    {"before_kinds": [], "after_kinds": []},
+    {"before_kinds": ["changed"], "after_kinds": []},
+    {"before_kinds": [], "after_kinds": ["changed"]},
+    {"before_kinds": ["removed"], "after_kinds": []},
+    {"before_kinds": [], "after_kinds": ["added"]},
+    {"before_kinds": ["changed", "removed"], "after_kinds": ["added"]},
+    {"before_kinds": ["changed"], "after_kinds": [], "before_media": ""},
+    {"before_kinds": [], "after_kinds": ["changed"], "after_media": ""},
+])
+def test_changes_post_comparison_has_no_text_legend(metadata):
+    """Сравнение «Было/Стало» — только скрины, без текстовой легенды подсветки."""
+    diff = _sample_diff()
+    for kind in ("added", "removed", "changed"):
+        diff[kind][0]["day"] = "Четверг"
+    rm = build_changes_rich_message(
+        diff, [], "https://example.test", now=dt.datetime(2026, 9, 2, 12, 0),
+        screenshot_media=[{
+            "label": "Чт", "source_url": "https://example.test",
+            "before_media": "attach://before", "after_media": "attach://after", **metadata,
+        }],
+    )
+    validate_rich_payload(rm)
+    text = _plain(rm).casefold()
+    for word in ("жёлтым", "зелёным", "светло-красным", "оранжевым",
+                 "подсветка добавлена ботом", "таблицы из сохранённых", "открыть актуальную"):
+        assert word not in text
+
+
+@pytest.mark.parametrize("before_kinds, after_kinds", [(["removed"], ["added"]), ([], [])])
+def test_changes_post_comparison_uses_applied_kinds_for_moves(before_kinds, after_kinds):
+    lesson = _sample_diff()["removed"][0]
+    diff = {
+        "added": [{**lesson, "time": "17:00 18:00"}],
+        "removed": [lesson], "changed": [], "transition": None,
+    }
+    rm = build_changes_rich_message(
+        diff, [], "https://example.test", now=dt.datetime(2026, 9, 2, 12, 0),
+        screenshot_media=[{
+            "label": "Чт", "source_url": "https://example.test",
+            "before_media": "attach://before", "after_media": "attach://after",
+            "before_kinds": before_kinds, "after_kinds": after_kinds,
+        }],
+    )
+    validate_rich_payload(rm)
+    days = [block for block in rm["rich_message"]["blocks"] if block.get("type") == "details"]
+    assert [day["summary"] for day in days] == ["Четверг (перенесли пару)"]
+    text = _plain(rm)
+    assert "перенесли: 15:00–16:45 → 17:00–18:45" in text
+    assert "1. " not in text and "1 изменение" not in text
+    # Легенды у сравнения нет независимо от того, что именно подсвечено.
+    for word in ("жёлтым", "зелёным", "оранжевым", "светло-красным"):
+        assert word not in text.casefold()
 
 
 def test_pick_day_screens_understands_combined_labels():
@@ -703,22 +989,31 @@ def test_changes_post_promises_highlight_only_when_screens_are_marked():
         diff, [], "https://example.test", now=now,
         screenshot_media=[{"label": "Вт", "media": "attach://changes_screenshot_1", "marked": 1}],
     )
+    validate_rich_payload(marked)
     blob = json.dumps(marked, ensure_ascii=False)
-    # пояснение про цвета теперь один раз внизу, а не в каждом дне
-    assert "Зелёным помечены новые пары" in blob
-    assert "оранжевым — поправленные" in blob
-    assert "зелёным новые пары, оранжевым правки" in blob
-    assert "Пояснения" in blob
+    shots = _photos_by_day(marked["rich_message"]["blocks"])
+    assert len(shots) == 1
+    assert _plain(shots[0][2]) == (
+        "Новое расписание: Вторник · оригинал на портале · зелёным новые пары, оранжевым правки"
+    )
+    assert blob.count("зелёным новые пары, оранжевым правки") == 1
+    assert "Зелёным помечены новые пары" not in blob
+    assert "оранжевым — поправленные" not in blob
+    assert "Пояснения" not in blob
 
     clean = build_changes_rich_message(
         diff, [], "https://example.test", now=now,
         screenshot_media=[{"label": "Вт", "media": "attach://changes_screenshot_1", "marked": 0}],
     )
+    validate_rich_payload(clean)
     clean_blob = json.dumps(clean, ensure_ascii=False)
     # чистый скрин (chromium упал) — никаких обещаний про подсветку
     assert "зелёным" not in clean_blob
     assert "оранжевым" not in clean_blob
     assert "attach://changes_screenshot_1" in clean_blob
+    clean_shots = _photos_by_day(clean["rich_message"]["blocks"])
+    assert len(clean_shots) == 1
+    assert _plain(clean_shots[0][2]) == "Новое расписание: Вторник · оригинал на портале"
 
     without_media = json.dumps(
         build_changes_rich_message(diff, [], "https://example.test", now=now),
@@ -728,7 +1023,7 @@ def test_changes_post_promises_highlight_only_when_screens_are_marked():
     assert "оранжевым" not in without_media
 
 
-def test_moved_pair_is_one_card_not_two_rows():
+def test_moved_pair_is_one_entry_not_two_rows():
     """Перенос пары — одна правка «было → стало», а не «убрали» + «добавили»."""
     lesson = {
         "day": "Четверг", "subject": "(пр.) География туризма", "subgroup": "",
@@ -742,20 +1037,32 @@ def test_moved_pair_is_one_card_not_two_rows():
     rm = build_changes_rich_message(
         diff, [], "https://example.test", now=dt.datetime(2026, 9, 3, 12, 0),
     )
+    validate_rich_payload(rm)
     blocks = rm["rich_message"]["blocks"]
-    day = next(b for b in blocks if b.get("type") == "details")
-    # обе записи склеены в один перенос, поэтому и заголовок про одно изменение
-    assert day["summary"] == "Четверг — 1 изменение"
-    card = _plain(day["blocks"][0])
-    assert "1. Перенесли" in card
-    assert "(пр.) География туризма" in card
-    assert "время: 11:00–12:45 → 17:00–18:45" in card
-    blob = json.dumps(rm, ensure_ascii=False)
-    # старую пару не выдаём за отдельное «убрали»
-    assert "Убрали" not in blob
-    # пояснение про перенос — один раз внизу, не в каждом дне
-    assert "Почему «перенесли», а не «убрали и добавили»" in blob
-    assert blob.count("Портал не пишет «перенос»") == 1
+    days = [block for block in blocks if block.get("type") == "details"]
+    assert [day["summary"] for day in days] == ["Четверг (перенесли пару)"]
+    sentence = days[0]["blocks"][0]
+    assert sentence["type"] == "paragraph"
+    assert _plain(sentence) == (
+        "Пару «География туризма» перенесли: 11:00–12:45 → 17:00–18:45."
+    )
+    assert {"type": "strikethrough", "text": "11:00–12:45"} in sentence["text"]
+    assert {"type": "bold", "text": "17:00–18:45"} in sentence["text"]
+    # Преподаватель не менялся — его нет в посте; место то же — молчим.
+    text = _plain(rm)
+    assert "Ефимов" not in text
+    assert "Антоново" not in text and "ауд. 418" not in text
+    assert text.count("География туризма") == 1
+    assert text.count("17:00–18:45") == 1
+    assert "убрали" not in text.casefold() and "добавили" not in text.casefold()
+    assert "1. " not in text and "1 изменение" not in text
+    assert "Пояснения" not in text and "Портал не пишет «перенос»" not in text
+    assert blocks[-1]["type"] == "footer"
+    assert _plain(blocks[-1]) == "Группа 6381 · На портале"
+    fallback = changes_fallback_text(diff, "https://example.test")
+    assert fallback.count("<b>Четверг (перенесли пару)</b>") == 1
+    assert "перенесли: <s>11:00–12:45</s> → <b>17:00–18:45</b>" in fallback
+    assert "убрали" not in fallback.casefold() and "добавили" not in fallback.casefold()
 
 
 def test_real_removal_stays_removal():
@@ -766,18 +1073,28 @@ def test_real_removal_stays_removal():
                      "teacher": "Иванов И. И.", "room": "1306", "location": ""}],
         "changed": [], "transition": None,
     }
-    blob = json.dumps(
-        build_changes_rich_message(diff, [], "https://example.test",
-                                   now=dt.datetime(2026, 9, 3, 12, 0)),
-        ensure_ascii=False,
+    rm = build_changes_rich_message(
+        diff, [], "https://example.test", now=dt.datetime(2026, 9, 3, 12, 0),
     )
-    assert "1. Убрали" in blob
-    assert "(лек.) Экономика" in blob
-    assert "этой пары в новом расписании нет" in blob
-    assert "Перенесли" not in blob
+    validate_rich_payload(rm)
+    blocks = rm["rich_message"]["blocks"]
+    days = [block for block in blocks if block.get("type") == "details"]
+    assert [day["summary"] for day in days] == ["Пятница (убрали пару)"]
+    assert days[0]["blocks"] == [{
+        "type": "paragraph",
+        "text": ["«", {"type": "bold", "text": "Экономика"}, "»", " убрали совсем",
+                 ": была ", {"type": "strikethrough", "text": "в 09:00–10:45, ауд. 1306"}, "."],
+    }]
+    text = _plain(rm)
+    assert "В новом расписании этого занятия нет." not in text
+    assert "09:00–10:45" in text and "ауд. 1306" in text
+    assert "Иванов" not in text
+    assert "перенесли" not in text.casefold()
+    assert "1. " not in text and "1 изменение" not in text
+    assert "Убрано:" not in text and "Пояснения" not in text
 
 
-def test_rename_on_both_weeks_is_one_card():
+def test_rename_on_both_weeks_is_one_entry():
     """Переименование пришло в верх и низ недели — одна карточка, а не две."""
     base = {
         "day": "Понедельник", "time": "09:00 10:00", "subgroup": "",
@@ -801,31 +1118,42 @@ def test_rename_on_both_weeks_is_one_card():
     }
     rm = build_changes_rich_message(diff, [], "https://example.test",
                                     now=dt.datetime(2026, 9, 4, 11, 33))
+    validate_rich_payload(rm)
     blocks = rm["rich_message"]["blocks"]
-    day = next(b for b in blocks if b.get("type") == "details")
-    assert day["summary"] == "Понедельник — 1 изменение"
-    cards = [b for b in day["blocks"] if b.get("type") == "blockquote"]
-    assert len(cards) == 1
-    card = _plain(cards[0])
-    # глагол по смыслу правки: название сменилось, остальное на месте
-    assert "1. Переименовали: (пр.) Иностранный язык" in card
-    assert "обе недели" in card
-    assert "было: (пр.) Иностранные языки в сфере профессиональной коммуникации" in card
-    assert "верхняя неделя — ауд. 1318, Антоново" in card
-    # пустая аудитория портала — прочерк, поэтому место названо форматом
-    assert "нижняя неделя — дистанционно" in card
-    assert "немецкий язык" in card
-    assert "немец. яз" not in card
-    assert "кто ведёт: Барышева Ангелина Алексеевна" in card
-    # шапка и «Коротко» считают одну правку, а не четыре записи портала
-    assert "1 изменение" in _plain(blocks[0])
-    overview = _plain(next(b for b in blocks if b.get("type") == "list"))
-    assert "переименовали" in overview
-    assert "изменили" not in overview
+    days = [block for block in blocks if block.get("type") == "details"]
+    assert [day["summary"] for day in days] == ["Понедельник (переименовали пару)"]
+    inner = days[0]["blocks"]
+    assert inner[0]["type"] == "paragraph"
+    assert _plain(inner[0]) == (
+        "Пару «(пр.) Иностранные языки в сфере профессиональной коммуникации» "
+        "(пр., 09:00–10:45 · обе недели) переименовали: теперь «Иностранный язык»."
+    )
+    assert {"type": "strikethrough",
+            "text": "(пр.) Иностранные языки в сфере профессиональной коммуникации"} in inner[0]["text"]
+    assert {"type": "bold", "text": "Иностранный язык"} in inner[0]["text"]
+    # Разные недели — разные места: показываем построчно, без слэша.
+    assert _plain(inner[1]) == "Верхняя неделя: ауд. 1318, Антоново\nНижняя неделя: ДОТ"
+    assert _plain(inner[2]) == "немецкий язык"
+    text = _plain(rm)
+    assert "Барышева" not in text
+    assert text.count("Иностранный язык") == 1
+    assert "Раньше:" not in text
+    assert "немец. яз" not in text
+    assert "1 изменение" not in text and "1. " not in text
+    assert not any(node.get("type") in {"list", "blockquote", "pullquote"} for node in _rich_nodes(rm))
+    assert blocks[-1]["type"] == "footer"
+    assert _plain(blocks[-1]) == "Группа 6381 · На портале"
+    fallback = changes_fallback_text(diff, "https://example.test")
+    assert fallback.count("<b>Понедельник (переименовали пару)</b>") == 1
+    assert fallback.count("<b>Иностранный язык</b>") == 1
+    assert ("«<s>(пр.) Иностранные языки в сфере профессиональной коммуникации</s>»"
+            in fallback)
+    assert "Верхняя неделя: ауд. 1318, Антоново\nНижняя неделя: ДОТ" in fallback
 
 
-def test_changes_post_names_only_the_colors_actually_marked():
-    """Подпись и пояснение обещают только те цвета, что легли на скрин."""
+@pytest.mark.parametrize("clean_metadata", [{}, {"kinds": ["changed"]}], ids=["unknown-kinds", "known-kinds"])
+def test_changes_post_names_only_the_colors_actually_marked(clean_metadata):
+    """Only the screenshot caption describes the colors actually applied."""
     diff = {
         "added": [], "removed": [], "transition": None,
         "changed": [{"day": "Понедельник", "time": "09:00 10:00", "subject": "(пр.) Иностранный язык",
@@ -834,23 +1162,33 @@ def test_changes_post_names_only_the_colors_actually_marked():
                      "fields": [["предмет", "старое", "новое"]]}],
     }
     now = dt.datetime(2026, 9, 4, 11, 33)
-    changed_only = json.dumps(build_changes_rich_message(
+    changed_only = build_changes_rich_message(
         diff, [], "https://example.test", now=now,
         screenshot_media=[{"label": "Пн", "media": "attach://changes_screenshot_1",
                            "marked": 2, "kinds": ["changed"]}],
-    ), ensure_ascii=False)
-    assert "оранжевым правки" in changed_only
-    assert "Оранжевым помечены поправленные пары" in changed_only
-    assert "зелёным" not in changed_only and "Зелёным" not in changed_only
+    )
+    validate_rich_payload(changed_only)
+    shots = _photos_by_day(changed_only["rich_message"]["blocks"])
+    assert len(shots) == 1
+    assert _plain(shots[0][2]) == "Новое расписание: Понедельник · оригинал на портале · оранжевым правки"
+    text = _plain(changed_only)
+    assert text.count("оранжевым правки") == 1
+    assert "Оранжевым помечены поправленные пары" not in text
+    assert "Пояснения" not in text
+    assert "зелёным" not in text.casefold() and "жёлтым" not in text.casefold()
 
-    clean = json.dumps(build_changes_rich_message(
+    clean = build_changes_rich_message(
         diff, [], "https://example.test", now=now,
         screenshot_media=[{"label": "Пн", "media": "attach://changes_screenshot_1",
-                           "marked": 1, "highlighted": False}],
-    ), ensure_ascii=False)
+                           "marked": 1, "highlighted": False, **clean_metadata}],
+    )
+    validate_rich_payload(clean)
     # чистый скрин из общего кеша: красок на нём нет, обещать их нельзя
-    assert "зелёным" not in clean and "оранжевым" not in clean
-    assert "attach://changes_screenshot_1" in clean
+    assert "зелёным" not in _plain(clean) and "оранжевым" not in _plain(clean)
+    shots = _photos_by_day(clean["rich_message"]["blocks"])
+    assert len(shots) == 1
+    assert shots[0][1] == "attach://changes_screenshot_1"
+    assert _plain(shots[0][2]) == "Новое расписание: Понедельник · оригинал на портале"
 
 
 def _week_tail_timetable() -> dict:
@@ -878,16 +1216,10 @@ WEEK_TAIL = [{"week": 1, "half": "top", "start": "01.09.2026", "end": "05.09.202
 
 
 def _dashboard_day_summaries(rm) -> list[str]:
-    def walk(blocks):
-        for block in blocks:
-            yield block
-            if block.get("type") == "details":
-                yield from walk(block.get("blocks") or [])
-
     return [
-        str(block.get("summary"))
-        for block in walk(rm["rich_message"]["blocks"])
-        if block.get("type") == "details" and isinstance(block.get("summary"), str)
+        _plain(block.get("summary"))
+        for block in rm["rich_message"]["blocks"]
+        if block.get("type") == "details"
     ]
 
 
@@ -899,9 +1231,11 @@ def test_dashboard_shows_whole_week_before_it_starts():
     )
     days = _dashboard_day_summaries(rm)
     assert [item for item in days if "Скрин" not in item] == [
-        "Четверг — 03.09: 1 пара", "Пятница — 04.09: 1 пара", "Суббота — 05.09: 1 пара",
+        "ЧЕТВЕРГ · 03.09  ·  1 пара",
+        "ПЯТНИЦА · 04.09  ·  1 пара",
+        "СУББОТА · 05.09  ·  1 пара",
     ]
-    assert "Полное расписание" in json.dumps(rm, ensure_ascii=False)
+    assert "На неделе:" in json.dumps(rm, ensure_ascii=False)
 
 
 def test_dashboard_drops_past_days_after_midnight_msk():
@@ -914,13 +1248,14 @@ def test_dashboard_drops_past_days_after_midnight_msk():
     )
     days = _dashboard_day_summaries(rm)
     assert [item for item in days if "Скрин" not in item] == [
-        "Пятница — 04.09: 1 пара", "Суббота — 05.09: 1 пара",
+        "ПЯТНИЦА · 04.09  ·  1 пара",
+        "СУББОТА · 05.09  ·  1 пара",
     ]
     assert "Четверг" not in json.dumps(rm, ensure_ascii=False)
     blob = json.dumps(rm, ensure_ascii=False)
     # Подпись раздела не обещает полное расписание, если часть дней уже прошла.
-    assert "Расписание до конца недели" in blob
-    assert "Полное расписание" not in blob
+    assert "Осталось:" in blob
+    assert "На неделе:" not in blob
 
 
 def test_dashboard_says_week_is_over_when_every_day_is_past():
@@ -958,10 +1293,10 @@ def test_dashboard_dot_pair_shows_place_and_drops_dot_note():
     blob = json.dumps(rm, ensure_ascii=False)
     # Предмет без [ДОТ], формат передан местом, примечание про ДОТ не дублируется.
     assert "[ДОТ]" not in blob
-    assert "дистанционно" in blob
+    assert "ДОТ" in blob
     assert "с использованием ДОТ" not in blob
-    assert "(лек.) История России" in blob
-    assert "(пр.) Философия" in blob
+    assert '"text": "ЛЕК."' in blob and "История России" in blob
+    assert '"text": "ПР."' in blob and "Философия" in blob
 
 
 def test_dashboard_today_disappears_after_last_pair():
@@ -973,12 +1308,13 @@ def test_dashboard_today_disappears_after_last_pair():
         current_date=friday, now=dt.datetime(2026, 9, 4, 14, 30),
     )
     assert [s for s in _dashboard_day_summaries(before) if "Скрин" not in s] == [
-        "Пятница — 04.09: 1 пара", "Суббота — 05.09: 1 пара",
+        "ПЯТНИЦА · 04.09  ·  1 пара",
+        "СУББОТА · 05.09  ·  1 пара",
     ]
     after = build_dashboard_rich_message(
         data["schedule"], WEEK_TAIL, "https://example.test", friday,
         current_date=friday, now=dt.datetime(2026, 9, 4, 15, 46),
     )
     assert [s for s in _dashboard_day_summaries(after) if "Скрин" not in s] == [
-        "Суббота — 05.09: 1 пара",
+        "СУББОТА · 05.09  ·  1 пара",
     ]

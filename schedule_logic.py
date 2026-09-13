@@ -2,8 +2,12 @@
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
+import json
 import re
 import zoneinfo
+
+DASHBOARD_PRESENTATION_VERSION = 11
 from typing import Any
 
 import bells
@@ -44,19 +48,20 @@ _MONTHS = {
     "сентября": 9, "октября": 10, "ноября": 11, "декабря": 12,
 }
 _END_DATE_RE = re.compile(rf"(?<!с\s)\bпо\s+({_DATE_TOKEN})", re.I)
-_AFTER_WEEK_RE = re.compile(r"после\s+(\d+)\s+недел", re.I)
-_UNTIL_WEEK_RE = re.compile(r"до\s+(\d+)\s+недел", re.I)
+_WEEK_ORDINAL_SUFFIX = r"(?:-?(?:й|ой))?"
+_AFTER_WEEK_RE = re.compile(rf"после\s+(\d+){_WEEK_ORDINAL_SUFFIX}\s+недел", re.I)
+_UNTIL_WEEK_RE = re.compile(rf"до\s+(\d+){_WEEK_ORDINAL_SUFFIX}\s+недел", re.I)
 # «с 10 недели» — портал так отмечает пары, которые начинаются не с первой
 # учебной недели (реальный пример: «с 10 недели», «с 9 недели, с
 # использованием ДОТ»). До этого фикса такие пары молча показывались с 1
 # недели — сравнение было строгое неравенство (>) вместо (>=), потому что
 # сама неделя N уже включена в диапазон действия пары.
-_FROM_WEEK_RE = re.compile(r"\bс\s+(\d+)\s+недел", re.I)
+_FROM_WEEK_RE = re.compile(rf"\bс\s+(\d+){_WEEK_ORDINAL_SUFFIX}\s+недел", re.I)
 
 
 def parse_user_date(value: str | None, *, today: dt.date | None = None) -> dt.date:
     """Parse relative dates, ISO dates, and Russian DD.MM forms."""
-    base = today or dt.date.today()
+    base = today or dt.datetime.now(zoneinfo.ZoneInfo("Europe/Moscow")).date()
     if not value or str(value).strip().lower() in {"today", "сегодня"}:
         return base
     raw = str(value).strip().lower()
@@ -100,6 +105,22 @@ def find_week(weeks: list[dict], target: dt.date) -> dict | None:
     return None
 
 
+def find_current_or_next_week(weeks: list[dict], target: dt.date) -> dict | None:
+    """Select by portal calendar dates, independent of lessons and list order."""
+    upcoming = None
+    upcoming_start = None
+    for week in weeks:
+        bounds = _week_dates(week)
+        if not bounds or bounds[0] > bounds[1]:
+            continue
+        start, end = bounds
+        if start <= target <= end:
+            return week
+        if start > target and (upcoming_start is None or start < upcoming_start):
+            upcoming, upcoming_start = week, start
+    return upcoming
+
+
 def find_week_by_number(weeks: list[dict], number: int) -> dict | None:
     for week in weeks:
         if week.get("week") == number:
@@ -109,7 +130,7 @@ def find_week_by_number(weeks: list[dict], number: int) -> dict | None:
 
 def calendar_bounds(weeks: list[dict]) -> tuple[dt.date, dt.date] | None:
     bounds = [_week_dates(week) for week in weeks]
-    valid = [item for item in bounds if item]
+    valid = [item for item in bounds if item and item[0] <= item[1]]
     if not valid:
         return None
     starts, ends = zip(*valid)
@@ -159,16 +180,80 @@ def visible_week_days(
     return live
 
 
+def resolve_dashboard_view(
+    schedule: dict | None,
+    weeks: list[dict],
+    now: dt.datetime | None = None,
+) -> dict:
+    """Resolve the next useful dashboard date and its still-live lesson days."""
+    tz = zoneinfo.ZoneInfo("Europe/Moscow")
+    if now is None:
+        current = dt.datetime.now(tz)
+    elif now.tzinfo is None:
+        current = now.replace(tzinfo=tz)
+    else:
+        current = now.astimezone(tz)
+    bounds = calendar_bounds(weeks)
+    if not bounds:
+        return {"target_date": current.date(), "week": None, "live_days": []}
+
+    first, last = bounds
+    cursor = max(first, current.date())
+    target_date = None
+    while cursor <= last:
+        week, lessons = lessons_for_date(schedule, weeks, cursor)
+        if week is not None and lessons:
+            if cursor != current.date():
+                target_date = cursor
+                break
+            end = day_last_pair_end(lessons)
+            if end is None or current.time() < end:
+                target_date = cursor
+                break
+        cursor += dt.timedelta(days=1)
+
+    if target_date is None:
+        return {"target_date": current.date(), "week": None, "live_days": []}
+    week = find_week(weeks, target_date)
+    live_days = visible_week_days(
+        weeks,
+        target_date,
+        current.date(),
+        schedule=schedule,
+        now=current,
+    )
+    return {"target_date": target_date, "week": week, "live_days": live_days}
+
+
+def dashboard_presentation_fingerprint(content_fingerprint: str, view: dict) -> str:
+    """Hash only values whose change requires editing the pinned post."""
+    week = view.get("week") or {}
+    payload = {
+        "version": DASHBOARD_PRESENTATION_VERSION,
+        "content": content_fingerprint,
+        "target_date": str(view.get("target_date") or ""),
+        "week": {key: week.get(key) for key in ("week", "half", "start", "end")},
+        "live_days": list(view.get("live_days") or []),
+    }
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
 def _parse_note_date(
     token: str,
     default_year: int,
     bounds: tuple[dt.date, dt.date] | None = None,
+    *,
+    strict: bool = False,
 ) -> dt.date | None:
+    """Resolve a note date; strict mode forbids missing or ambiguous years."""
     m = _DATE_RE.fullmatch(token.strip())
     if not m:
         return None
     day, month, year = int(m.group(1)), int(m.group(2)), m.group(3)
     if year:
+        if strict and len(year) not in {2, 4}:
+            return None
         full_year = int(year)
         if full_year < 100:
             full_year += 2000
@@ -191,9 +276,13 @@ def _parse_note_date(
                 continue
             if first_month <= (candidate_year, month) <= last_month:
                 candidates.append(candidate)
+        if strict:
+            return candidates[0] if len(candidates) == 1 else None
         if candidates:
             return min(candidates, key=lambda item: abs(item.year - default_year))
 
+    if strict:
+        return None
     try:
         return dt.date(default_year, month, day)
     except ValueError:
@@ -284,28 +373,155 @@ def lesson_applies_on(
     week: dict | None,
     bounds: tuple[dt.date, dt.date] | None = None,
 ) -> bool:
-    if week is None:
+    return lesson_non_applicability_reason(lesson, target, week, bounds) is None
+
+
+def lesson_has_expired(
+    lesson: dict,
+    target: dt.date,
+    week: dict | None,
+    bounds: tuple[dt.date, dt.date] | None = None,
+) -> bool:
+    """Prove that explicit positive deadlines have passed, without editing a row.
+
+    This is not non-applicability: parity, starts and cancellations never prove
+    expiry. Yearless dates require unambiguous *full academic calendar* bounds,
+    never just the selected week. Unknown/partial conditions keep the row.
+    """
+    if bounds is not None and (
+        len(bounds) != 2
+        or any(type(value) is not dt.date for value in bounds)
+        or bounds[0] > bounds[1]
+    ):
         return False
+
+    expired: list[bool] = []
+    date_parts = _date_condition_parts(lesson)
+    condition_text = " ".join(date_parts)
+    for pattern in (_UNTIL_WEEK_RE, _FROM_WEEK_RE, _AFTER_WEEK_RE):
+        for match in pattern.finditer(condition_text):
+            number = int(match.group(1))
+            raw_week = str((week or {}).get("week") or "")
+            if number < 1 or not re.fullmatch(r"[0-9]+", raw_week) or int(raw_week) < 1:
+                return False
+            current = int(raw_week)
+            if pattern is _UNTIL_WEEK_RE:
+                expired.append(current >= number)
+            elif current < number or (pattern is _AFTER_WEEK_RE and current == number):
+                return False
+
+    for value in date_parts:
+        # Do not silently discard an invalid member of an otherwise valid list.
+        dates = {}
+        for match in _DATE_RE.finditer(value):
+            token = match.group(0)
+            if re.match(r"\.?\w", value[match.end():]):
+                return False
+            parsed = _parse_note_date(token, target.year, bounds, strict=True)
+            if parsed is None:
+                return False
+            dates[token] = parsed
+
+        text = _CANCELLED_DATES_RE.sub(" ", value)
+        # Unsupported negations/cancellation wording cannot supply a positive
+        # deadline. In particular, a cancelled range is not an occurrence range.
+        if re.search(r"\b(?:не|нет|без|кроме|отмен\w*|перен\w*|исключ\w*|или)\b", text, re.I):
+            return False
+
+        for match in _RANGE_RE.finditer(text):
+            start = dates[match.group("from") or match.group("dash_from")]
+            end = dates[match.group("to") or match.group("dash_to")]
+            # Calendar-based resolution already handles Dec-Jan. Do not turn
+            # a reversed/malformed range into an invented extra year.
+            if end < start:
+                return False
+            expired.append(target > end)
+        text = _RANGE_RE.sub(" ", text)
+
+        for match in _START_DATE_RE.finditer(text):
+            if target < dates[match.group(1)]:
+                return False
+        text = _START_DATE_RE.sub(" ", text)
+        for match in _END_DATE_RE.finditer(text):
+            expired.append(target > dates[match.group(1)])
+        text = _END_DATE_RE.sub(" ", text)
+
+        for pattern in (_ONLY_DATES_RE, _DATE_LIST_RE):
+            for match in pattern.finditer(text):
+                expired.extend(
+                    target > dates[token.group(0)]
+                    for token in _DATE_RE.finditer(match.group("dates"))
+                )
+            text = pattern.sub(" ", text)
+
+        for match in _START_MONTH_RE.finditer(text):
+            month = _MONTHS[match.group(1).lower()]
+            start = _parse_note_date(f"01.{month:02d}", target.year, bounds, strict=True)
+            if start is None or target < start:
+                return False
+        text = _START_MONTH_RE.sub(" ", text)
+        for pattern in (_UNTIL_WEEK_RE, _FROM_WEEK_RE, _AFTER_WEEK_RE):
+            text = pattern.sub(" ", text)
+        text = re.sub(r"\bпо\s+(?:верхней|нижней)\s+недел[еи]\b", " ", text, flags=re.I)
+        # This known delivery phrase is not a date-start condition.
+        text = re.sub(r"\bс\s+использованием\s+ДОТ\b", " ", text, flags=re.I)
+        # Leftover dates or condition markers mean a list/range was only partly
+        # understood. Ordinary titles and location prose do not imply expiry.
+        if re.search(
+            r"\d[./-]|(?:[,;]|\bи\b)\s*\d|"
+            r"\b(?:только|с|по|до|после|недел\w*|уточн\w*|далее|позже|ежегодно)\b",
+            text, re.I,
+        ):
+            return False
+
+    return bool(expired) and all(expired)
+
+
+def _short_date(value: dt.date) -> str:
+    return value.strftime("%d.%m")
+
+
+def _week_condition_tag(prefix: str, number: int) -> str:
+    # Non-breaking hyphen keeps ``9‑Й`` together in narrow screenshot cells.
+    return f"НЕ НА ЭТОЙ НЕДЕЛЕ · {prefix} {number}‑Й НЕДЕЛИ"
+
+
+def lesson_non_applicability_reason(
+    lesson: dict,
+    target: dt.date,
+    week: dict | None,
+    bounds: tuple[dt.date, dt.date] | None = None,
+) -> str | None:
+    """Explain why a lesson is inactive on ``target``; ``None`` means active.
+
+    This is the same evaluator used by ``lesson_applies_on``. Keeping the
+    contextual reason here prevents screenshot code from guessing whether an
+    inactive row failed parity, an academic-week boundary, or a calendar date.
+    """
+    if week is None:
+        return "ВНЕ УЧЕБНОГО КАЛЕНДАРЯ"
     if bounds is None:
         bounds = _week_dates(week)
 
     condition_text = _condition_text(lesson)
     low = condition_text.lower()
-    half = week.get("half")
-    parity = lesson_parity(lesson)
-    if parity in {"top", "bottom"} and half != parity:
-        return False
 
     week_number = int(week.get("week") or 0)
     after_match = _AFTER_WEEK_RE.search(low)
     if after_match and week_number <= int(after_match.group(1)):
-        return False
+        return _week_condition_tag("ПОСЛЕ", int(after_match.group(1)))
     until_match = _UNTIL_WEEK_RE.search(low)
     if until_match and week_number >= int(until_match.group(1)):
-        return False
+        return _week_condition_tag("ДО", int(until_match.group(1)))
     from_match = _FROM_WEEK_RE.search(low)
     if from_match and week_number < int(from_match.group(1)):
-        return False
+        return _week_condition_tag("С", int(from_match.group(1)))
+
+    half = week.get("half")
+    parity = lesson_parity(lesson)
+    if parity in {"top", "bottom"} and half != parity:
+        label = "ВЕРХНЯЯ" if parity == "top" else "НИЖНЯЯ"
+        return f"НЕ НА ЭТОЙ НЕДЕЛЕ · ТОЛЬКО {label}"
 
     date_parts = _date_condition_parts(lesson)
     ranges: list[tuple[dt.date, dt.date]] = []
@@ -325,14 +541,15 @@ def lesson_applies_on(
                     pass
             ranges.append((start, end))
     if ranges and not any(start <= target <= end for start, end in ranges):
-        return False
+        start, end = ranges[0]
+        return f"НЕ В ЭТУ ДАТУ · {_short_date(start)}–{_short_date(end)}"
 
     cancelled_dates: set[dt.date] = set()
     for text in date_parts:
         for match in _CANCELLED_DATES_RE.finditer(text):
             cancelled_dates.update(_parsed_dates(match.group("dates"), target.year, bounds))
     if target in cancelled_dates:
-        return False
+        return f"ЗАНЯТИЯ НЕ БУДЕТ · {_short_date(target)}"
 
     # A range's opening "с DD.MM" is not a separate lower-bound condition.
     without_ranges = [_RANGE_RE.sub(" ", text) for text in date_parts]
@@ -352,7 +569,7 @@ def lesson_applies_on(
             if parsed is not None:
                 start_dates.append(parsed)
     if start_dates and target < max(start_dates):
-        return False
+        return f"НЕ В ЭТУ ДАТУ · С {_short_date(max(start_dates))}"
 
     # A bare "по DD.MM" (no matching "с DD.MM" range) marks the last date the
     # lesson happens — portal example: «По 30.09», «ул. Псковская д.3 по
@@ -369,13 +586,19 @@ def lesson_applies_on(
         if parsed is not None
     ]
     if end_dates and target > min(end_dates):
-        return False
+        return f"НЕ В ЭТУ ДАТУ · ПО {_short_date(min(end_dates))}"
 
     has_exact_context, exact_dates = _explicit_lesson_dates(lesson, target, bounds)
     if has_exact_context:
-        return target in exact_dates
+        if target in exact_dates:
+            return None
+        dates = sorted(exact_dates)
+        suffix = ", ".join(_short_date(value) for value in dates[:4])
+        if len(dates) > 4:
+            suffix += "…"
+        return f"ТОЛЬКО ПО ДАТАМ · {suffix}" if suffix else "ТОЛЬКО ПО УКАЗАННЫМ ДАТАМ"
 
-    return True
+    return None
 
 
 def _lesson_subject(lesson: dict) -> str:
@@ -504,10 +727,30 @@ def normalise_lesson(lesson: dict) -> dict:
     }
 
 
-# Даты без регулярных пар (День знаний и т.п.)
-HOLIDAYS = {
-    dt.date(2026, 9, 1),   # 1 сентября — День знаний, регулярных пар нет
-}
+def _load_holidays() -> set[dt.date]:
+    """Load academic holidays from versioned knowledge data.
+
+    Falls back to a known default if the file is missing or malformed.
+    This keeps year-specific exceptions out of the core algorithm while
+    preserving the 2026-09-01 regression behavior.
+    """
+    import pathlib
+    path = pathlib.Path(__file__).resolve().parent / "knowledge" / "holidays.json"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        dates: set[dt.date] = set()
+        for entry in data.get("holidays", []):
+            raw = str(entry.get("date") or "").strip()
+            if raw:
+                dates.add(dt.date.fromisoformat(raw))
+        return dates
+    except (OSError, ValueError, TypeError, KeyError):
+        return {dt.date(2026, 9, 1)}
+
+
+# Даты без регулярных пар (День знаний и т.п.). Загружаются из
+# knowledge/holidays.json; fallback сохраняет поведение 01.09.2026.
+HOLIDAYS = _load_holidays()
 
 
 def lessons_for_date(schedule: dict | None, weeks: list[dict], target: dt.date) -> tuple[dict | None, list[dict]]:

@@ -1,3 +1,5 @@
+from pathlib import Path
+
 from bs4 import BeautifulSoup
 
 from portal_parser import (
@@ -6,6 +8,61 @@ from portal_parser import (
     parse_institutes,
     render_schedule_day_chunk_htmls,
 )
+
+
+def test_day_chunks_keep_dict_contract_for_root_table():
+    html = Path("tests/fixtures/rowspan_time.html").read_text(encoding="utf-8")
+    chunks = render_schedule_day_chunk_htmls(html, "https://example.test")
+    assert chunks and all(isinstance(chunk, dict) for chunk in chunks)
+    assert chunks[0]["label"] == "Чт"
+    assert "<html" in chunks[0]["html"]
+
+
+def test_schedule_statuses_dim_inactive_mark_dot_and_leave_in_person_clean():
+    html = """<table>
+    <tr><th>дата</th><th>время</th><th>под гр.</th><th>предмет</th><th>преподаватель</th><th>ауд.</th><th>комм.</th></tr>
+    <tr><td rowspan="4">Пн</td></tr>
+    <tr><td>9:00 10:00</td><td></td><td>Верхняя очно</td><td>А</td><td>101</td><td>по верхней неделе</td></tr>
+    <tr><td>11:00 12:00</td><td></td><td>Нижняя ДОТ</td><td>Б</td><td>.</td><td>по нижней неделе с использованием ДОТ</td></tr>
+    <tr><td>14:00 15:00</td><td></td><td>Нижняя очно</td><td>В</td><td>303</td><td>по нижней неделе</td></tr>
+    </table>"""
+    statuses = {"Пн": [
+        {"source_row": 2, "subject": "Верхняя очно", "time": "9:00 10:00", "room": "101",
+         "_schedule_status": "inactive", "_schedule_dot": False,
+         "_schedule_tag": "НЕ НА ЭТОЙ НЕДЕЛЕ · С 9‑Й НЕДЕЛИ"},
+        {"source_row": 3, "subject": "Нижняя ДОТ", "time": "11:00 12:00", "room": "—",
+         "_schedule_status": "dot", "_schedule_dot": True, "_schedule_tag": "ДОТ"},
+    ]}
+    chunk = render_schedule_day_chunk_htmls(
+        html, "https://example.test", schedule_statuses=statuses,
+    )[0]
+    soup = BeautifulSoup(chunk["html"], "html.parser")
+    rows = soup.select("table.shedultable tr")
+    inactive = next(row for row in rows if "Верхняя очно" in row.get_text(" "))
+    dot = next(row for row in rows if "Нижняя ДОТ" in row.get_text(" "))
+    clean = next(row for row in rows if "Нижняя очно" in row.get_text(" "))
+    assert inactive["data-schedule-status"] == "inactive"
+    assert inactive.select("td.schedule-inactive")
+    assert inactive.select_one(".schedule-status-tag").get_text(strip=True) == "НЕ НА ЭТОЙ НЕДЕЛЕ · С 9‑Й НЕДЕЛИ"
+    assert inactive.select_one(".schedule-status-content") is not None
+    assert dot["data-schedule-status"] == "dot"
+    assert dot.select("td.schedule-dot")
+    assert dot.select_one(".schedule-status-tag").get_text(strip=True) == "ДОТ"
+    assert not any(name.startswith("schedule-") for name in clean.get("class", []))
+    assert chunk["status_marked"] == 2
+    assert "#eef5ff" in chunk["html"] and "text-decoration: line-through" in chunk["html"]
+
+
+def test_day_chunk_does_not_duplicate_nested_first_lesson():
+    html = """<table>
+    <tr><th>дата</th><th>время</th><th>под гр.</th><th>предмет</th><th>преподаватель</th><th>ауд.</th><th>комм.</th></tr>
+    <tr><td rowspan="2">Пн</td><tr><td>9:00</td><td></td><td>Первая пара</td><td>А</td><td>101</td><td></td></tr></tr>
+    <tr><td>11:00</td><td></td><td>Вторая пара</td><td>Б</td><td>202</td><td></td></tr>
+    </table>"""
+    chunk = render_schedule_day_chunk_htmls(html, "https://example.test")[0]
+    soup = BeautifulSoup(chunk["html"], "html.parser")
+    assert soup.get_text(" ").count("Первая пара") == 1
+    assert soup.get_text(" ").count("Вторая пара") == 1
 
 
 def test_groups_accept_alphanumeric_names_and_any_query_order():

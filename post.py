@@ -29,8 +29,9 @@ from typing import Any
 import zoneinfo
 
 import config  # noqa: E402
+import bells  # noqa: E402
 from fetch import content_fingerprint, fetch_html, hash_html  # noqa: E402
-from parse import parse_all  # noqa: E402
+from parse import parse_all, parse_schedule  # noqa: E402
 from format import (  # noqa: E402
     DAY_SHORT_TO_FULL,
     DAY_TO_SHORT,
@@ -40,9 +41,24 @@ from format import (  # noqa: E402
     format_schedule_post,
     render_schedule_html,
 )
-from schedule_logic import visible_week_days  # noqa: E402
+from schedule_logic import (  # noqa: E402
+    calendar_bounds,
+    dashboard_presentation_fingerprint,
+    find_week,
+    lesson_has_expired,
+    lesson_non_applicability_reason,
+    resolve_dashboard_view,
+)
 from screenshot import screenshot_html, screenshot_schedule_day_crop_items  # noqa: E402
+from portal_parser import day_short, norm_text, render_schedule_day_chunk_htmls  # noqa: E402
 from telegram_api import edit_rich_message  # noqa: E402
+
+SCHEDULE_SCREEN_STYLE_VERSION = 4
+COMPARISON_SCREEN_STYLE_VERSION = 1
+
+
+def _dashboard_screen_status_key(target_date: dt.date) -> str:
+    return f"v{SCHEDULE_SCREEN_STYLE_VERSION}:{target_date.isoformat()}"
 
 
 def _today_msk() -> dt.date:
@@ -131,6 +147,7 @@ def _write_last_post(data: dict) -> None:
 def _write_dashboard_post_state(data: dict) -> None:
     """Состояние последнего успешного обновления дашборда отдельно от алертов."""
     path = config.STATE_DIR / "last_dashboard_post.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     with temporary.open("w", encoding="utf-8") as handle:
         json.dump(data, handle, ensure_ascii=False, indent=2)
@@ -341,34 +358,73 @@ def post_changes_alert(changes_summary: str, data: dict | None = None) -> dict:
     return result
 
 
-def _dashboard_screens(html: str, fingerprint: str, target_date: dt.date) -> list[dict]:
-    """Вернуть [{label, path}] дневных скринов расписания.
+def _schedule_screenshot_statuses(data: dict, target_date: dt.date) -> dict[str, list[dict]]:
+    week = find_week(data.get("weeks") or [], target_date)
+    if not week:
+        return {}
+    full_bounds = calendar_bounds(data.get("weeks") or [])
+    try:
+        start = dt.datetime.strptime(week["start"], "%d.%m.%Y").date()
+        end = dt.datetime.strptime(week["end"], "%d.%m.%Y").date()
+    except (KeyError, TypeError, ValueError):
+        return {}
+    day_index = {day: index for index, day in enumerate((
+        "Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота", "Воскресенье",
+    ))}
+    statuses: dict[str, list[dict]] = {}
+    for day, lessons in ((data.get("schedule") or {}).get("days") or {}).items():
+        if day not in day_index:
+            continue
+        day_date = start + dt.timedelta(days=(day_index[day] - start.weekday()) % 7)
+        if day_date > end:
+            continue
+        items = []
+        for lesson in lessons or []:
+            is_dot = str(lesson.get("delivery_mode") or "").casefold().startswith("remote") or "дот" in str(lesson.get("note") or "").casefold()
+            expired = lesson_has_expired(lesson, day_date, week, full_bounds)
+            inactive_reason = lesson_non_applicability_reason(lesson, day_date, week, full_bounds)
+            applies = inactive_reason is None
+            if applies and not is_dot and not expired:
+                continue
+            items.append({
+                **lesson,
+                "_schedule_dot": is_dot,
+                "_schedule_expired": expired,
+                "_schedule_status": "dot" if applies else "inactive",
+                "_schedule_tag": "ДОТ" if applies else inactive_reason,
+            })
+        if items:
+            statuses[DAY_TO_SHORT.get(day, day)] = items
+    return statuses
 
-    Скриншоты кешируются по отпечатку расписания в state/dashboard_screens.json:
-    chromium гоняется, только когда расписание реально поменялось (другой
-    fingerprint). При неизменном расписании переиспользуем готовые PNG, чтобы
-    не пересоздавать скрины на каждом обновлении закрепа — смена даты фокуса,
-    ретрай упавшей доставки и т. п. к смене скринов не ведут.
-    """
+
+def _dashboard_screens(
+    html: str,
+    fingerprint: str,
+    target_date: dt.date,
+    data: dict | None = None,
+) -> list[dict]:
+    """Cache dashboard images by content plus target-date and rendering policy."""
     cache_file = config.STATE_DIR / "dashboard_screens.json"
-    shot_dir = config.STATE_DIR / "dashboard_screens"
+    shot_dir = config.STATE_DIR / "day_screens"
     shot_dir.mkdir(parents=True, exist_ok=True)
 
     cache = _read_json(cache_file)
-    cached = cache.get("items") if cache.get("fingerprint") == fingerprint else None
-    if cached and all(Path(item.get("path", "")).exists() for item in cached):
+    status_key = _dashboard_screen_status_key(target_date)
+    cached = (
+        cache.get("items")
+        if cache.get("fingerprint") == fingerprint and cache.get("status_key") == status_key
+        else None
+    )
+    if cached is not None and all(Path(item.get("path", "")).exists() for item in cached):
         return cached
 
-    # Расписание поменялось — пересоздаём скрины. Чистим старые части рендера
-    # (и их html-исходники), чтобы не копить мусор между версиями расписания.
-    for stale in (*shot_dir.glob("6381_site_*_part*.png"), *shot_dir.glob("6381_site_*_part*.html")):
-        try:
-            stale.unlink()
-        except OSError:
-            pass
-    base = shot_dir / f"6381_site_{target_date.isoformat()}.png"
     try:
-        raw = screenshot_schedule_day_crop_items(html, config.GROUP_URL, base)
+        parsed = data or parse_all(html)
+        raw = _cached_day_screens(
+            html,
+            schedule_statuses=_schedule_screenshot_statuses(parsed, target_date),
+        )
     except Exception as exc:  # noqa: BLE001
         # Скриншот — украшение поста, а не его суть. Если chromium не отработал
         # (снап-песочница, нет памяти, портал отдал кривую вёрстку), закреплённый
@@ -378,10 +434,187 @@ def _dashboard_screens(html: str, fingerprint: str, target_date: dt.date) -> lis
         if cached:
             print("[dashboard screens] reusing cached screenshots", file=sys.stderr)
             return cached
-        _write_json_atomic(cache_file, {"fingerprint": "", "items": []})
+        _write_json_atomic(cache_file, {"fingerprint": "", "status_key": "", "items": []})
         return []
     items = [{"label": item["label"], "path": str(item["path"])} for item in raw]
-    _write_json_atomic(cache_file, {"fingerprint": fingerprint, "items": items})
+    _write_json_atomic(cache_file, {"fingerprint": fingerprint, "status_key": status_key, "items": items})
+    return items
+
+
+def _prune_day_screen_cache(protected: set[Path], *, max_age_days: int = 14, max_bytes: int = 200_000_000) -> None:
+    directory = config.STATE_DIR / "day_screens"
+    if not directory.exists():
+        return
+    now = dt.datetime.now(dt.timezone.utc).timestamp()
+    files = sorted(directory.glob("*.png"), key=lambda path: path.stat().st_mtime, reverse=True)
+    total = 0
+    for path in files:
+        size = path.stat().st_size
+        age = now - path.stat().st_mtime
+        keep = path in protected or (age <= max_age_days * 86400 and total + size <= max_bytes)
+        if keep:
+            total += size
+            continue
+        try:
+            path.unlink()
+        except OSError:
+            pass
+
+
+def _cached_day_screens(
+    html: str,
+    only_labels: set[str] | None = None,
+    *,
+    schedule_statuses: dict[str, list[dict]] | None = None,
+) -> list[dict]:
+    """Render clean portal days once per day-HTML hash, across full snapshots."""
+    directory = config.STATE_DIR / "day_screens"
+    directory.mkdir(parents=True, exist_ok=True)
+    items = []
+    render_kwargs = {"schedule_statuses": schedule_statuses} if schedule_statuses is not None else {}
+    for chunk in render_schedule_day_chunk_htmls(
+        html, config.GROUP_URL, days_per_chunk=1, **render_kwargs,
+    ):
+        if not isinstance(chunk, dict):
+            continue
+        label = str(chunk.get("label") or "")
+        if only_labels is not None and label not in only_labels:
+            continue
+        rendered = str(chunk.get("html") or "")
+        digest = hashlib.sha256(rendered.encode("utf-8")).hexdigest()
+        path = directory / f"{digest}.png"
+        if not path.exists() or path.stat().st_size < 1000:
+            screenshot_html(rendered, path, width=1480, height=3200, scale_factor=2, bg=(255, 255, 255))
+            try:
+                path.with_suffix(".html").unlink()
+            except OSError:
+                pass
+        items.append({"label": label, "path": str(path), "cache_key": digest})
+    _prune_day_screen_cache({Path(item["path"]) for item in items})
+    return items
+
+
+def _comparison_marks(schedule: dict, diff: dict, *, before: bool) -> list[dict]:
+    """Resolve each diff against its own snapshot, then use exact source rows."""
+    fields = {"предмет": "subject", "ауд.": "room", "преподаватель": "teacher",
+              "примечание": "note", "место": "location", "формат": "delivery_mode"}
+    portal_columns = {"примечание": "комм.", "место": "комм.", "формат": "комм."}
+    lessons = [{**lesson, "day": day} for day, rows in schedule.get("days", {}).items() for lesson in rows]
+    marks = []
+    used = set()
+    kind = "removed" if before else "added"
+    items = [(kind, item) for item in (diff.get(kind) or [])]
+    items += [("changed", item) for item in (diff.get("changed") or [])]
+    for kind, item in items:
+        target = dict(item)
+        columns = []
+        for label, old, new in item.get("fields", []):
+            if label in fields:
+                target[fields[label]] = old if before else new
+                columns.append(portal_columns.get(label, label))
+        candidates = []
+        for lesson in lessons:
+            if lesson["source_row"] in used or day_short(lesson["day"]) != day_short(target.get("day")):
+                continue
+            if norm_text(lesson["subject"].split("\n", 1)[0]) != norm_text(str(target.get("subject") or "").split("\n", 1)[0]):
+                continue
+            if bells.parse_hours(lesson["time"]) != bells.parse_hours(target.get("time")):
+                continue
+            if any(
+                key in target and target[key] is not None and norm_text(lesson.get(key)) != norm_text(target[key])
+                for key in ("subgroup", "room", "note", "location", "delivery_mode")
+            ):
+                continue
+            if target.get("teacher") is not None:
+                teacher, expected = norm_text(lesson.get("teacher")), norm_text(target["teacher"])
+                # The notification expands bare surnames to full names; the
+                # screenshot still contains the original portal spelling.
+                if teacher != expected and not (teacher and " " not in teacher and expected.startswith(teacher + " ")):
+                    continue
+            candidates.append(lesson)
+        exact = [lesson for lesson in candidates if lesson["source_row"] == target.get("source_row")]
+        candidates = exact or candidates
+        # Do not guess between indistinguishable parallel lessons.
+        if len(candidates) != 1:
+            continue
+        source_row = candidates[0]["source_row"]
+        used.add(source_row)
+        marks.append({"source_row": source_row, "kind": kind, "columns": sorted(set(columns))})
+    return marks
+
+
+def comparison_day_screens(old_html: str | None, new_html: str | None, diff: dict) -> list[dict]:
+    """Pair annotated snapshots with fixed columns and equal image canvases."""
+    from PIL import Image
+
+    wanted = {DAY_TO_SHORT.get(day, day) for day in changed_days(diff)}
+    sides = []
+    for html, before, title in ((old_html, True, "Было"), (new_html, False, "Стало")):
+        schedule = parse_schedule(html) if html else None
+        chunks = render_schedule_day_chunk_htmls(
+            html, config.GROUP_URL, comparison_title=title,
+            comparison_marks=_comparison_marks(schedule, diff, before=before),
+        ) if schedule is not None else []
+        sides.append({chunk["label"]: chunk for chunk in chunks if chunk["label"] in wanted})
+    directory = config.STATE_DIR / "day_screens"
+    directory.mkdir(parents=True, exist_ok=True)
+    order = {day: index for index, day in enumerate(("Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"))}
+    items = []
+    protected = set()
+    for label in sorted(wanted, key=lambda item: order.get(item, 9)):
+        pair = [side.get(label) for side in sides]
+        if not any(pair):
+            continue
+        signature = json.dumps([COMPARISON_SCREEN_STYLE_VERSION, 1480, 3200, 2,
+                                [chunk["html"] if chunk else None for chunk in pair]], ensure_ascii=False)
+        digest = hashlib.sha256(signature.encode("utf-8")).hexdigest()
+        item = {"label": label}
+        paths = []
+        for side, chunk in zip(("before", "after"), pair):
+            item[f"{side}_path"] = None
+            item[f"{side}_kinds"] = chunk.get("comparison_kinds", []) if chunk else []
+            if chunk is None:
+                continue
+            path = directory / f"{digest}_{side}.png"
+            try:
+                with Image.open(path) as image:
+                    image.verify()
+                cached = True
+            except (OSError, ValueError, SyntaxError):
+                cached = False
+            if not cached:
+                staging = path.with_name(path.stem + ".render.png")
+                try:
+                    staging.unlink(missing_ok=True)
+                    screenshot_html(chunk["html"], staging, width=1480, height=3200, scale_factor=2, bg=(255, 255, 255))
+                    with Image.open(staging) as image:
+                        image.verify()
+                    staging.replace(path)
+                finally:
+                    staging.unlink(missing_ok=True)
+                    staging.with_suffix(".html").unlink(missing_ok=True)
+            item[f"{side}_path"] = str(path)
+            paths.append(path)
+        if len(paths) == 2:
+            sizes = []
+            for path in paths:
+                with Image.open(path) as image:
+                    sizes.append(image.size)
+            canvas_size = (max(size[0] for size in sizes), max(size[1] for size in sizes))
+            for path, size in zip(paths, sizes):
+                if size != canvas_size:
+                    with Image.open(path) as image:
+                        canvas = Image.new("RGB", canvas_size, "white")
+                        canvas.paste(image, (0, 0))
+                    staging = path.with_name(path.stem + ".padding.png")
+                    try:
+                        canvas.save(staging)
+                        staging.replace(path)
+                    finally:
+                        staging.unlink(missing_ok=True)
+        protected.update(paths)
+        items.append(item)
+    _prune_day_screen_cache(protected)
     return items
 
 
@@ -487,45 +720,63 @@ def diff_day_screens(
 
 def edit_dashboard_post(
     message_id: int,
-    target_date: dt.date,
+    target_date: dt.date | None = None,
     html: str | None = None,
     fingerprint: str | None = None,
+    data: dict | None = None,
+    now: dt.datetime | None = None,
+    render_screens: bool = True,
 ) -> dict:
     """Обновить закреплённый rich-пост. html — уже скачанная страница
     (монитор передаёт её, чтобы не фетчить дважды за цикл). fingerprint —
     отпечаток распарсенного расписания (content_fingerprint); если он совпал
     с прошлым рендером, скриншоты берутся из кеша и chromium не гоняется —
     скрины обновляются только при реальном изменении расписания."""
+    if data is None:
+        if html is None:
+            html = fetch_html()
+        data = parse_all(html)
     if html is None:
-        html = fetch_html()
-    data = parse_all(html)
+        raise ValueError("html is required for dashboard screenshots")
     fp = fingerprint or content_fingerprint(data)
-
-    # Skip holidays: advance target_date to the next day with lessons
-    from schedule_logic import HOLIDAYS, lessons_for_date
     schedule = data.get("schedule")
     weeks = data.get("weeks", [])
-    for _ in range(7):
-        if target_date in HOLIDAYS:
-            target_date = target_date + dt.timedelta(days=1)
-            continue
-        _, lessons = lessons_for_date(schedule, weeks, target_date)
-        if not lessons:
-            target_date = target_date + dt.timedelta(days=1)
-            continue
-        break
-
-    # Скрины прошедших дней в пост не кладём. День живёт в закрепе до конца
-    # своей последней пары (вариант 2), поэтому фильтруем по московскому времени.
     tz_msk = zoneinfo.ZoneInfo("Europe/Moscow")
-    # Дата берётся через тестируемый helper: rollover и ручной --edit-rich
-    # должны одинаково определять «живые» дни, независимо от даты запуска теста.
-    current_date = _today_msk()
-    clock_now = dt.datetime.now(tz_msk)
-    now_msk = dt.datetime.combine(current_date, clock_now.timetz())
-    live_days = set(
-        visible_week_days(weeks, target_date, current_date, schedule=schedule, now=now_msk)
+    if now is None:
+        clock_now = dt.datetime.now(tz_msk)
+        now_msk = dt.datetime.combine(_today_msk(), clock_now.timetz())
+    elif now.tzinfo is None:
+        now_msk = now.replace(tzinfo=tz_msk)
+    else:
+        now_msk = now.astimezone(tz_msk)
+    view = resolve_dashboard_view(schedule, weeks, now_msk)
+    if target_date is not None and target_date != now_msk.date():
+        manual_now = dt.datetime.combine(target_date, dt.time.min, tzinfo=tz_msk)
+        view = resolve_dashboard_view(schedule, weeks, manual_now)
+    target_date = view["target_date"]
+    current_date = now_msk.date()
+    live_days = set(view["live_days"])
+    presentation_fp = dashboard_presentation_fingerprint(fp, view)
+    previous_dashboard = _read_json(config.STATE_DIR / "last_dashboard_post.json")
+    expects_screens = bool(schedule and live_days)
+    screen_cache = _read_json(config.STATE_DIR / "dashboard_screens.json")
+    screen_status_key = _dashboard_screen_status_key(target_date)
+    cached_items = (
+        screen_cache.get("items")
+        if screen_cache.get("fingerprint") == fp
+        and screen_cache.get("status_key") == screen_status_key
+        else None
     )
+    media_cache_valid = cached_items is not None and all(
+        Path(str(item.get("path") or "")).exists() for item in cached_items
+    )
+    media_delivery_complete = bool(previous_dashboard.get("screens_complete")) and media_cache_valid
+    if (
+        previous_dashboard.get("message_id") == message_id
+        and previous_dashboard.get("presentation_fingerprint") == presentation_fp
+        and (media_delivery_complete or not expects_screens or not render_screens)
+    ):
+        return {"ok": True, "skipped": True, "reason": "same_presentation"}
 
     def _day_still_live(item: dict) -> bool:
         label = str(item.get("label") or "")
@@ -534,7 +785,11 @@ def edit_dashboard_post(
         # остался бы совсем без картинок.
         return day_name is None or day_name in live_days
 
-    shot_items = [item for item in _dashboard_screens(html, fp, target_date) if _day_still_live(item)]
+    shot_items = (
+        [item for item in _dashboard_screens(html, fp, target_date, data=data) if _day_still_live(item)]
+        if render_screens and expects_screens
+        else []
+    )
     screenshot_media = [
         {"label": item["label"], "media": f"attach://site_screenshot_{index}"}
         for index, item in enumerate(shot_items, 1)
@@ -585,7 +840,9 @@ def edit_dashboard_post(
         _write_dashboard_post_state({
             "message_id": message_id,
             "fingerprint": fp,
+            "presentation_fingerprint": presentation_fp,
             "target_date": target_date.isoformat(),
+            "screens_complete": render_screens or not expects_screens,
             "ts": dt.datetime.now(tz_msk).isoformat(timespec="seconds"),
         })
     return result

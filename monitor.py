@@ -39,13 +39,13 @@ from pathlib import Path
 import zoneinfo
 
 import bells  # noqa: E402
+import api as timetable_api  # noqa: E402
 import config  # noqa: E402
 from fetch import content_fingerprint, fetch_html, hash_html, is_stub, save_html  # noqa: E402
 from format import build_changes_rich_message, changes_fallback_text, pick_day_screens  # noqa: E402
-from parse import extract_teacher_ids, parse_all  # noqa: E402
-from portal_parser import count_schedule_lessons  # noqa: E402
-from post import _tg_api, day_screens, diff_day_screens, edit_dashboard_post  # noqa: E402
-from telegram_api import send_rich_message  # noqa: E402
+from parse import parse_all  # noqa: E402
+from post import _tg_api, comparison_day_screens, edit_dashboard_post  # noqa: E402
+from telegram_api import edit_rich_message, send_rich_message  # noqa: E402
 
 # Сколько подряд неудачных циклов терпим молча перед tech-алертом в личку
 FAIL_ALERT_THRESHOLD = 3
@@ -325,59 +325,31 @@ def diff_schedules(
     }
 
 
-def _changed_day_screen_media(
+def _comparison_screen_media(
     diff: dict,
-    html: str | None,
-    fingerprint: str | None,
-    focus_date: dt.date | None,
+    old_html: str | None,
+    new_html: str | None,
 ) -> tuple[list[dict], dict[str, Path]]:
-    """Скриншоты изменившихся дней: (медиа для rich, файлы).
-
-    Сначала пробуем машинную подсветку правок в самой портальной таблице
-    (post.diff_day_screens): на скрине видно, что именно поменялось. Если
-    подсветка не отрендерилась, берём чистые скрины тех же дней из общего кеша
-    закреплённого поста — chromium на одно изменение расписания всё равно
-    запускается один раз. Скриншоты — иллюстрация диффа, а не его суть: если
-    рендер не удался вовсе, пост уходит текстом, как раньше.
-    """
-    if not html or not fingerprint:
+    if not old_html and not new_html:
         return [], {}
-    target = focus_date or dt.datetime.now(zoneinfo.ZoneInfo("Europe/Moscow")).date()
-    picked: list[dict] = []
-    highlighted = False
-    try:
-        picked = diff_day_screens(html, diff, target, fingerprint=fingerprint)
-        highlighted = bool(picked)
-        if picked:
-            print(f"[diff screens] подсветка: {[(item.get('label'), item.get('marked')) for item in picked]}")
-    except Exception as exc:  # noqa: BLE001
-        print(f"[diff screens] highlight render failed: {exc}", file=sys.stderr)
-    if not picked:
-        try:
-            picked = pick_day_screens(diff, day_screens(html, fingerprint, target))
-        except Exception as exc:  # noqa: BLE001
-            print(f"[diff screens] render failed: {exc}", file=sys.stderr)
-            return [], {}
+    pairs = comparison_day_screens(old_html, new_html, diff)
     media: list[dict] = []
-    for index, item in enumerate(picked, 1):
+    files: dict[str, Path] = {}
+    for index, item in enumerate(pairs, 1):
         entry = {
-            "label": item.get("label", ""),
-            "media": f"attach://changes_screenshot_{index}",
-            "marked": int(item.get("marked") or 0),
+            "label": item.get("label", ""), "source_url": config.GROUP_URL,
+            "before_kinds": item.get("before_kinds", []),
+            "after_kinds": item.get("after_kinds", []),
         }
-        # Пост обещает только те цвета, которые реально легли на скрин.
-        kinds = [str(kind) for kind in (item.get("marked_kinds") or [])]
-        if kinds:
-            entry["kinds"] = kinds
-        if not highlighted:
-            entry["highlighted"] = False
+        if item.get("before_path"):
+            key = f"changes_before_{index}"
+            entry["before_media"] = f"attach://{key}"
+            files[key] = Path(item["before_path"])
+        if item.get("after_path"):
+            key = f"changes_after_{index}"
+            entry["after_media"] = f"attach://{key}"
+            files[key] = Path(item["after_path"])
         media.append(entry)
-    files = {
-        f"changes_screenshot_{index}": Path(item["path"])
-        for index, item in enumerate(picked, 1)
-    }
-    if picked:
-        print(f"[diff screens] {len(picked)} скрин(ов): {[item.get('label') for item in picked]}")
     return media, files
 
 
@@ -386,41 +358,88 @@ def _post_changes_to_channel(
     weeks: list[dict],
     *,
     html: str | None = None,
+    old_html: str | None = None,
     fingerprint: str | None = None,
     focus_date: dt.date | None = None,
 ) -> dict:
-    """Rich-пост в канал; при отказе — plain-HTML фоллбек."""
-    screenshot_media, files = _changed_day_screen_media(diff, html, fingerprint, focus_date)
-    rich = build_changes_rich_message(
-        diff, weeks, config.GROUP_URL, group_name="6381", screenshot_media=screenshot_media,
-    )
+    """Send the durable text notification before any optional media work."""
+    rich = build_changes_rich_message(diff, weeks, config.GROUP_URL, group_name="6381")
     try:
         result = send_rich_message(
-            rich, token=config.TG_BOT_TOKEN, chat_id=config.TG_CHANNEL_ID, files=files or None,
+            rich, token=config.TG_BOT_TOKEN, chat_id=config.TG_CHANNEL_ID,
         )
     except Exception as exc:  # local validation/transport failure also falls back
         result = {"ok": False, "error": str(exc)}
     if result.get("ok"):
+        result["_rich"] = True
         return result
     print(f"[sendRichMessage FAIL] {result}", file=sys.stderr)
-    if files:
-        # Отказ мог прийти из-за медиа (лимит, кривой файл, attach:// не
-        # подхватился). Пробуем тот же rich без скриншотов, прежде чем
-        # сваливаться в простой HTML.
-        try:
-            retry = send_rich_message(
-                build_changes_rich_message(diff, weeks, config.GROUP_URL, group_name="6381"),
-                token=config.TG_BOT_TOKEN,
-                chat_id=config.TG_CHANNEL_ID,
-            )
-        except Exception as exc:  # noqa: BLE001
-            retry = {"ok": False, "error": str(exc)}
-        if retry.get("ok"):
-            print("[diff post] отправлен без скриншотов", file=sys.stderr)
-            return retry
-        print(f"[sendRichMessage FAIL без скринов] {retry}", file=sys.stderr)
     text = changes_fallback_text(diff, config.GROUP_URL, group_name="6381")
     return _tg_api("sendMessage", chat_id=config.TG_CHANNEL_ID, text=text, parse_mode="HTML")
+
+
+def _queue_media_enhancement(
+    result: dict,
+    diff: dict,
+    weeks: list[dict],
+    old_snapshot_id: int | None,
+    new_snapshot_id: int | None,
+) -> None:
+    message_id = ((result.get("result") or {}).get("message_id") if isinstance(result.get("result"), dict) else None)
+    if not result.get("_rich") or not isinstance(message_id, int) or not (old_snapshot_id or new_snapshot_id):
+        return
+    path = config.STATE_DIR / "pending_media.json"
+    state = _read_json(path)
+    items = state.get("items") if isinstance(state.get("items"), list) else []
+    task = {
+        "message_id": message_id,
+        "diff": diff,
+        "weeks": weeks,
+        "old_snapshot_id": old_snapshot_id,
+        "new_snapshot_id": new_snapshot_id,
+    }
+    items = [item for item in items if item.get("message_id") != message_id]
+    items.append(task)
+    _write_json_atomic(path, {"items": items})
+
+
+def _try_pending_media() -> bool | None:
+    path = config.STATE_DIR / "pending_media.json"
+    state = _read_json(path)
+    items = state.get("items") if isinstance(state.get("items"), list) else []
+    pending = items[0] if items else {}
+    if not pending.get("message_id") or pending.get("diff") is None:
+        return None
+    db_path = config.STATE_DIR / "timetable.sqlite3"
+    old_id, new_id = pending.get("old_snapshot_id"), pending.get("new_snapshot_id")
+    old_html = timetable_api.load_snapshot_html(int(old_id), db_path=db_path) if old_id else None
+    new_html = timetable_api.load_snapshot_html(int(new_id), db_path=db_path) if new_id else None
+    try:
+        screenshot_media, files = _comparison_screen_media(pending["diff"], old_html, new_html)
+        if not files:
+            items.pop(0)
+            _write_json_atomic(path, {"items": items}) if items else _unlink(path)
+            return True
+        rich = build_changes_rich_message(
+            pending["diff"], pending.get("weeks") or [], config.GROUP_URL,
+            group_name="6381", screenshot_media=screenshot_media,
+        )
+        result = edit_rich_message(
+            rich,
+            token=config.TG_BOT_TOKEN,
+            chat_id=config.TG_CHANNEL_ID,
+            message_id=int(pending["message_id"]),
+            files=files,
+            timeout=120,
+        )
+    except Exception as exc:  # noqa: BLE001
+        result = {"ok": False, "error": str(exc)}
+    if result.get("ok") or "not modified" in str(result.get("description", "")):
+        items.pop(0)
+        _write_json_atomic(path, {"items": items}) if items else _unlink(path)
+        return True
+    print(f"[pending media] enhancement failed: {result}", file=sys.stderr)
+    return False
 
 
 def _read_json(path: Path) -> dict:
@@ -591,13 +610,24 @@ def _escape_code(value: object, limit: int = 500) -> str:
     return html_lib.escape(str(value)[:limit], quote=False)
 
 
-def _try_dashboard(update_post_id: int | None, post_date: dt.date | None, html: str, fingerprint: str) -> bool | None:
+def _try_dashboard(
+    update_post_id: int | None,
+    post_date: dt.date | None,
+    html: str,
+    fingerprint: str,
+    data: dict,
+    *,
+    render_screens: bool = True,
+) -> bool | None:
     pending_file = config.STATE_DIR / "pending_dashboard.json"
     if not update_post_id:
         return None
     focus_date = post_date or dt.datetime.now(zoneinfo.ZoneInfo("Europe/Moscow")).date()
     try:
-        result = edit_dashboard_post(update_post_id, focus_date, html=html, fingerprint=fingerprint)
+        result = edit_dashboard_post(
+            update_post_id, focus_date, html=html, fingerprint=fingerprint, data=data,
+            render_screens=render_screens,
+        )
     except Exception as exc:  # noqa: BLE001
         result = {"ok": False, "error": str(exc)}
     if result.get("ok"):
@@ -629,18 +659,21 @@ def _run_once_locked(update_post_id: int | None = None, post_date: dt.date | Non
     save_html(html)
     data = parse_all(html)
     if not data.get("stub"):
-        expected = count_schedule_lessons(html)
+        expected = int(data.get("physical_lesson_count", -1))
         actual = _lesson_count(data.get("schedule"))
         if expected != actual:
             raise RuntimeError(f"parser invariant failed: physical={expected}, parsed={actual}")
     stub = bool(data.get("stub"))
     new_fp = content_fingerprint(data)
+    with timetable_api.connect(config.STATE_DIR / "timetable.sqlite3") as db:
+        snapshot_id = timetable_api.persist(db, html, config.GROUP_URL, data)
     event = {
         "ts": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
         "hash": hash_html(html),
         "fingerprint": new_fp,
         "size": len(html),
         "stub": stub,
+        "snapshot_id": snapshot_id,
     }
     with changes_log.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(event, ensure_ascii=False) + "\n")
@@ -656,12 +689,22 @@ def _run_once_locked(update_post_id: int | None = None, post_date: dt.date | Non
 
     previous_event = baseline.get("event") or {}
     previous_fp = previous_event.get("fingerprint")
+    old_snapshot_id = previous_event.get("snapshot_id")
+    old_html = (
+        timetable_api.load_snapshot_html(
+            int(old_snapshot_id), db_path=config.STATE_DIR / "timetable.sqlite3",
+        )
+        if old_snapshot_id
+        else None
+    )
     if previous_fp is None:
         _save_baseline(event, data, last_change_event=event)
         _unlink(candidate_file)
         _unlink(pending_file)
+        dashboard_ok = _try_dashboard(update_post_id, post_date, html, new_fp, data) if update_post_id else None
         print(f"[baseline] fingerprint={new_fp} stub={stub}")
-        return {"changed": False, "fingerprint": new_fp, "stub": stub, "posted": None, **event}
+        return {"changed": False, "fingerprint": new_fp, "stub": stub, "posted": None,
+                "dashboard_updated": dashboard_ok, **event}
 
     changed = previous_fp != new_fp
 
@@ -680,12 +723,20 @@ def _run_once_locked(update_post_id: int | None = None, post_date: dt.date | Non
                 pending_notif["diff"],
                 data.get("weeks", []),
                 html=html,
+                old_html=old_html,
                 fingerprint=new_fp,
                 focus_date=post_date,
             )
         except Exception as exc:  # noqa: BLE001
             retry_result = {"ok": False, "error": str(exc)}
         if retry_result.get("ok"):
+            _queue_media_enhancement(
+                retry_result,
+                pending_notif["diff"],
+                data.get("weeks", []),
+                pending_notif.get("old_snapshot_id") or old_snapshot_id,
+                pending_notif.get("new_snapshot_id") or snapshot_id,
+            )
             _unlink(pending_file)
             print("[retry pending] diff posted successfully")
         else:
@@ -700,7 +751,8 @@ def _run_once_locked(update_post_id: int | None = None, post_date: dt.date | Non
         _unlink(candidate_file)
         dashboard_ok = None
         if update_post_id:
-            dashboard_ok = _try_dashboard(update_post_id, post_date, html, new_fp)
+            dashboard_ok = _try_dashboard(update_post_id, post_date, html, new_fp, data)
+        _try_pending_media()
         print(f"[no change] fingerprint={new_fp} stub={stub}")
         return {"changed": False, "fingerprint": new_fp, "stub": stub, "posted": None, "dashboard_updated": dashboard_ok, **event}
 
@@ -737,10 +789,7 @@ def _run_once_locked(update_post_id: int | None = None, post_date: dt.date | Non
     # This is unambiguous (no oneфамилец problem) and works for bare last names
     _id_cache = _load_teacher_id_cache()
     _id_lookup: dict[str, str] = {}
-    try:
-        _teacher_id_map = extract_teacher_ids(html)
-    except Exception:
-        _teacher_id_map = {}
+    _teacher_id_map = data.get("teacher_ids") or {}
     for _ttext, _tid in _teacher_id_map.items():
         _full = _id_cache.get(_tid)
         if _full and _ttext != _full:
@@ -774,7 +823,7 @@ def _run_once_locked(update_post_id: int | None = None, post_date: dt.date | Non
         })
         _save_baseline(event, data, last_change_event=event)
         _unlink(pending_file)
-        dashboard_ok = _try_dashboard(update_post_id, post_date, html, new_fp) if update_post_id else None
+        dashboard_ok = _try_dashboard(update_post_id, post_date, html, new_fp, data) if update_post_id else None
         _dm(
             "⚠️ отпечаток расписания изменился, но дифф пустой\n"
             f"было: <code>{_escape_code(previous_fp, 80)}</code>\n"
@@ -785,12 +834,18 @@ def _run_once_locked(update_post_id: int | None = None, post_date: dt.date | Non
         return {"changed": True, "fingerprint": new_fp, "stub": stub, "posted": None,
                 "unexplained": True, "dashboard_updated": dashboard_ok, **event}
 
-    _write_json_atomic(pending_file, {"event": event, "diff": diff})
+    _write_json_atomic(pending_file, {
+        "event": event,
+        "diff": diff,
+        "old_snapshot_id": old_snapshot_id,
+        "new_snapshot_id": snapshot_id,
+    })
     try:
         post_result = _post_changes_to_channel(
             diff,
             data.get("weeks", []),
             html=html,
+            old_html=old_html,
             fingerprint=new_fp,
             focus_date=post_date,
         )
@@ -802,9 +857,15 @@ def _run_once_locked(update_post_id: int | None = None, post_date: dt.date | Non
         print(f"[delivery pending] fingerprint={new_fp}")
         return {"changed": True, "fingerprint": new_fp, "stub": stub, "posted": False, "delivery_pending": True, **event}
 
+    _queue_media_enhancement(post_result, diff, data.get("weeks", []), old_snapshot_id, snapshot_id)
     _save_baseline(event, data, last_change_event=event)
     _unlink(pending_file)
-    dashboard_ok = _try_dashboard(update_post_id, post_date, html, new_fp) if update_post_id else None
+    dashboard_ok = (
+        _try_dashboard(update_post_id, post_date, html, new_fp, data, render_screens=False)
+        if update_post_id
+        else None
+    )
+    _try_pending_media()
     total = len(diff["added"]) + len(diff["removed"]) + len(diff["changed"])
     print(f"[changed] diff: +{len(diff['added'])} -{len(diff['removed'])} ~{len(diff['changed'])} "
           f"transition={diff['transition']} total={total} posted=True")
@@ -837,8 +898,8 @@ def schedule_daily(hour: int = 9, minute: int = 0, update_post_id: int | None = 
 
 
 def run_interval(
-    minutes: float = 30,
-    jitter_s: float = 180.0,
+    minutes: float = 3,
+    jitter_s: float = 15.0,
     update_post_id: int | None = None,
     post_date: dt.date | None = None,
 ):
@@ -869,7 +930,10 @@ def run_interval(
                     f"последняя ошибка: <code>{_escape_code(e, 400)}</code>"
                 )
                 alerted = True
-        target_period = minutes * 60 + random.uniform(-jitter_s, jitter_s)
+        # Back off portal/network failures, but keep the normal start-to-start
+        # period short enough to leave time for text delivery under five minutes.
+        multiplier = min(2 ** max(0, consecutive_failures - 1), max(1.0, 20.0 / minutes))
+        target_period = minutes * 60 * multiplier + random.uniform(-jitter_s, jitter_s)
         sleep_s = max(1.0, target_period - (time.monotonic() - started))
         print(f"[sleep {sleep_s:.0f}s]")
         time.sleep(sleep_s)
@@ -879,7 +943,7 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--schedule", action="store_true", help="вечный scheduler раз в день 09:00 MSK")
     ap.add_argument("--interval", type=float, metavar="MINUTES", help="вечный цикл: проверка каждые N минут")
-    ap.add_argument("--jitter", type=float, default=3.0, metavar="MINUTES", help="симметричный джиттер ±N минут (по умолчанию 3)")
+    ap.add_argument("--jitter", type=float, default=0.25, metavar="MINUTES", help="симметричный джиттер ±N минут (по умолчанию 0.25)")
     _env_post = os.environ.get("NOVSU_DASHBOARD_POST_ID", "").strip()
     _default_post = int(_env_post) if _env_post and _env_post not in ("0", "None") else None
     ap.add_argument(

@@ -7,12 +7,20 @@ CREATE TABLE IF NOT EXISTS snapshots (
  content_fingerprint TEXT NOT NULL,
  raw_hash TEXT NOT NULL,
  html TEXT NOT NULL,
+ parsed_json TEXT NOT NULL DEFAULT '{}',
  parser_version TEXT NOT NULL,
  UNIQUE(url, content_fingerprint, parser_version)
 );
 
 CREATE INDEX IF NOT EXISTS snapshots_fetched_at_idx ON snapshots(fetched_at);
 CREATE INDEX IF NOT EXISTS snapshots_url_fetched_at_idx ON snapshots(url, fetched_at);
+
+CREATE TABLE IF NOT EXISTS snapshot_heads (
+ url TEXT PRIMARY KEY,
+ snapshot_id INTEGER NOT NULL REFERENCES snapshots(id) ON DELETE CASCADE,
+ observed_at TEXT NOT NULL,
+ raw_hash TEXT NOT NULL
+);
 
 CREATE TABLE IF NOT EXISTS lessons (
  id INTEGER PRIMARY KEY,

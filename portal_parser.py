@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import html as htmlmod
+import copy
 import re
 import urllib.parse
 from typing import Any
@@ -97,7 +98,7 @@ def _span(value: object) -> int:
         return 1
 
 
-def expand_table(table) -> list[list[str]]:
+def expand_table(table, *, cell_rows: list | None = None) -> list[list[str]]:
     """Expand all rowspans/colspans into a logical grid.
 
     A day separator is authoritative and clears a stale day rowspan left by the
@@ -105,8 +106,9 @@ def expand_table(table) -> list[list[str]]:
     the portal's nested first lesson, normal tbody markup and rowspans in any
     column.
     """
-    active: dict[int, tuple[str, int]] = {}
+    active: dict[int, tuple[str, Any, int]] = {}
     logical_rows: list[dict[int, str]] = []
+    owners: list[dict[int, Any]] = []
     max_width = 0
     header_width: int | None = None
     date_column: int | None = None
@@ -125,11 +127,13 @@ def expand_table(table) -> list[list[str]]:
             current_day = starts_day_abbr
 
         row: dict[int, str] = {}
-        next_active: dict[int, tuple[str, int]] = {}
-        for col, (value, rows_left) in active.items():
+        cells_by_column: dict[int, Any] = {}
+        next_active: dict[int, tuple[str, Any, int]] = {}
+        for col, (value, cell, rows_left) in active.items():
             row[col] = value
+            cells_by_column[col] = cell
             if rows_left > 1:
-                next_active[col] = (value, rows_left - 1)
+                next_active[col] = (value, cell, rows_left - 1)
         if header_width is not None and date_column is not None and current_day and not starts_day:
             row.setdefault(date_column, current_day)
 
@@ -164,19 +168,24 @@ def expand_table(table) -> list[list[str]]:
                 while col in row:
                     col += 1
                 row[col] = value
+                cells_by_column[col] = cell
                 if rowspan > 1:
-                    next_active[col] = (value, rowspan - 1)
+                    next_active[col] = (value, cell, rowspan - 1)
                 col += 1
                 placed += 1
         active = next_active
         max_width = max(max_width, max(row, default=-1) + 1)
         logical_rows.append(row)
+        if cell_rows is not None:
+            owners.append(cells_by_column)
         normalized = {normalize_header(value): column for column, value in row.items() if value}
         if SCHEDULE_TABLE_HEADERS.issubset(normalized):
             header_width = max(row, default=-1) + 1
             date_column = normalized["дата"]
             time_column = normalized["время"]
             current_day = None
+    if cell_rows is not None:
+        cell_rows.extend([[row.get(col) for col in range(max_width)] for row in owners])
     return [[row.get(col, "") for col in range(max_width)] for row in logical_rows]
 
 
@@ -192,9 +201,10 @@ def schedule_header(grid: list[list[str]]) -> tuple[int, dict[str, int]] | None:
     return None
 
 
-def find_schedule_table(soup: BeautifulSoup):
-    """Return the best schedule table instead of the first partial candidate."""
+def find_schedule_table_grid(soup: BeautifulSoup):
+    """Return the best schedule table together with its expanded grid."""
     best = None
+    best_grid = None
     best_score = (-1, -1)
     for table in soup.find_all("table"):
         grid = expand_table(table)
@@ -206,13 +216,19 @@ def find_schedule_table(soup: BeautifulSoup):
         nonempty_rows = sum(bool(row[mapping["предмет"]].strip()) for row in grid[header_index + 1:] if len(row) > mapping["предмет"])
         score = (known, nonempty_rows)
         if score > best_score:
-            best, best_score = table, score
-    return best
+            best, best_grid, best_score = table, grid, score
+    return best, best_grid
+
+
+def find_schedule_table(soup: BeautifulSoup):
+    """Return the best schedule table instead of the first partial candidate."""
+    return find_schedule_table_grid(soup)[0]
 
 
 def _group_link_params(href: object) -> dict[str, str] | None:
     try:
-        query = urllib.parse.parse_qs(urllib.parse.urlsplit(str(href)).query)
+        split = urllib.parse.urlsplit(str(href))
+        query = urllib.parse.parse_qs(split.query)
         page = (query.get("page") or [""])[0]
         inst_id = (query.get("instId") or [""])[0].strip()
         name = (query.get("name") or [""])[0].strip()
@@ -222,7 +238,20 @@ def _group_link_params(href: object) -> dict[str, str] | None:
         return None
     if page != "EditViewGroup" or not (inst_id.isdigit() and name and typ and year.isdigit()):
         return None
-    return {"inst_id": inst_id, "group": name, "type": typ, "year": year}
+    result = {"inst_id": inst_id, "group": name, "type": typ, "year": year}
+    # Preserve the route path so the resolver knows which timetable route
+    # (ochn/zaochn/session) this group link came from.
+    path = split.path.strip("/")
+    if path:
+        result["route_path"] = path
+        # Extract route key from known path patterns like
+        # "univer/timetable/ochn/i.1103357" or "univer/timetable/zaochn".
+        parts = path.split("/")
+        if "timetable" in parts:
+            idx = parts.index("timetable")
+            if idx + 1 < len(parts):
+                result["route"] = parts[idx + 1]
+    return result
 
 
 def parse_institutes(html: str) -> list[dict]:
@@ -269,12 +298,8 @@ def parse_groups(html: str, inst_id: str | None = None) -> list[dict]:
     return groups
 
 
-def count_schedule_lessons(html: str, span=None) -> int:
+def count_schedule_grid_lessons(grid: list[list[str]]) -> int:
     """Count semantic lesson rows using the complete logical table grid."""
-    table = find_schedule_table(BeautifulSoup(html, "html.parser"))
-    if table is None:
-        raise ValueError("schedule table not found")
-    grid = expand_table(table)
     header = schedule_header(grid)
     if header is None:
         raise ValueError("schedule header not found")
@@ -297,6 +322,14 @@ def count_schedule_lessons(html: str, span=None) -> int:
         if current_day and subject:
             count += 1
     return count
+
+
+def count_schedule_lessons(html: str, span=None) -> int:
+    """Count semantic lesson rows using the complete logical table grid."""
+    table, grid = find_schedule_table_grid(BeautifulSoup(html, "html.parser"))
+    if table is None or grid is None:
+        raise ValueError("schedule table not found")
+    return count_schedule_grid_lessons(grid)
 
 
 def source_content_until_print(source_html: str):
@@ -361,6 +394,102 @@ DIFF_HIGHLIGHT_CSS = """
                          vertical-align: -3px; border: 3px solid #c1440e; background: #ffb02e; }
   .diff-legend .swatch.added { border-color: #14682c; background: #56d364; }
 """
+
+SCHEDULE_STATUS_CSS = """
+  /* Обычные очные строки остаются ровно такими, как на портале. */
+  tr.schedule-dot > td, td.schedule-dot {
+    background: #eef5ff !important;
+  }
+  tr.schedule-dot > td:first-child, td.schedule-dot:first-child {
+    box-shadow: inset 7px 0 0 #5b7fa6;
+  }
+  tr.schedule-inactive > td, td.schedule-inactive {
+    background: #f1f3f5 !important;
+    color: #64748b !important;
+  }
+  tr.schedule-inactive > td:first-child, td.schedule-inactive:first-child {
+    box-shadow: inset 7px 0 0 #94a3b8;
+  }
+  tr.schedule-inactive .schedule-status-content, td.schedule-inactive > .schedule-status-content {
+    opacity: .56;
+    text-decoration: line-through;
+    text-decoration-thickness: 2px;
+  }
+  .schedule-status-tag {
+    display: block; width: fit-content; margin: 0 0 5px; padding: 2px 8px;
+    border-radius: 5px; color: #fff; background: #5b7fa6;
+    font-size: 19px; line-height: 1.25; font-weight: 800; letter-spacing: .35px;
+    text-decoration: none !important; white-space: normal; max-width: 100%;
+  }
+  tr.schedule-inactive .schedule-status-tag, td.schedule-inactive .schedule-status-tag {
+    background: #64748b;
+  }
+"""
+
+COMPARISON_SCREEN_CSS = """
+  .wrap { width: 1480px; }
+  table.comparison-table { table-layout: fixed; }
+  .comparison-table td, .comparison-table th {
+    width: auto !important; min-width: 0 !important;
+    white-space: normal !important; overflow-wrap: anywhere;
+  }
+  .comparison-heading { font-size: 30px; font-weight: 800; margin: 0 0 12px; }
+  .comparison-table .comparison-changed {
+    background: #ffe28a !important; box-shadow: inset 0 0 0 3px #b78103;
+  }
+  .comparison-table .comparison-added { background: #d6f5d6 !important; }
+  .comparison-table .comparison-removed { background: #fce4e4 !important; }
+  .comparison-tag {
+    display: block; width: fit-content; margin: 0 0 5px; padding: 2px 8px;
+    border-radius: 4px; font-size: 20px; font-weight: 700; line-height: 1.25;
+    background: #14682c; color: #fff;
+  }
+  .comparison-removed .comparison-tag { background: #a13434; }
+"""
+
+
+def _mark_comparison_table(table, marks: list[dict]) -> None:
+    """Annotate source cells, including inherited rowspans, without text matching."""
+    cell_rows: list = []
+    grid = expand_table(table, cell_rows=cell_rows)
+    header = schedule_header(grid)
+    if header is None:
+        return
+    header_index, columns = header
+    by_row = {mark["source_row"]: mark for mark in marks}
+    users: dict[int, set[int]] = {}
+    for index, row in enumerate(grid):
+        if index <= header_index or not row[columns["предмет"]] or day_token(row[columns["предмет"]]):
+            continue
+        for cell in cell_rows[index]:
+            if cell is not None:
+                users.setdefault(id(cell), set()).add(index)
+    soup = BeautifulSoup("", "html.parser")
+    for index, mark in by_row.items():
+        if index not in range(header_index + 1, len(cell_rows)):
+            continue
+        kind = mark["kind"]
+        row = cell_rows[index]
+        names = mark.get("columns", []) if kind == "changed" else columns.keys()
+        tagged = []
+        for name in names:
+            column = columns.get(name)
+            cell = row[column] if column is not None else None
+            if cell is None or name == "дата":
+                continue
+            # Shared cells stay neutral if an unchanged alternative uses them.
+            if kind != "changed" and any(by_row.get(other, {}).get("kind") != kind for other in users.get(id(cell), set())):
+                continue
+            cell["class"] = list(dict.fromkeys([*cell.get("class", []), f"comparison-{kind}"]))
+            tagged.append(cell)
+        if kind in {"added", "removed"} and tagged:
+            subject = row[columns["предмет"]]
+            target = next((cell for cell in tagged if cell is subject), tagged[0])
+            if target.select_one(".comparison-tag") is None:
+                tag = soup.new_tag("span", attrs={"class": "comparison-tag"})
+                tag.string = "Добавили" if kind == "added" else "Убрали"
+                target.insert(0, tag)
+
 
 _DIFF_TIME_RE = re.compile(r"\d{1,2}:\d{2}")
 _DIFF_MIN_SCORE = 3.0
@@ -482,6 +611,199 @@ def highlight_day_group(group: list[str], items: list[dict]) -> tuple[list[str],
     return out, marked_total
 
 
+def _status_row_score(row_norm: str, item: dict) -> float:
+    score = _diff_row_score(row_norm, item)
+    if score < _DIFF_MIN_SCORE:
+        return 0.0
+    row_is_dot = "дот" in row_norm
+    item_is_dot = bool(item.get("_schedule_dot"))
+    if item_is_dot != row_is_dot:
+        return 0.0
+    room = norm_text(item.get("room"))
+    if room and room not in {"—", "."}:
+        if room not in row_norm:
+            return 0.0
+        score += 2.0
+    return score
+
+
+def _mark_schedule_status(row, item: dict) -> None:
+    status = str(item.get("_schedule_status") or "")
+    if status not in {"dot", "inactive"}:
+        return
+    row["class"] = [*row.get("class", []), f"schedule-{status}"]
+    cells = row.find_all(["td", "th"], recursive=False)
+    if status == "inactive":
+        soup = BeautifulSoup("", "html.parser")
+        for cell in cells:
+            wrapper = soup.new_tag("span")
+            wrapper["class"] = ["schedule-status-content"]
+            for child in list(cell.contents):
+                wrapper.append(child.extract())
+            cell.append(wrapper)
+
+    subject = norm_text(str(item.get("subject") or "").split("\n", 1)[0])
+    target = next((cell for cell in cells if subject and subject in norm_text(cell.get_text(" ", strip=True))), None)
+    if target is None and cells:
+        target = cells[min(2, len(cells) - 1)]
+    if target is not None:
+        soup = BeautifulSoup("", "html.parser")
+        tag = soup.new_tag("span")
+        tag["class"] = ["schedule-status-tag"]
+        tag.string = str(item.get("_schedule_tag") or ("ДОТ" if status == "dot" else "НЕ АКТУАЛЬНО"))
+        target.insert(0, tag)
+
+
+def annotate_schedule_day_group(group: list[str], items: list[dict]) -> tuple[list[str], int]:
+    """Mark only active DOT and lessons not applicable to the selected date."""
+    marked_total = 0
+    out: list[str] = []
+    for row_html in group:
+        soup = BeautifulSoup(row_html, "html.parser")
+        rows = soup.find_all("tr")
+        best: dict[int, tuple[dict, float]] = {}
+        for row in rows:
+            row_norm = norm_text(row.get_text(" ", strip=True))
+            top_item, top_score = None, 0.0
+            for item in items:
+                score = _status_row_score(row_norm, item)
+                if score > top_score:
+                    top_item, top_score = item, score
+            if top_item is not None:
+                best[id(row)] = (top_item, top_score)
+        hits = 0
+        for row in rows:
+            if id(row) not in best:
+                continue
+            if any(id(child) in best for child in row.find_all("tr")):
+                continue
+            _mark_schedule_status(row, best[id(row)][0])
+            hits += 1
+        marked_total += hits
+        out.append(str(soup) if hits else row_html)
+    return out, marked_total
+
+
+def _dashboard_schedule_table(table, statuses: dict[str, list[dict]]):
+    """Project retained source cells, transferring rowspans out of expired rows."""
+    owners: list = []
+    grid = expand_table(table, cell_rows=owners)
+    header_index, columns = schedule_header(grid)
+    source_rows = list(iter_table_rows(table))
+    width = max(columns.values()) + 1
+    date_col, subject_col = columns["дата"], columns["предмет"]
+    days: dict[str, list[int]] = {}
+    for index in range(header_index + 1, len(grid)):
+        row = grid[index]
+        day = day_short(row[date_col])
+        if day and row[subject_col] and day_token(row[subject_col]) != day:
+            if any(value.strip() for value in row[width:]):
+                raise ValueError("unrecognized dashboard source row")
+            days.setdefault(day, []).append(index)
+    marks = {}
+    for day, items in statuses.items():
+        for item in items:
+            index = item.get("source_row")
+            if type(index) is not int or index not in days.get(day, []):
+                raise ValueError("dashboard status has no matching source row")
+            evidence = {"subject_raw": "предмет", "raw_time": "время",
+                        "raw_room": "ауд.", "raw_comment": "комм."}
+            subject = item.get("subject_raw", str(item.get("subject") or "").split("\n", 1)[0])
+            if norm_text(subject) != norm_text(grid[index][subject_col]):
+                raise ValueError("dashboard subject provenance mismatch")
+            for key, name in evidence.items():
+                if key in item and name in columns and norm_text(item[key]) != norm_text(grid[index][columns[name]]):
+                    raise ValueError("dashboard cell provenance mismatch")
+            if index in marks:
+                raise ValueError("duplicate dashboard status source row")
+            marks[index] = item
+
+    # Detach children first so malformed nested day rows cannot duplicate or
+    # swallow another lesson when a source cell is copied below.
+    for row in reversed(source_rows):
+        row.extract()
+    soup = BeautifulSoup("", "html.parser")
+    result = soup.new_tag("table", attrs=dict(table.attrs))
+    result.append(copy.deepcopy(source_rows[header_index]))
+    for day, indices in days.items():
+        kept = [index for index in indices if marks.get(index, {}).get("_schedule_expired") is not True]
+        if not kept:
+            continue
+        day_cell = next((owners[index][date_col] for index in kept if owners[index][date_col] is not None), None)
+        if day_cell is None:
+            day_cell = soup.new_tag("td")
+            day_cell.string = day
+        matrix = []
+        for index in kept:
+            cells = list(owners[index][:width])
+            cells[date_col] = day_cell
+            for col, cell in enumerate(cells):
+                if cell is None:
+                    cells[col] = soup.new_tag("td")
+            matrix.append(cells)
+        footprints: dict[int, set[tuple[int, int]]] = {}
+        for r, cells in enumerate(matrix):
+            for c, cell in enumerate(cells):
+                footprints.setdefault(id(cell), set()).add((r, c))
+        rendered_cells = {}
+        for r, index in enumerate(kept):
+            row = soup.new_tag("tr", attrs=dict(source_rows[index].attrs))
+            row["data-source-row"] = str(index)
+            status = marks.get(index, {}).get("_schedule_status")
+            if status in {"dot", "inactive"}:
+                row["data-schedule-status"] = status
+            for c, original in enumerate(matrix[r]):
+                positions = footprints[id(original)]
+                first_row = min(pos[0] for pos in positions)
+                first_col = min(pos[1] for pos in positions)
+                if (r, c) != (first_row, first_col):
+                    continue
+                last_row = max(pos[0] for pos in positions)
+                last_col = max(pos[1] for pos in positions)
+                expected = {(rr, cc) for rr in range(r, last_row + 1) for cc in range(c, last_col + 1)}
+                if positions != expected:
+                    raise ValueError("non-rectangular dashboard cell span")
+                cell = copy.deepcopy(original)
+                cell.attrs.pop("rowspan", None)
+                cell.attrs.pop("colspan", None)
+                if last_row > r:
+                    cell["rowspan"] = str(last_row - r + 1)
+                if last_col > c:
+                    cell["colspan"] = str(last_col - c + 1)
+                states = {marks.get(kept[rr], {}).get("_schedule_status", "") for rr, _ in positions}
+                if c != date_col and len(states) == 1 and states <= {"dot", "inactive"}:
+                    state = next(iter(states))
+                    cell["class"] = [*cell.get("class", []), f"schedule-{state}"]
+                    if state == "inactive":
+                        wrapper = soup.new_tag("span", attrs={"class": "schedule-status-content"})
+                        for child in list(cell.contents):
+                            wrapper.append(child.extract())
+                        cell.append(wrapper)
+                row.append(cell)
+                for position in positions:
+                    rendered_cells[position] = cell
+            result.append(row)
+        for r, index in enumerate(kept):
+            mark = marks.get(index, {})
+            if mark.get("_schedule_status") not in {"dot", "inactive"}:
+                continue
+            candidates = [subject_col, *[c for c in range(width) if c not in {date_col, subject_col}]]
+            for c in candidates:
+                positions = footprints[id(matrix[r][c])]
+                tags = {(marks.get(kept[rr], {}).get("_schedule_status"), marks.get(kept[rr], {}).get("_schedule_tag")) for rr, _ in positions}
+                if len(tags) != 1:
+                    continue
+                cell = rendered_cells[(r, c)]
+                if cell.select_one(".schedule-status-tag") is None:
+                    tag = soup.new_tag("span", attrs={"class": "schedule-status-tag"})
+                    tag.string = str(mark.get("_schedule_tag") or "ДОТ")
+                    cell.insert(0, tag)
+                break
+            else:
+                raise ValueError("cannot label a shared dashboard status cell")
+    return result
+
+
 def render_schedule_day_chunk_htmls(
     source_html: str,
     source_url: str,
@@ -489,33 +811,72 @@ def render_schedule_day_chunk_htmls(
     diff_items: list[dict] | None = None,
     diff_legend: str = "",
     removed_note: bool = True,
+    schedule_statuses: dict[str, list[dict]] | None = None,
+    comparison_title: str = "",
+    comparison_marks: list[dict] | None = None,
 ) -> list[dict]:
     content = source_content_until_print(source_html)
-    table = find_schedule_table(content)
+    table = (
+        content
+        if getattr(content, "name", None) == "table" and schedule_header(expand_table(content)) is not None
+        else find_schedule_table(content)
+    )
     if table is None:
-        return [render_schedule_crop_html(source_html, source_url)]
+        return [{"label": "с сайта", "html": render_schedule_crop_html(source_html, source_url), "marked": 0}]
 
     header_parts = []
-    for child in content.find_all(recursive=False):
-        if child is table:
-            break
-        header_parts.append(str(child))
+    colgroup = ""
+    if comparison_title:
+        header = schedule_header(expand_table(table))
+        weights = {"дата": 7, "время": 10, "под гр.": 7, "предмет": 28,
+                   "преподаватель": 18, "ауд.": 10, "комм.": 20}
+        names = {column: name for name, column in header[1].items()}
+        widths = [weights.get(names.get(column), 10) for column in range(max(names) + 1)]
+        colgroup = "<colgroup>" + "".join(
+            f'<col style="width:{width / sum(widths) * 100:.4f}%">' for width in widths
+        ) + "</colgroup>"
+        _mark_comparison_table(table, comparison_marks or [])
+
+    if content is not table:
+        branch = table
+        while branch is not content and branch.parent is not None:
+            prefix = [str(sibling) for sibling in reversed(list(branch.previous_siblings))
+                      if getattr(sibling, "name", None)]
+            header_parts[0:0] = prefix
+            branch = branch.parent
+
+    dashboard = schedule_statuses is not None and not comparison_title
+    if dashboard:
+        table = _dashboard_schedule_table(table, schedule_statuses)
+        if len(list(iter_table_rows(table))) <= 1:
+            return []
 
     # Keep the portal's invalid outer day rows intact for rendering (they
     # already contain the nested first lesson).  Fall back to the semantic row
     # iterator for normal thead/tbody markup.
-    rows = table.find_all("tr", recursive=False)
-    if not rows:
+    # The portal nests the first lesson inside an outer day row. Serializing
+    # both rows duplicates that lesson in the screenshot because the outer
+    # row already contains the nested markup.
+    rows = [
+        row for row in iter_table_rows(table)
+        if row.find_parent("tr") is None
+        or row.find_parent("tr").find_parent("table") is not table
+    ]
+    if comparison_title:
+        # Flatten owned rows once: an unclosed day row may also contain the
+        # next day's separator, not just its own first lesson.
         rows = list(iter_table_rows(table))
+        for row in reversed(rows):
+            row.extract()
     if not rows:
-        return [render_schedule_crop_html(source_html, source_url)]
+        return [{"label": "с сайта", "html": render_schedule_crop_html(source_html, source_url), "marked": 0}]
 
     table_header = str(rows[0])
     day_groups: list[list[str]] = []
     current: list[str] = []
     for row in rows[1:]:
         cells = [text(cell) for cell in row.find_all(["td", "th"], recursive=False)]
-        is_day_row = len(cells) == 1 and day_token(cells[0]) is not None
+        is_day_row = bool(cells) and day_token(cells[0]) is not None and (comparison_title or dashboard or len(cells) == 1)
         if is_day_row and current:
             day_groups.append(current)
             current = []
@@ -523,7 +884,7 @@ def render_schedule_day_chunk_htmls(
     if current:
         day_groups.append(current)
     if not day_groups:
-        return [render_schedule_crop_html(source_html, source_url)]
+        return [{"label": "с сайта", "html": render_schedule_crop_html(source_html, source_url), "marked": 0}]
 
     print_link = content.find(string=lambda value: value and "Распечатать" in value)
     print_html = f'<p class="print-link">{print_link.parent}</p>' if print_link and print_link.parent else ""
@@ -535,7 +896,10 @@ def render_schedule_day_chunk_htmls(
         labels = [_day_label_from_group(group) for group in groups]
         rendered: list[list[str]] = []
         marked = 0
+        status_marked = 0
         for group, label in zip(groups, labels):
+            if dashboard:
+                status_marked += sum(row.count('data-schedule-status=') for row in group)
             group_items = [
                 item for item in (diff_items or []) if day_short(item.get("day")) == label
             ]
@@ -543,8 +907,9 @@ def render_schedule_day_chunk_htmls(
                 group, hits = highlight_day_group(group, group_items)
                 marked += hits
             rendered.append(group)
-        table_html = '<table border="1" class="shedultable" style="border-spacing: 1px">'
-        table_html += table_header
+        table_class = "shedultable comparison-table" if comparison_title else "shedultable"
+        table_html = f'<table border="1" class="{table_class}" style="border-spacing: 1px">'
+        table_html += colgroup + table_header
         table_html += "".join("".join(group) for group in rendered)
         table_html += "</table>"
         # Какие именно правки легли на скрин: подпись в посте обещает только
@@ -581,15 +946,26 @@ def render_schedule_day_chunk_htmls(
                 )
             legend = '<div class="diff-legend">' + "".join(rows) + "</div>"
         suffix = print_html if start + days_per_chunk >= len(day_groups) else ""
+        comparison_heading = (
+            '<div class="comparison-heading">'
+            + htmlmod.escape(comparison_title + " · " + " + ".join(labels)) + "</div>"
+            if comparison_title else ""
+        )
+        comparison_kinds = sorted({
+            kind for kind in ("changed", "added", "removed") if f'comparison-{kind}' in table_html
+        })
         chunks.append({
             "label": " + ".join(labels),
             "html": wrap_schedule_html(
-                "".join(header_parts) + table_html + legend + suffix,
+                comparison_heading + "".join(header_parts) + table_html + legend + suffix,
                 source_url,
-                extra_css=DIFF_HIGHLIGHT_CSS if marked else "",
+                extra_css=(SCHEDULE_STATUS_CSS if status_marked else "") + (DIFF_HIGHLIGHT_CSS if marked else "")
+                + (COMPARISON_SCREEN_CSS if comparison_title else ""),
             ),
             "marked": marked,
+            **({"status_marked": status_marked} if status_marked else {}),
             **({"marked_kinds": sorted(kinds)} if kinds else {}),
+            **({"comparison_kinds": comparison_kinds} if comparison_title else {}),
         })
     return chunks
 

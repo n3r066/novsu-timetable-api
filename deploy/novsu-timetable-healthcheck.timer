@@ -1,0 +1,10 @@
+[Unit]
+Description=Hourly health check for NovSU timetable monitor
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=1h
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target

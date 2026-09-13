@@ -1,6 +1,7 @@
 import json
 from pathlib import Path
 
+import parse
 from parse import parse_all, parse_schedule
 
 
@@ -219,3 +220,19 @@ def test_garbage_time_cell_is_not_silently_repaired():
     assert [lesson["time"] for lesson in lessons] == ["—", "9:00 10:00"]
     # Портальное написание сохраняется в raw_time для отладки и диффов.
     assert lessons[1]["raw_time"] == "9:00 10:00"
+def test_parse_all_reuses_selected_table_grid(monkeypatch):
+    html = Path("tests/fixtures/rowspan_time.html").read_text(encoding="utf-8")
+    original = parse.expand_table
+    calls = []
+
+    def counted(table):
+        calls.append(table)
+        return original(table)
+
+    monkeypatch.setattr("portal_parser.expand_table", counted)
+    data = parse_all(html)
+    parsed_count = sum(len(rows) for rows in data["schedule"]["days"].values())
+    assert data["physical_lesson_count"] == parsed_count
+    # find_schedule_table_grid scans each table once; parse_schedule and the
+    # physical-count invariant reuse the selected grid instead of expanding it again.
+    assert len({id(table) for table in calls}) == len(calls)

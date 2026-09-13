@@ -81,6 +81,19 @@ def test_persist_is_idempotent_by_url_semantic_fingerprint_and_parser(tmp_path):
         ).fetchone()
         assert raw == hashlib.sha256(html_a.encode()).hexdigest()
         assert semantic == api.content_fingerprint(parsed)
+        head = db.execute("select snapshot_id from snapshot_heads where url=?", ("https://example.test/a",)).fetchone()
+        assert head == (first,)
+
+
+def test_latest_snapshot_returns_parsed_data_without_fetch(tmp_path):
+    parsed = api.parse_all(SCHEDULE_HTML)
+    path = tmp_path / "snapshot.sqlite3"
+    with api.connect(path) as db:
+        snapshot_id = api.persist(db, SCHEDULE_HTML, "https://example.test/a", parsed)
+    loaded = api.load_latest_snapshot("https://example.test/a", db_path=path, max_age_s=60)
+    assert loaded["snapshot_id"] == snapshot_id
+    assert loaded["html"] == SCHEDULE_HTML
+    assert loaded["data"] == parsed
 
 
 def test_stub_persists_without_lessons(tmp_path):
@@ -184,7 +197,7 @@ def test_find_groups_prioritises_6381(monkeypatch):
     <tr><td><a href="?page=EditViewGroup&instId=868342&name=16381&type=%D0%92%D0%9E&year=2021">16381</a></td></tr>
     </table>
     """
-    monkeypatch.setattr(api, "_index_html", lambda: html)
+    monkeypatch.setattr(api, "_all_index_html", lambda: {"ochn": html})
     matches = api.find_groups("638")
     assert [item["group"] for item in matches] == ["6381", "6382", "16381"]
     assert matches[0]["inst_id"] == "2244947"
@@ -196,10 +209,10 @@ def test_resolve_group_finds_any_exact_group(monkeypatch):
     <tr><td><a href="?page=EditViewGroup&instId=868342&name=5731&type=%D0%92%D0%9E&year=2026">5731</a></td></tr>
     </table>
     """
-    monkeypatch.setattr(api, "_index_html", lambda: html)
+    monkeypatch.setattr(api, "_all_index_html", lambda: {"ochn": html})
     assert api.resolve_group("5731") == {
         "group": "5731", "inst_id": "868342", "type": "ВО",
-        "year": "2026", "institute": "ПИ",
+        "year": "2026", "institute": "ПИ", "route": "ochn",
     }
 
 
@@ -214,6 +227,7 @@ def test_api_fetch_uses_common_fetcher(monkeypatch):
 
 def test_timetable_ttl_cache_avoids_repeated_fetch_and_persist(monkeypatch):
     api.clear_timetable_cache()
+    monkeypatch.setattr(api, "load_latest_snapshot", lambda *args, **kwargs: None)
     calls = []
 
     def fake_load(cfg):
@@ -228,8 +242,27 @@ def test_timetable_ttl_cache_avoids_repeated_fetch_and_persist(monkeypatch):
     api.clear_timetable_cache()
 
 
-def _request(monkeypatch, payload, path):
-    monkeypatch.setattr(api, "get_timetable", lambda *args, **kwargs: payload)
+def test_default_group_uses_materialized_snapshot_without_fetch(monkeypatch):
+    cfg = api.resolve_group(api.DEFAULT_GROUP)
+    materialized = {
+        "snapshot_id": 7,
+        "fetched_at": "2026-09-05T12:00:00+00:00",
+        "data": {"stub": False, "weeks": [], "schedule": {"days": {}}},
+    }
+    monkeypatch.setattr(api, "load_latest_snapshot", lambda url, **kwargs: materialized)
+    monkeypatch.setattr(api, "_load_timetable", lambda cfg: (_ for _ in ()).throw(AssertionError("must not fetch")))
+    result = api.get_timetable(cfg["group"])
+    assert result["snapshot_id"] == 7
+    assert result["schedule"] == {"days": {}}
+
+
+def _request(monkeypatch, payload, path, *, calls=None):
+    def load(*args, **kwargs):
+        if calls is not None:
+            calls.append((args, kwargs))
+        return payload
+
+    monkeypatch.setattr(api, "get_timetable", load)
     server = ThreadingHTTPServer(("127.0.0.1", 0), api.Handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -258,9 +291,101 @@ def test_api_returns_stub_as_normal_200_for_derived_views(monkeypatch):
 
 
 def test_api_invalid_parameter_is_400_before_fetch(monkeypatch):
-    status, body = _request(monkeypatch, {}, "/v1/timetables/6381/next?limit=nope")
+    calls = []
+    status, body = _request(monkeypatch, {}, "/v1/timetables/6381/next?limit=nope", calls=calls)
     assert status == 400
     assert body["error"] == "bad_request"
+    assert calls == []
+
+
+def _auto_week_payload():
+    return {"group": "6381", "stub": False, "source_url": "https://example.test",
+            "schedule": api.parse_all(SCHEDULE_HTML)["schedule"],
+            "weeks": [
+                {"week": 1, "half": "top", "start": "01.09.2026", "end": "05.09.2026"},
+                {"week": 2, "half": "bottom", "start": "07.09.2026", "end": "12.09.2026"},
+                {"week": 3, "half": "top", "start": "14.09.2026", "end": "19.09.2026"},
+                {"week": 18, "half": "bottom", "start": "28.12.2026", "end": "31.12.2026"},
+            ]}
+
+
+@pytest.mark.parametrize("anchor,number", [
+    ("2026-08-31", 1), ("2026-09-05", 1), ("2026-09-06", 2),
+    ("2026-09-12", 2), ("2026-09-13", 3), ("2026-12-27", 18),
+    ("2026-12-31", 18), ("13.09.2026", 3),
+])
+def test_api_auto_week_matches_fixed_week_view(monkeypatch, anchor, number):
+    payload = _auto_week_payload()
+    status, body = _request(monkeypatch, payload, f"/v1/timetables/6381/week?mode=auto&date={anchor}")
+    assert status == 200
+    selected = next(week for week in payload["weeks"] if week["week"] == number)
+    assert body == api.week_view(payload["schedule"], payload["weeks"], selected,
+                                 group="6381", source_url=payload["source_url"])
+
+
+def test_api_auto_week_ends_at_real_calendar_boundary(monkeypatch):
+    status, body = _request(monkeypatch, _auto_week_payload(), "/v1/timetables/6381/week?mode=auto&date=2027-01-01")
+    assert status == 404
+    assert body == {"error": "calendar_ended", "calendar_end": "2026-12-31"}
+
+
+def test_api_auto_week_distinguishes_unavailable_calendar_from_stub(monkeypatch):
+    payload = {**_auto_week_payload(), "weeks": []}
+    status, body = _request(monkeypatch, payload, "/v1/timetables/6381/week?mode=auto&date=2026-09-06")
+    assert status == 404 and body == {"error": "calendar_unavailable"}
+    payload.update(stub=True, schedule=None)
+    status, body = _request(monkeypatch, payload, "/v1/timetables/6381/week?mode=auto")
+    assert status == 200 and body == payload
+
+
+def test_api_auto_week_uses_moscow_today_not_utc(monkeypatch):
+    import datetime as dt
+    import schedule_logic
+
+    instant = dt.datetime(2026, 9, 5, 21, 30, tzinfo=dt.timezone.utc)
+
+    class Clock(dt.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return instant.astimezone(tz)
+
+    monkeypatch.setattr(schedule_logic.dt, "datetime", Clock)
+    status, body = _request(monkeypatch, _auto_week_payload(), "/v1/timetables/6381/week?mode=auto")
+    assert status == 200 and body["week"]["week"] == 2
+
+
+def test_api_auto_week_recomputes_selection_without_snapshot_changes(monkeypatch):
+    import datetime as dt
+
+    payload = _auto_week_payload()
+    for today, number in ((dt.date(2026, 9, 6), 2), (dt.date(2026, 9, 13), 3)):
+        monkeypatch.setattr(api, "parse_user_date", lambda value: today)
+        status, body = _request(monkeypatch, payload, "/v1/timetables/6381/week?mode=auto")
+        assert status == 200 and body["week"]["week"] == number
+        status, body = _request(monkeypatch, payload, "/v1/timetables/6381/week?week=2")
+        assert status == 200 and body["week"]["week"] == 2
+    status, body = _request(monkeypatch, payload, "/v1/timetables/6381/week")
+    assert status == 404 and body == {"error": "week_not_found"}
+
+
+@pytest.mark.parametrize("query", [
+    "mode=other", "mode=AUTO", "mode=", "mode=auto&mode=auto",
+    "mode=auto&week=2", "week=2&mode=auto", "mode=auto&week=",
+    "mode=auto&date=", "mode=auto&date=invalid", "mode=auto&date=today&date=tomorrow",
+])
+def test_api_auto_week_rejects_bad_parameters_before_loading(monkeypatch, query):
+    calls = []
+    status, body = _request(monkeypatch, {}, f"/v1/timetables/6381/week?{query}", calls=calls)
+    assert status == 400 and body["error"] == "bad_request"
+    assert calls == []
+
+
+@pytest.mark.parametrize("action", ["day", "next", ""])
+def test_api_mode_is_only_accepted_for_week(monkeypatch, action):
+    calls = []
+    status, body = _request(monkeypatch, {}, f"/v1/timetables/6381/{action}?mode=auto", calls=calls)
+    assert status == 400 and body["error"] == "bad_request"
+    assert calls == []
 
 
 def test_api_unexpected_parse_failure_is_502(monkeypatch):
@@ -288,7 +413,7 @@ def test_resolve_group_accepts_alphanumeric_group(monkeypatch):
     html = """<table><tr><th>ПИ</th></tr><tr><td>
     <a href="?page=EditViewGroup&instId=868342&name=544P&type=%D0%92%D0%9E&year=2026">544P</a>
     </td></tr></table>"""
-    monkeypatch.setattr(api, "_index_html", lambda: html)
+    monkeypatch.setattr(api, "_all_index_html", lambda: {"ochn": html})
     assert api.resolve_group("544P")["group"] == "544P"
 
 
@@ -332,3 +457,127 @@ def test_legacy_migration_keeps_newest_raw_copy_for_same_semantics(tmp_path):
         assert rows == [(2, latest)]
         assert migrated.execute("select snapshot_id from lessons").fetchall() == [(2,)]
         assert migrated.execute("pragma foreign_key_check").fetchall() == []
+
+
+# ---------------------------------------------------------------------------
+# Bug #1 regression tests: Route/Group Identity Model
+# ---------------------------------------------------------------------------
+
+
+def test_config_timetable_routes_and_backward_compat():
+    """TIMETABLE_ROUTES exposes ochn/zaochn/session; legacy aliases still work."""
+    import config
+
+    assert set(config.TIMETABLE_ROUTES) >= {"ochn", "zaochn", "session"}
+    assert config.PORTAL_TIMETABLE_BASE_URL == config.TIMETABLE_ROUTES["ochn"]["base_url"]
+    assert config.PORTAL_TIMETABLE_INDEX_URL == config.TIMETABLE_ROUTES["ochn"]["index_url"]
+    assert config.get_route_base_url("ochn") == config.PORTAL_TIMETABLE_BASE_URL
+    assert config.get_route_index_url("ochn") == config.PORTAL_TIMETABLE_INDEX_URL
+    assert "zaochn" in config.get_route_base_url("zaochn")
+    assert "i.1103358" in config.get_route_base_url("zaochn")
+    with pytest.raises(ValueError, match="unknown timetable route"):
+        config.get_route_base_url("spo")
+
+
+def test_build_group_url_uses_route_specific_base():
+    """A zaochn group must NOT be built through the hardcoded ochn base URL."""
+    import config
+
+    url_ochn = config.build_group_url(
+        "6381", {"group": "6381", "inst_id": "2244947", "type": "ДО", "year": "2026", "route": "ochn"}
+    )
+    url_zaochn = config.build_group_url(
+        "9201", {"group": "9201", "inst_id": "55", "type": "ЗО", "year": "2025", "route": "zaochn"}
+    )
+    assert url_ochn.startswith(config.TIMETABLE_ROUTES["ochn"]["base_url"])
+    assert url_zaochn.startswith(config.TIMETABLE_ROUTES["zaochn"]["base_url"])
+    assert "zaochn/i.1103358" in url_zaochn
+    assert "ochn/i.1103357" not in url_zaochn
+    # route kwarg overrides group_ref
+    url_override = config.build_group_url(
+        "9201", {"group": "9201", "inst_id": "55", "type": "ЗО", "year": "2025"}, route="zaochn"
+    )
+    assert url_override.startswith(config.TIMETABLE_ROUTES["zaochn"]["base_url"])
+
+
+def test_group_link_params_preserves_route_path():
+    """_group_link_params must keep the path so resolver knows the route."""
+    from portal_parser import _group_link_params
+
+    href = "/univer/timetable/zaochn/i.1103358/?page=EditViewGroup&instId=55&name=9201&type=%D0%97%D0%9E&year=2025"
+    params = _group_link_params(href)
+    assert params is not None
+    assert params["group"] == "9201"
+    assert params["route"] == "zaochn"
+    assert "zaochn" in params["route_path"]
+
+    href_ochn = "?page=EditViewGroup&instId=2244947&name=6381&type=%D0%94%D0%9E&year=2026"
+    params_ochn = _group_link_params(href_ochn)
+    assert params_ochn is not None
+    assert params_ochn["group"] == "6381"
+    # Query-only link has no path → no route info, which is fine (legacy fixture).
+    assert "route" not in params_ochn
+
+
+def test_parse_groups_extracts_route_from_full_href():
+    from portal_parser import parse_groups
+
+    html = """<table><tr><th>ИЭ</th></tr><tr><td>
+    <a href="/univer/timetable/zaochn/i.1103358/?page=EditViewGroup&instId=55&name=9201&type=%D0%97%D0%9E&year=2025">9201</a>
+    </td></tr></table>"""
+    groups = parse_groups(html)
+    assert groups[0]["group"] == "9201"
+    assert groups[0]["route"] == "zaochn"
+
+
+def test_resolver_preserves_route_for_zaochn_group(monkeypatch):
+    """A ЗО group resolved from the zaochn index keeps route=zaochn and
+    builds its URL against the zaochn base, not the ochn one."""
+    import config
+
+    zaochn_html = """<table><tr><th>ИЭ</th></tr><tr><td>
+    <a href="/univer/timetable/zaochn/i.1103358/?page=EditViewGroup&instId=55&name=9201&type=%D0%97%D0%9E&year=2025">9201</a>
+    </td></tr></table>"""
+    monkeypatch.setattr(api, "_all_index_html", lambda: {"ochn": "<html></html>", "zaochn": zaochn_html})
+    ref = api.resolve_group("9201")
+    assert ref["route"] == "zaochn"
+    url = api.source_url("9201", ref)
+    assert url.startswith(config.TIMETABLE_ROUTES["zaochn"]["base_url"])
+    assert "ochn/i.1103357" not in url
+
+
+def test_find_groups_returns_ambiguity_across_routes(monkeypatch):
+    """Same group number present in ochn and zaochn must surface both matches
+    and resolve_group must raise AmbiguousGroupError instead of picking one."""
+    ochn_html = """<table><tr><th>ИЭ</th></tr><tr><td>
+    <a href="/univer/timetable/ochn/i.1103357/?page=EditViewGroup&instId=2244947&name=9999&type=%D0%94%D0%9E&year=2026">9999</a>
+    </td></tr></table>"""
+    zaochn_html = """<table><tr><th>ИЭ</th></tr><tr><td>
+    <a href="/univer/timetable/zaochn/i.1103358/?page=EditViewGroup&instId=55&name=9999&type=%D0%97%D0%9E&year=2025">9999</a>
+    </td></tr></table>"""
+    monkeypatch.setattr(api, "_all_index_html", lambda: {"ochn": ochn_html, "zaochn": zaochn_html})
+
+    matches = api.find_groups("9999")
+    assert len(matches) == 2
+    assert {m["route"] for m in matches} == {"ochn", "zaochn"}
+
+    with pytest.raises(api.AmbiguousGroupError) as caught:
+        api.resolve_group("9999")
+    assert len(caught.value.groups) == 2
+
+
+def test_known_groups_6381_and_5234_keep_ochn_route():
+    """Known groups keep working and carry route=ochn; URLs stay on ochn base."""
+    import config
+
+    ref_6381 = api.resolve_group("6381")
+    assert ref_6381["route"] == "ochn"
+    assert api.source_url("6381", ref_6381).startswith(config.TIMETABLE_ROUTES["ochn"]["base_url"])
+
+    ref_5234 = api.resolve_group("5234")
+    assert ref_5234["route"] == "ochn"
+    assert ref_5234["inst_id"] == "868344"
+    assert api.source_url("5234", ref_5234).startswith(config.TIMETABLE_ROUTES["ochn"]["base_url"])
+
+    # default alias still resolves to 6381 with ochn route
+    assert api.resolve_group("default")["route"] == "ochn"

@@ -40,6 +40,7 @@ def test_three_hours_keep_the_trailing_single_hour_visible():
     assert slot.pairs == 2
     assert slot.label() == "16:00–17:45 + 18:00–18:45"
     assert "1 ак. ч." in slot.label_full()
+    assert slot.label_cell() == "16:00–17:45\n18:00–18:45"
 
 
 def test_gap_between_hours_splits_blocks():

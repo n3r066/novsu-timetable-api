@@ -10,9 +10,75 @@ from schedule_logic import (
     lesson_applies_on,
     next_lessons,
     parse_user_date,
+    dashboard_presentation_fingerprint,
+    resolve_dashboard_view,
     visible_week_days,
     week_view,
 )
+
+
+def test_dashboard_view_advances_after_saturdays_last_pair():
+    before = resolve_dashboard_view(SCHEDULE, WEEKS, dt.datetime(2026, 9, 5, 12, 30))
+    after = resolve_dashboard_view(SCHEDULE, WEEKS, dt.datetime(2026, 9, 5, 14, 0))
+    assert before["target_date"] == dt.date(2026, 9, 5)
+    assert after["target_date"] == dt.date(2026, 9, 7)
+    assert after["week"]["week"] == 2
+
+
+def test_dashboard_view_does_not_fall_back_to_first_week_after_calendar():
+    view = resolve_dashboard_view(SCHEDULE, WEEKS, dt.datetime(2026, 12, 1, 12, 0))
+    assert view == {"target_date": dt.date(2026, 12, 1), "week": None, "live_days": []}
+
+
+def test_dashboard_presentation_changes_only_when_view_changes():
+    view = resolve_dashboard_view(SCHEDULE, WEEKS, dt.datetime(2026, 9, 5, 12, 30))
+    assert dashboard_presentation_fingerprint("fp", view) == dashboard_presentation_fingerprint("fp", dict(view))
+    assert dashboard_presentation_fingerprint("fp", view) != dashboard_presentation_fingerprint("fp2", view)
+
+
+def test_dashboard_rolls_top_bottom_top_with_unchanged_schedule():
+    """Long-running dashboard alternates parity without a portal content change."""
+    weeks = [
+        {"week": 1, "half": "top", "start": "31.08.2026", "end": "05.09.2026"},
+        {"week": 2, "half": "bottom", "start": "07.09.2026", "end": "12.09.2026"},
+        {"week": 3, "half": "top", "start": "14.09.2026", "end": "19.09.2026"},
+    ]
+    schedule = {"days": {
+        "Понедельник": [
+            {"subject": "Только верхняя", "time": "09:00 10:00", "note": "по верхней неделе"},
+            {"subject": "Только нижняя", "time": "11:00 12:00", "note": "по нижней неделе"},
+        ],
+        "Суббота": [
+            {"subject": "Субботняя верхняя", "time": "09:00 10:00", "note": "по верхней неделе"},
+            {"subject": "Субботняя нижняя", "time": "11:00 12:00", "note": "по нижней неделе"},
+        ],
+    }}
+    moments = [
+        (dt.datetime(2026, 9, 5, 10, 0), 1, "top", "Субботняя верхняя"),
+        (dt.datetime(2026, 9, 5, 10, 46), 2, "bottom", "Только нижняя"),
+        (dt.datetime(2026, 9, 6, 12, 0), 2, "bottom", "Только нижняя"),
+        (dt.datetime(2026, 9, 12, 12, 46), 3, "top", "Только верхняя"),
+        (dt.datetime(2026, 9, 13, 12, 0), 3, "top", "Только верхняя"),
+    ]
+    fingerprints = []
+    for moment, number, half, expected_subject in moments:
+        view = resolve_dashboard_view(schedule, weeks, moment)
+        assert view["week"]["week"] == number
+        assert view["week"]["half"] == half
+        selected = week_view(schedule, weeks, view["week"], group="6381", source_url="https://example.test")
+        subjects = {
+            lesson["subject"]
+            for day in selected["days"]
+            for lesson in day["lessons"]
+        }
+        assert expected_subject in subjects
+        assert ("Только нижняя" in subjects) is (half == "bottom")
+        assert ("Только верхняя" in subjects) is (half == "top")
+        fingerprints.append(dashboard_presentation_fingerprint("unchanged-content", view))
+    assert fingerprints[0] != fingerprints[1]
+    assert fingerprints[1] == fingerprints[2]
+    assert fingerprints[2] != fingerprints[3]
+    assert fingerprints[3] == fingerprints[4]
 
 
 WEEKS = [
@@ -36,6 +102,42 @@ SCHEDULE = {
         ],
     }
 }
+
+
+@pytest.mark.parametrize("date,number", [
+    ("2026-08-31", 1), ("2026-09-01", 1), ("2026-09-05", 1),
+    ("2026-09-06", 2), ("2026-09-07", 2), ("2026-09-12", 2),
+    ("2026-09-13", 3), ("2026-09-14", 3), ("2026-10-01", 10),
+    ("2026-12-27", 18), ("2026-12-28", 18), ("2026-12-31", 18),
+    ("2027-01-01", None),
+])
+def test_auto_week_uses_published_bounds_including_gaps_and_partial_weeks(date, number):
+    import schedule_logic
+
+    weeks = [*WEEKS, {"week": 18, "half": "bottom", "start": "28.12.2026", "end": "31.12.2026"}]
+    # The portal groups upper/lower weeks; source order need not be chronological.
+    selected = schedule_logic.find_current_or_next_week(list(reversed(weeks)), dt.date.fromisoformat(date))
+    assert (selected["week"] if selected else None) == number
+    if selected:
+        assert any(selected is week for week in weeks)
+
+
+def test_auto_week_respects_sunday_when_the_portal_includes_it():
+    import schedule_logic
+
+    weeks = [{**WEEKS[0], "end": "06.09.2026"}, WEEKS[1]]
+    assert schedule_logic.find_current_or_next_week(weeks, dt.date(2026, 9, 6)) == weeks[0]
+
+
+def test_auto_week_does_not_invent_a_calendar_from_invalid_entries():
+    import schedule_logic
+
+    bad = [{"week": 1, "start": "invalid", "end": "05.09.2026"},
+           {"week": 2, "start": "12.09.2026", "end": "07.09.2026"}]
+    assert schedule_logic.find_current_or_next_week([], dt.date(2026, 9, 6)) is None
+    assert schedule_logic.find_current_or_next_week(bad, dt.date(2026, 9, 6)) is None
+    assert calendar_bounds(bad) is None
+    assert schedule_logic.find_current_or_next_week([*bad, WEEKS[2]], dt.date(2026, 9, 6)) == WEEKS[2]
 
 
 def test_parse_user_date_relative_and_yearless_dates():
@@ -80,6 +182,62 @@ def test_lesson_applies_on_handles_from_week_note():
     bounds_8 = (dt.date(2026, 10, 19), dt.date(2026, 10, 25))
     assert lesson_applies_on(lesson_dot, dt.date(2026, 10, 19), week_8, bounds_8) is False
     assert lesson_applies_on(lesson_dot, dt.date(2026, 10, 26), week_9, bounds_9) is True
+
+
+@pytest.mark.parametrize(("note", "week_number", "expected"), [
+    ("с 9 недели", 8, "НЕ НА ЭТОЙ НЕДЕЛЕ · С 9‑Й НЕДЕЛИ"),
+    ("с 9-й недели", 8, "НЕ НА ЭТОЙ НЕДЕЛЕ · С 9‑Й НЕДЕЛИ"),
+    ("с 9 недели", 9, None),
+    ("после 9 недели", 9, "НЕ НА ЭТОЙ НЕДЕЛЕ · ПОСЛЕ 9‑Й НЕДЕЛИ"),
+    ("после 9-ой недели", 9, "НЕ НА ЭТОЙ НЕДЕЛЕ · ПОСЛЕ 9‑Й НЕДЕЛИ"),
+    ("после 9 недели", 10, None),
+    ("до 9 недели", 8, None),
+    ("до 9-й недели", 9, "НЕ НА ЭТОЙ НЕДЕЛЕ · ДО 9‑Й НЕДЕЛИ"),
+    ("до 9 недели", 9, "НЕ НА ЭТОЙ НЕДЕЛЕ · ДО 9‑Й НЕДЕЛИ"),
+])
+def test_non_applicability_reason_explains_academic_week_boundary(note, week_number, expected):
+    from schedule_logic import lesson_non_applicability_reason
+
+    target = dt.date(2026, 10, 19) + dt.timedelta(weeks=week_number - 8)
+    week = {"week": week_number, "half": "top" if week_number % 2 else "bottom"}
+    bounds = (target, target + dt.timedelta(days=6))
+    assert lesson_non_applicability_reason({"note": note}, target, week, bounds) == expected
+
+
+def test_non_applicability_reason_prioritizes_week_boundary_then_parity_then_date():
+    from schedule_logic import lesson_non_applicability_reason
+
+    week_8 = {"week": 8, "half": "bottom"}
+    bounds = (dt.date(2026, 10, 19), dt.date(2026, 10, 25))
+    assert lesson_non_applicability_reason(
+        {"note": "с 9 недели по верхней неделе с 01.11"},
+        bounds[0], week_8, bounds,
+    ) == "НЕ НА ЭТОЙ НЕДЕЛЕ · С 9‑Й НЕДЕЛИ"
+    assert lesson_non_applicability_reason(
+        {"note": "по верхней неделе с 01.11"},
+        bounds[0], week_8, bounds,
+    ) == "НЕ НА ЭТОЙ НЕДЕЛЕ · ТОЛЬКО ВЕРХНЯЯ"
+    assert lesson_non_applicability_reason(
+        {"note": "с 01.11"},
+        bounds[0], week_8, bounds,
+    ) == "НЕ В ЭТУ ДАТУ · С 01.11"
+
+
+def test_non_applicability_reason_explains_calendar_context():
+    from schedule_logic import lesson_non_applicability_reason
+
+    target = dt.date(2026, 10, 19)
+    week = {"week": 8, "half": "bottom"}
+    bounds = (target, target + dt.timedelta(days=6))
+    assert lesson_non_applicability_reason(
+        {"note": "с 20.10 по 22.10"}, target, week, bounds,
+    ) == "НЕ В ЭТУ ДАТУ · 20.10–22.10"
+    assert lesson_non_applicability_reason(
+        {"note": "19.10 занятий не будет"}, target, week, bounds,
+    ) == "ЗАНЯТИЯ НЕ БУДЕТ · 19.10"
+    assert lesson_non_applicability_reason(
+        {"note": "только 20.10, 22.10"}, target, week, bounds,
+    ) == "ТОЛЬКО ПО ДАТАМ · 20.10, 22.10"
 
 
 def test_lesson_applies_on_handles_bare_end_date_note():

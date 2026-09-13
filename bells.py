@@ -173,9 +173,8 @@ class Block:
 
     @property
     def label_cell(self) -> str:
-        """Интервал для ячейки таблицы; нестандартный объём — в скобках."""
-        note = self.structure_short
-        return f"{self.label} ({note})" if note else self.label
+        """Короткий интервал для ячейки таблицы без технических пояснений."""
+        return self.label
 
     @property
     def label_both(self) -> str:

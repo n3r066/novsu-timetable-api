@@ -152,11 +152,15 @@ def test_dashboard_screens_cached_by_fingerprint(monkeypatch, tmp_path):
         out_png.write_bytes(b"\x89PNG\r\n\x1a\n" + b"x" * 50)
         return [{"label": "Пн", "path": str(out_png)}]
 
-    monkeypatch.setattr(post, "screenshot_schedule_day_crop_items", fake_crops)
+    monkeypatch.setattr(post, "_cached_day_screens", lambda html, **kwargs: fake_crops(html, "", tmp_path / "cached.png"))
     monkeypatch.setattr(post, "build_dashboard_rich_message", lambda *a, **k: {"rich_message": {"blocks": []}})
     monkeypatch.setattr(post, "edit_rich_message", lambda *a, **k: {"ok": True})
     monkeypatch.setattr(post, "content_fingerprint", lambda data: "FP-1")
-    monkeypatch.setattr(post, "parse_all", lambda html: {"schedule": {"days": {}}, "weeks": []})
+    data = {
+        "schedule": {"days": {"Среда": [{"subject": "Пара", "time": "09:00"}]}},
+        "weeks": [{"week": 1, "half": "top", "start": "31.08.2026", "end": "05.09.2026"}],
+    }
+    monkeypatch.setattr(post, "parse_all", lambda html: data)
 
     state = tmp_path / "state"
     monkeypatch.setattr(post.config, "STATE_DIR", state)
@@ -182,11 +186,15 @@ def test_dashboard_screens_recreated_when_cache_file_missing(monkeypatch, tmp_pa
         out_png.write_bytes(b"\x89PNG\r\n\x1a\n" + b"x" * 50)
         return [{"label": "Пн", "path": str(out_png)}]
 
-    monkeypatch.setattr(post, "screenshot_schedule_day_crop_items", fake_crops)
+    monkeypatch.setattr(post, "_cached_day_screens", lambda html, **kwargs: fake_crops(html, "", tmp_path / "cached.png"))
     monkeypatch.setattr(post, "build_dashboard_rich_message", lambda *a, **k: {"rich_message": {"blocks": []}})
     monkeypatch.setattr(post, "edit_rich_message", lambda *a, **k: {"ok": True})
     monkeypatch.setattr(post, "content_fingerprint", lambda data: "FP-1")
-    monkeypatch.setattr(post, "parse_all", lambda html: {"schedule": {"days": {}}, "weeks": []})
+    data = {
+        "schedule": {"days": {"Среда": [{"subject": "Пара", "time": "09:00"}]}},
+        "weeks": [{"week": 1, "half": "top", "start": "31.08.2026", "end": "05.09.2026"}],
+    }
+    monkeypatch.setattr(post, "parse_all", lambda html: data)
 
     state = tmp_path / "state"
     monkeypatch.setattr(post.config, "STATE_DIR", state)
@@ -197,6 +205,122 @@ def test_dashboard_screens_recreated_when_cache_file_missing(monkeypatch, tmp_pa
     (state / "dashboard_screens.json").unlink()
     post.edit_dashboard_post(1, day, html="html-B", fingerprint="FP-1")
     assert len(calls) == 2
+
+
+def test_dashboard_can_update_text_without_waiting_for_screens(monkeypatch, tmp_path):
+    import datetime as dt
+
+    state = tmp_path / "state"
+    monkeypatch.setattr(post.config, "STATE_DIR", state)
+    data = {"schedule": {"days": {}}, "weeks": []}
+    monkeypatch.setattr(post, "_dashboard_screens", lambda *args: (_ for _ in ()).throw(AssertionError("no chromium")))
+    monkeypatch.setattr(post, "build_dashboard_rich_message", lambda *args, **kwargs: {"rich_message": {"blocks": []}})
+    sent = []
+    monkeypatch.setattr(post, "edit_rich_message", lambda *args, **kwargs: sent.append(kwargs) or {"ok": True})
+    result = post.edit_dashboard_post(
+        1,
+        html="html",
+        fingerprint="fp",
+        data=data,
+        now=dt.datetime(2026, 9, 5, 22, 0),
+        render_screens=False,
+    )
+    assert result["ok"] is True
+    assert sent[0]["files"] == {}
+
+
+def test_dashboard_retries_media_after_text_only_rollover(monkeypatch, tmp_path):
+    """A successful text-only edit must not suppress media recovery next cycle."""
+    import datetime as dt
+    import json
+
+    state = tmp_path / "state"
+    state.mkdir()
+    monkeypatch.setattr(post.config, "STATE_DIR", state)
+    data = {
+        "schedule": {"days": {"Понедельник": [
+            {"subject": "Нижняя", "time": "09:00 10:00", "room": "101", "note": "по нижней неделе"},
+        ]}},
+        "weeks": [{"week": 2, "half": "bottom", "start": "07.09.2026", "end": "12.09.2026"}],
+    }
+    sent = []
+    monkeypatch.setattr(post, "build_dashboard_rich_message", lambda *args, **kwargs: {"rich_message": {"blocks": []}})
+    monkeypatch.setattr(post, "edit_rich_message", lambda *args, **kwargs: sent.append(kwargs) or {"ok": True})
+    screen = tmp_path / "week2.png"
+    screen.write_bytes(b"png" * 500)
+    monkeypatch.setattr(post, "_dashboard_screens", lambda *args, **kwargs: [{"label": "Пн", "path": str(screen)}])
+    now = dt.datetime(2026, 9, 6, 12, 0)
+
+    text_only = post.edit_dashboard_post(
+        3, html="same-html", fingerprint="same-fp", data=data,
+        now=now, render_screens=False,
+    )
+    with_media = post.edit_dashboard_post(
+        3, html="same-html", fingerprint="same-fp", data=data,
+        now=now, render_screens=True,
+    )
+
+    assert text_only["ok"] is True and with_media["ok"] is True
+    assert len(sent) == 2
+    assert sent[0]["files"] == {}
+    assert list(sent[1]["files"]) == ["site_screenshot_1"]
+    saved = json.loads((state / "last_dashboard_post.json").read_text())
+    assert saved["target_date"] == "2026-09-07"
+    assert saved["screens_complete"] is True
+
+
+def test_dashboard_does_not_accept_previous_week_screen_cache(monkeypatch, tmp_path):
+    """Same timetable fingerprint does not make upper-week PNG valid for lower week."""
+    import datetime as dt
+    import json
+
+    state = tmp_path / "state"
+    state.mkdir()
+    monkeypatch.setattr(post.config, "STATE_DIR", state)
+    stale = tmp_path / "week1.png"
+    stale.write_bytes(b"png" * 500)
+    (state / "dashboard_screens.json").write_text(json.dumps({
+        "fingerprint": "same-fp",
+        "status_key": post._dashboard_screen_status_key(dt.date(2026, 9, 1)),
+        "items": [{"label": "Пн", "path": str(stale)}],
+    }))
+    data = {
+        "schedule": {"days": {"Понедельник": [
+            {"subject": "Нижняя", "time": "09:00 10:00", "room": "101", "note": "по нижней неделе"},
+        ]}},
+        "weeks": [{"week": 2, "half": "bottom", "start": "07.09.2026", "end": "12.09.2026"}],
+    }
+    fresh = tmp_path / "week2.png"
+    fresh.write_bytes(b"png" * 500)
+    calls = []
+    monkeypatch.setattr(post, "_dashboard_screens", lambda *args, **kwargs: calls.append(args) or [{"label": "Пн", "path": str(fresh)}])
+    monkeypatch.setattr(post, "build_dashboard_rich_message", lambda *args, **kwargs: {"rich_message": {"blocks": []}})
+    monkeypatch.setattr(post, "edit_rich_message", lambda *args, **kwargs: {"ok": True})
+
+    result = post.edit_dashboard_post(
+        3, html="same-html", fingerprint="same-fp", data=data,
+        now=dt.datetime(2026, 9, 6, 12, 0),
+    )
+
+    assert result["ok"] is True
+    assert len(calls) == 1
+
+
+def test_dashboard_without_expected_screens_is_idempotent(monkeypatch, tmp_path):
+    import datetime as dt
+
+    state = tmp_path / "state"
+    monkeypatch.setattr(post.config, "STATE_DIR", state)
+    data = {"stub": True, "schedule": None, "weeks": []}
+    monkeypatch.setattr(post, "_dashboard_screens", lambda *args: (_ for _ in ()).throw(AssertionError("no chromium")))
+    monkeypatch.setattr(post, "build_dashboard_rich_message", lambda *args, **kwargs: {"rich_message": {"blocks": []}})
+    sent = []
+    monkeypatch.setattr(post, "edit_rich_message", lambda *args, **kwargs: sent.append(kwargs) or {"ok": True})
+    now = dt.datetime(2026, 12, 1, 12, 0)
+    assert post.edit_dashboard_post(1, html="stub", fingerprint="fp", data=data, now=now)["ok"] is True
+    again = post.edit_dashboard_post(1, html="stub", fingerprint="fp", data=data, now=now)
+    assert again == {"ok": True, "skipped": True, "reason": "same_presentation"}
+    assert len(sent) == 1
 
 
 def _diff_for_screens():
@@ -266,6 +390,125 @@ def test_diff_day_screens_marks_only_visible_changes_and_caches(monkeypatch, tmp
     assert left == sorted(Path(item["path"]).name for item in fresh)
 
 
+def test_comparison_day_screens_cache_by_rendered_day_html(monkeypatch, tmp_path):
+    from PIL import Image
+    from bs4 import BeautifulSoup
+
+    state = tmp_path / "state"
+    monkeypatch.setattr(post.config, "STATE_DIR", state)
+    rendered = []
+    source = Path("tests/fixtures/rowspan_time.html").read_text(encoding="utf-8")
+    changed = source.replace("<td>102</td>", "<td>303</td>")
+
+    def fake_screenshot(html, path, **kwargs):
+        rendered.append(html)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        assert kwargs == {"width": 1480, "height": 3200, "scale_factor": 2, "bg": (255, 255, 255)}
+        Image.effect_noise((160, 200 if "Было" in html else 240), 30).convert("RGB").save(path)
+        return path
+
+    monkeypatch.setattr(post, "screenshot_html", fake_screenshot)
+    diff = {"added": [], "removed": [], "changed": [{
+        "day": "Четверг", "subject": "(пр.) Предмет Б", "time": "15:00 16:00",
+        "fields": [["ауд.", "102", "303"]],
+    }]}
+
+    first = post.comparison_day_screens(source, changed, diff)
+    second = post.comparison_day_screens(source, changed, diff)
+
+    assert len(first) == 1 and first == second
+    assert len(rendered) == 2
+    before, after = [BeautifulSoup(html, "html.parser") for html in rendered]
+    assert before.select_one(".comparison-heading").text == "Было · Чт"
+    assert after.select_one(".comparison-heading").text == "Стало · Чт"
+    assert before.colgroup == after.colgroup
+    assert [cell.text for cell in before.select(".comparison-changed")] == ["102"]
+    assert [cell.text for cell in after.select(".comparison-changed")] == ["303"]
+    assert first[0]["before_kinds"] == first[0]["after_kinds"] == ["changed"]
+    for side in ("before", "after"):
+        with Image.open(first[0][f"{side}_path"]) as image:
+            assert image.size == (160, 240)
+    assert not (state / "dashboard_screens.json").exists()
+
+    # A different annotation on identical HTML cannot reuse the old image.
+    other = {"added": [], "changed": [], "removed": [{
+        "day": "Четверг", "subject": "(пр.) Предмет Б", "time": "15:00 16:00",
+    }]}
+    assert post.comparison_day_screens(source, changed, other) != first
+    assert len(rendered) == 4
+    monkeypatch.setattr(post, "COMPARISON_SCREEN_STYLE_VERSION", 99)
+    assert post.comparison_day_screens(source, changed, diff) != first
+    assert len(rendered) == 6
+
+
+def test_comparison_renderer_failure_propagates_for_media_retry(monkeypatch, tmp_path):
+    import pytest
+
+    monkeypatch.setattr(post.config, "STATE_DIR", tmp_path)
+    source = Path("tests/fixtures/rowspan_time.html").read_text(encoding="utf-8")
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("renderer unavailable")
+
+    monkeypatch.setattr(post, "screenshot_html", fail)
+    with pytest.raises(RuntimeError, match="renderer unavailable"):
+        post.comparison_day_screens(source, source, {"removed": [{"day": "Четверг"}]})
+
+
+def test_comparison_cache_recovers_from_partial_png(monkeypatch, tmp_path):
+    import pytest
+    from PIL import Image
+
+    monkeypatch.setattr(post.config, "STATE_DIR", tmp_path)
+    source = Path("tests/fixtures/rowspan_time.html").read_text(encoding="utf-8")
+    calls = []
+
+    def render(html, path, **kwargs):
+        calls.append(path)
+        if len(calls) == 1:
+            path.write_bytes(b"partial PNG" * 200)
+            raise RuntimeError("renderer interrupted")
+        Image.effect_noise((160, 240), 30).convert("RGB").save(path)
+
+    monkeypatch.setattr(post, "screenshot_html", render)
+    diff = {"removed": [{"day": "Четверг"}]}
+    with pytest.raises(RuntimeError, match="renderer interrupted"):
+        post.comparison_day_screens(source, source, diff)
+    pairs = post.comparison_day_screens(source, source, diff)
+    assert len(calls) == 3
+    # A corrupt pre-existing final cache file is also replaced on the next try.
+    Path(pairs[0]["before_path"]).write_bytes(b"bad cached PNG" * 200)
+    assert post.comparison_day_screens(source, source, diff) == pairs
+    assert len(calls) == 4
+
+
+def test_screenshot_statuses_use_selected_week_and_date():
+    import datetime as dt
+
+    data = {
+        "weeks": [{"week": 2, "half": "bottom", "start": "07.09.2026", "end": "12.09.2026"}],
+        "schedule": {"days": {"Понедельник": [
+            {"subject": "Верхняя", "time": "9:00 10:00", "room": "101", "note": "по верхней неделе", "delivery_mode": "in_person"},
+            {"subject": "Нижняя ДОТ", "time": "11:00 12:00", "room": "—", "note": "по нижней неделе с использованием ДОТ", "delivery_mode": "remote_or_hybrid"},
+            {"subject": "С 14.09", "time": "14:00 15:00", "room": "303", "note": "с 14.09", "delivery_mode": "in_person"},
+            {"subject": "С 9 недели", "time": "15:00 16:00", "room": "305", "note": "с 9 недели", "delivery_mode": "in_person"},
+            {"subject": "С 9 недели ДОТ", "time": "17:00 18:00", "room": "—", "note": "с 9 недели, с использованием ДОТ", "delivery_mode": "remote_or_hybrid"},
+            {"subject": "После 9 недели", "time": "18:00 19:00", "room": "306", "note": "после 9 недели", "delivery_mode": "in_person"},
+            {"subject": "Нижняя очно", "time": "16:00 17:00", "room": "304", "note": "по нижней неделе", "delivery_mode": "in_person"},
+        ]}},
+    }
+    items = post._schedule_screenshot_statuses(data, dt.date(2026, 9, 7))["Пн"]
+    by_subject = {item["subject"]: item for item in items}
+    assert by_subject["Верхняя"]["_schedule_tag"] == "НЕ НА ЭТОЙ НЕДЕЛЕ · ТОЛЬКО ВЕРХНЯЯ"
+    assert by_subject["Нижняя ДОТ"]["_schedule_status"] == "dot"
+    assert by_subject["С 14.09"]["_schedule_tag"] == "НЕ В ЭТУ ДАТУ · С 14.09"
+    assert by_subject["С 9 недели"]["_schedule_tag"] == "НЕ НА ЭТОЙ НЕДЕЛЕ · С 9‑Й НЕДЕЛИ"
+    assert by_subject["С 9 недели ДОТ"]["_schedule_status"] == "inactive"
+    assert by_subject["С 9 недели ДОТ"]["_schedule_tag"] == "НЕ НА ЭТОЙ НЕДЕЛЕ · С 9‑Й НЕДЕЛИ"
+    assert by_subject["После 9 недели"]["_schedule_tag"] == "НЕ НА ЭТОЙ НЕДЕЛЕ · ПОСЛЕ 9‑Й НЕДЕЛИ"
+    assert "Нижняя очно" not in by_subject
+
+
 def _rollover_stubs(monkeypatch, tmp_path, weeks, today):
     """Обвязка для проверки ролловера закрепа: chromium и Telegram не дёргаем."""
     import datetime as dt
@@ -302,7 +545,7 @@ def _rollover_stubs(monkeypatch, tmp_path, weeks, today):
             items.append({"label": label, "path": str(path)})
         return items
 
-    monkeypatch.setattr(post, "screenshot_schedule_day_crop_items", fake_crops)
+    monkeypatch.setattr(post, "_cached_day_screens", lambda html, **kwargs: fake_crops(html, "", tmp_path / "cached.png"))
 
     seen = {}
 

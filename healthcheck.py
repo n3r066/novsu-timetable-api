@@ -40,9 +40,11 @@ def _env(name: str) -> str:
 BOT_TOKEN = _env("TG_BOT_TOKEN")
 DM_TARGET = _env("TG_DM_TARGET")
 SERVICE = "novsu-timetable-monitor.service"
+API_SERVICE = "novsu-timetable-api.service"
+API_HEALTH_URL = "http://127.0.0.1:8787/health"
 STATE_DIR = Path(__file__).resolve().parent / "state"
 STATE_FILE = STATE_DIR / "healthcheck_status.json"
-MAX_SILENCE_MINUTES = 20  # alarm if state file not updated for this long
+MAX_SILENCE_MINUTES = 30  # includes the monitor's capped 20-minute error backoff
 
 
 def _dm(text: str) -> None:
@@ -112,23 +114,46 @@ def _save_state(state: dict) -> None:
     STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def _api_health_ok() -> tuple[bool, str]:
+    """Check local API health endpoint. Returns (ok, detail)."""
+    try:
+        req = urllib.request.Request(API_HEALTH_URL, method="GET")
+        resp = urllib.request.urlopen(req, timeout=5)
+        data = json.loads(resp.read().decode())
+        if data.get("ok"):
+            return True, "ok"
+        return False, f"health returned ok=false: {data.get('problems', [])}"
+    except Exception as exc:
+        return False, f"API unreachable: {exc}"
+
+
 def check() -> dict:
     """Run all checks. Returns dict with 'ok' bool and 'problems' list."""
     problems: list[str] = []
 
-    # 1. Service active?
+    # 1. Monitor service active?
     active = _systemctl("is-active", SERVICE)
     if active != "active":
-        problems.append(f"service {active!r} (not active)")
+        problems.append(f"monitor service {active!r} (not active)")
 
-    # 2. State file freshness?
+    # 2. API service active?
+    api_active = _systemctl("is-active", API_SERVICE)
+    if api_active != "active":
+        problems.append(f"API service {api_active!r} (not active)")
+    else:
+        # 2b. API health endpoint responds?
+        api_ok, api_detail = _api_health_ok()
+        if not api_ok:
+            problems.append(f"API health: {api_detail}")
+
+    # 3. State file freshness?
     age = _state_file_age()
     if age is not None and age > MAX_SILENCE_MINUTES * 60:
         problems.append(f"state file stale for {int(age / 60)} min (monitor not running?)")
     elif age is None:
         problems.append("monitor_state.json missing")
 
-    # 3. Tracebacks?
+    # 4. Tracebacks?
     tb = _journal_has_traceback()
     if tb:
         problems.append(f"traceback in logs:\n{tb[:300]}")
@@ -136,24 +161,42 @@ def check() -> dict:
     return {"ok": len(problems) == 0, "problems": problems}
 
 
+def _problems_fingerprint(problems: list[str]) -> str:
+    """Stable hash of problem set for deduplication."""
+    import hashlib
+    canonical = "\n".join(sorted(problems))
+    return hashlib.sha256(canonical.encode()).hexdigest()[:16]
+
+
 def main() -> int:
     state = _load_state()
     was_ok = state.get("ok", True)
+    prev_fingerprint = state.get("fingerprint", "")
     result = check()
     is_ok = result["ok"]
+    current_fingerprint = _problems_fingerprint(result["problems"]) if result["problems"] else ""
 
     if not is_ok:
-        # Always alert on fresh problems
-        msg = "🔴 novsu monitor проблем:\n" + "\n".join(result["problems"])
-        _dm(msg)
-        print(msg, file=sys.stderr)
+        # Alert only on OK->FAIL transition or significant problem set change.
+        # Avoids sending the same alert every hour during a sustained incident.
+        if was_ok or (current_fingerprint != prev_fingerprint):
+            msg = "🔴 novsu monitor проблем:\n" + "\n".join(result["problems"])
+            _dm(msg)
+            print(msg, file=sys.stderr)
+        else:
+            # Sustained incident with unchanged problems — log but don't alert.
+            print(f"[healthcheck] sustained incident, no alert (fingerprint={current_fingerprint})", file=sys.stderr)
     elif not was_ok:
-        # Recovery
+        # Recovery: FAIL -> OK
         msg = "🟢 novsu monitor: восстановился, всё ок"
         _dm(msg)
         print(msg)
 
-    _save_state({"ok": is_ok, "last_check": __import__("datetime").datetime.now().isoformat()})
+    _save_state({
+        "ok": is_ok,
+        "fingerprint": current_fingerprint,
+        "last_check": __import__("datetime").datetime.now().isoformat(),
+    })
     return 0 if is_ok else 1
 
 

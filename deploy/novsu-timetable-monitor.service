@@ -8,7 +8,7 @@ Type=simple
 WorkingDirectory=/root/novsu-timetable-api
 EnvironmentFile=/root/novsu-timetable-api/.env
 Environment=PYTHONUNBUFFERED=1
-ExecStart=/usr/bin/python3 /root/novsu-timetable-api/monitor.py --interval 10 --jitter 2 --update-post 3
+ExecStart=/usr/bin/python3 /root/novsu-timetable-api/monitor.py --interval 3 --jitter 0.25 --update-post 3
 Restart=always
 RestartSec=20
 TimeoutStopSec=20

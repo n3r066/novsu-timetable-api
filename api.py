@@ -24,7 +24,9 @@ from fetch import (
 from parse import parse_all
 from portal_parser import count_schedule_lessons, parse_groups, parse_institutes
 from schedule_logic import (
+    calendar_bounds,
     day_view,
+    find_current_or_next_week,
     find_week,
     find_week_by_number,
     next_lessons,
@@ -35,7 +37,18 @@ from schedule_logic import (
 LOGGER = logging.getLogger(__name__)
 PERSIST_LOCK = threading.Lock()
 INITIALIZE_LOCK = threading.RLock()
-CACHE_LOCK = threading.RLock()
+
+# Per-key locks for timetable cache: a slow fetch for one group must not block
+# cache reads or fetches for other groups. The guard protects the dict itself.
+_KEY_LOCKS: dict[str, threading.Lock] = {}
+_KEY_LOCKS_GUARD = threading.Lock()
+
+
+def _get_key_lock(key: str) -> threading.Lock:
+    with _KEY_LOCKS_GUARD:
+        if key not in _KEY_LOCKS:
+            _KEY_LOCKS[key] = threading.Lock()
+        return _KEY_LOCKS[key]
 
 PARSER_VERSION = "3"
 ROOT = Path(__file__).resolve().parent
@@ -44,10 +57,19 @@ DEFAULT_GROUP = config.DEFAULT_GROUP
 GROUPS = config.GROUPS
 BASE_URL = config.PORTAL_TIMETABLE_BASE_URL
 INDEX_URL = config.PORTAL_TIMETABLE_INDEX_URL
+TIMETABLE_ROUTES = config.TIMETABLE_ROUTES
 TIMETABLE_CACHE_TTL_S = config.TIMETABLE_CACHE_TTL_S
 SNAPSHOT_RETENTION_DAYS = config.SNAPSHOT_RETENTION_DAYS
+MONITOR_SNAPSHOT_MAX_AGE_S = config.MONITOR_SNAPSHOT_MAX_AGE_S
 
 _TIMETABLE_CACHE: dict[str, tuple[float, dict]] = {}
+
+# TTL cache for the group index pages (find_groups / list_groups). The portal
+# index changes rarely, so a short TTL avoids hammering the portal on every
+# group lookup while still picking up new groups reasonably fast.
+_INDEX_CACHE: dict[str, tuple[float, str]] = {}
+_INDEX_CACHE_TTL_S = 300.0
+_INDEX_CACHE_LOCK = threading.Lock()
 
 
 class ParseValidationError(ValueError):
@@ -103,8 +125,50 @@ def fetch(
     return _fetch_resolved(cfg)
 
 
-def _index_html() -> str:
-    return fetch_html(INDEX_URL, page_kind="index")
+def _index_html(route: str = "ochn") -> str:
+    """Fetch the group index page for a route, with a short TTL cache.
+
+    The portal index changes rarely, so we cache the HTML for a few minutes.
+    On upstream errors we do NOT cache the error page; if a previous good
+    fetch exists we return it with a freshness marker instead of failing.
+    """
+    url = config.get_route_index_url(route)
+    now = time.monotonic()
+    with _INDEX_CACHE_LOCK:
+        cached = _INDEX_CACHE.get(url)
+    if cached and cached[0] > now:
+        return cached[1]
+    try:
+        html = fetch_html(url, page_kind="index")
+    except Exception:
+        # Do not cache WAF/error pages. Return the last good index if we have one.
+        if cached:
+            LOGGER.warning("index fetch failed for %s, serving stale cache", url)
+            return cached[1]
+        raise
+    with _INDEX_CACHE_LOCK:
+        _INDEX_CACHE[url] = (now + _INDEX_CACHE_TTL_S, html)
+    return html
+
+
+def _all_index_html() -> dict[str, str]:
+    """Fetch index pages from all routes that have a distinct index URL.
+
+    Returns a mapping of route key to HTML. Routes that fail to fetch or
+    validate are silently skipped so one broken route does not block others.
+    """
+    seen_urls: set[str] = set()
+    result: dict[str, str] = {}
+    for route in TIMETABLE_ROUTES:
+        index_url = config.get_route_index_url(route)
+        if index_url in seen_urls:
+            continue
+        seen_urls.add(index_url)
+        try:
+            result[route] = _index_html(route)
+        except Exception:  # noqa: BLE001 - one broken route must not block others
+            LOGGER.debug("index fetch failed for route %s", route, exc_info=True)
+    return result
 
 
 def list_institutes(html: str | None = None) -> list[dict]:
@@ -113,12 +177,24 @@ def list_institutes(html: str | None = None) -> list[dict]:
 
 def list_groups(inst_id: str | None = None, html: str | None = None) -> list[dict]:
     _validate_reference_fields(inst_id=inst_id)
-    source = html if html is not None else _index_html()
-    try:
-        groups = parse_groups(source, inst_id=inst_id)
-    except Exception as exc:  # malformed upstream HTML is not a client error
-        raise ParseValidationError(f"unexpected groups parser failure: {exc}") from exc
-    return sorted(groups, key=_group_sort_key)
+    if html is not None:
+        try:
+            groups = parse_groups(html, inst_id=inst_id)
+        except Exception as exc:  # malformed upstream HTML is not a client error
+            raise ParseValidationError(f"unexpected groups parser failure: {exc}") from exc
+        return sorted(groups, key=_group_sort_key)
+    # Search across all routes.
+    all_groups: list[dict] = []
+    for route, route_html in _all_index_html().items():
+        try:
+            groups = parse_groups(route_html, inst_id=inst_id)
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.debug("groups parser failed for route %s: %s", route, exc)
+            continue
+        for g in groups:
+            g.setdefault("route", route)
+        all_groups.extend(groups)
+    return sorted(all_groups, key=_group_sort_key)
 
 
 def find_groups(
@@ -131,13 +207,19 @@ def find_groups(
     query = str(query or "").strip()
     _validate_reference_fields(query or None, inst_id=inst_id, year=year, typ=typ)
     candidates = []
-    html = _index_html()
-    for item in list_groups(inst_id, html):
-        if year and item["year"] != str(year):
+    for route, html in _all_index_html().items():
+        try:
+            groups = parse_groups(html, inst_id=inst_id)
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.debug("groups parser failed for route %s: %s", route, exc)
             continue
-        if typ and item["type"].casefold() != str(typ).casefold():
-            continue
-        candidates.append(item)
+        for item in groups:
+            item.setdefault("route", route)
+            if year and item["year"] != str(year):
+                continue
+            if typ and item["type"].casefold() != str(typ).casefold():
+                continue
+            candidates.append(item)
     if not query:
         return sorted(candidates, key=_group_sort_key)
     exact = [item for item in candidates if item["group"] == query]
@@ -194,6 +276,7 @@ def _group_sort_key(item: dict) -> tuple:
         item.get("year") or "",
         item.get("group") or "",
         item.get("type") or "",
+        item.get("route") or "",
     )
 
 
@@ -217,7 +300,9 @@ def validate(data: dict, html: str) -> None:
         raise ParseValidationError("schedule is missing without a valid portal stub")
     lessons = [lesson for rows in schedule["days"].values() for lesson in rows]
     try:
-        expected = physical_lesson_count(html)
+        expected = data.get("physical_lesson_count")
+        if expected is None:
+            expected = physical_lesson_count(html)
     except (TypeError, ValueError) as exc:
         raise ParseValidationError(f"parser invariant failed: {exc}") from exc
     if len(lessons) != expected:
@@ -252,6 +337,12 @@ def _snapshot_schema_is_current(db: sqlite3.Connection) -> bool:
     return False
 
 
+def _ensure_snapshot_columns(db: sqlite3.Connection) -> None:
+    columns = {row[1] for row in db.execute("PRAGMA table_info(snapshots)")}
+    if "parsed_json" not in columns:
+        db.execute("ALTER TABLE snapshots ADD COLUMN parsed_json TEXT NOT NULL DEFAULT '{}'")
+
+
 def _dict_rows(cursor: sqlite3.Cursor) -> list[dict]:
     names = [item[0] for item in cursor.description or []]
     return [dict(zip(names, row)) for row in cursor.fetchall()]
@@ -265,6 +356,7 @@ CREATE TABLE snapshots_new (
  content_fingerprint TEXT NOT NULL,
  raw_hash TEXT NOT NULL,
  html TEXT NOT NULL,
+ parsed_json TEXT NOT NULL DEFAULT '{}',
  parser_version TEXT NOT NULL,
  UNIQUE(url, content_fingerprint, parser_version)
 )
@@ -313,11 +405,18 @@ def _migrate_legacy_schema(db: sqlite3.Connection) -> None:
             html = str(old.get("html") or "")
             raw_hash = hashlib.sha256(html.encode("utf-8")).hexdigest()
             semantic = old.get("content_fingerprint")
+            parsed = {}
             if not semantic:
                 try:
-                    semantic = content_fingerprint(parse_all(html))
+                    parsed = parse_all(html)
+                    semantic = content_fingerprint(parsed)
                 except Exception:  # noqa: BLE001 - сохраняем даже очень старый мусор
                     semantic = hashlib.sha256(("legacy\0" + raw_hash).encode()).hexdigest()[:16]
+            elif html:
+                try:
+                    parsed = parse_all(html)
+                except Exception:  # noqa: BLE001 - preserve diagnostic legacy HTML
+                    parsed = {}
             values = (
                 old.get("id"),
                 old.get("fetched_at") or dt.datetime.now(dt.timezone.utc).isoformat(),
@@ -325,19 +424,20 @@ def _migrate_legacy_schema(db: sqlite3.Connection) -> None:
                 str(semantic),
                 raw_hash,
                 html,
+                json.dumps(parsed, ensure_ascii=False, separators=(",", ":")),
                 str(old.get("parser_version") or "legacy"),
             )
             db.execute(
                 """INSERT INTO snapshots_new
-                (id,fetched_at,url,content_fingerprint,raw_hash,html,parser_version)
-                VALUES(?,?,?,?,?,?,?)
+                (id,fetched_at,url,content_fingerprint,raw_hash,html,parsed_json,parser_version)
+                VALUES(?,?,?,?,?,?,?,?)
                 ON CONFLICT(url,content_fingerprint,parser_version) DO NOTHING""",
                 values,
             )
             new_id = db.execute(
                 """SELECT id FROM snapshots_new
                 WHERE url=? AND content_fingerprint=? AND parser_version=?""",
-                (values[2], values[3], values[6]),
+                (values[2], values[3], values[7]),
             ).fetchone()[0]
             snapshot_map[int(old["id"])] = int(new_id)
 
@@ -405,6 +505,7 @@ def connect(path: str | Path = DB_PATH) -> sqlite3.Connection:
             if _table_exists(db, "snapshots") and not _snapshot_schema_is_current(db):
                 _migrate_legacy_schema(db)
             db.executescript((ROOT / "db" / "schema.sql").read_text(encoding="utf-8"))
+            _ensure_snapshot_columns(db)
             _seed_annotations_once(db)
         return db
     except Exception:
@@ -440,14 +541,15 @@ def persist(db: sqlite3.Connection, html: str, url: str, data: dict) -> int:
     raw_hash = hashlib.sha256(html.encode("utf-8")).hexdigest()
     semantic = content_fingerprint(data)
     now = dt.datetime.now(dt.timezone.utc).isoformat()
+    parsed_json = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
     with PERSIST_LOCK:
         try:
             cursor = db.execute(
                 """INSERT INTO snapshots
-                (fetched_at,url,content_fingerprint,raw_hash,html,parser_version)
-                VALUES(?,?,?,?,?,?)
+                (fetched_at,url,content_fingerprint,raw_hash,html,parsed_json,parser_version)
+                VALUES(?,?,?,?,?,?,?)
                 ON CONFLICT(url,content_fingerprint,parser_version) DO NOTHING""",
-                (now, url, semantic, raw_hash, html, PARSER_VERSION),
+                (now, url, semantic, raw_hash, html, parsed_json, PARSER_VERSION),
             )
             row = db.execute(
                 """SELECT id FROM snapshots
@@ -485,6 +587,19 @@ def persist(db: sqlite3.Connection, html: str, url: str, data: dict) -> int:
                             lesson.get("note"),
                         )
                         db.execute(sql, values)
+            else:
+                db.execute(
+                    "UPDATE snapshots SET parsed_json=? WHERE id=?",
+                    (parsed_json, snapshot_id),
+                )
+            db.execute(
+                """INSERT INTO snapshot_heads(url,snapshot_id,observed_at,raw_hash)
+                VALUES(?,?,?,?) ON CONFLICT(url) DO UPDATE SET
+                snapshot_id=excluded.snapshot_id,
+                observed_at=excluded.observed_at,
+                raw_hash=excluded.raw_hash""",
+                (url, snapshot_id, now, raw_hash),
+            )
             prune_snapshots(db, keep_snapshot_id=snapshot_id)
             db.commit()
             return snapshot_id
@@ -493,9 +608,84 @@ def persist(db: sqlite3.Connection, html: str, url: str, data: dict) -> int:
             raise
 
 
+def load_latest_snapshot(
+    url: str,
+    *,
+    db_path: str | Path = DB_PATH,
+    max_age_s: float | None = None,
+    now: dt.datetime | None = None,
+) -> dict | None:
+    """Load the current materialized snapshot without fetching the portal."""
+    with connect(db_path) as db:
+        row = db.execute(
+            """SELECT s.id,h.observed_at,s.html,s.parsed_json
+            FROM snapshot_heads h JOIN snapshots s ON s.id=h.snapshot_id
+            WHERE h.url=?""",
+            (url,),
+        ).fetchone()
+    if row is None:
+        return None
+    snapshot_id, observed_at, html, parsed_json = row
+    observed = dt.datetime.fromisoformat(str(observed_at).replace("Z", "+00:00"))
+    current = now or dt.datetime.now(dt.timezone.utc)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=dt.timezone.utc)
+    age_limit = MONITOR_SNAPSHOT_MAX_AGE_S if max_age_s is None else max(0.0, float(max_age_s))
+    if age_limit and (current - observed.astimezone(dt.timezone.utc)).total_seconds() > age_limit:
+        return None
+    try:
+        data = json.loads(parsed_json)
+    except (TypeError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    return {
+        "snapshot_id": int(snapshot_id),
+        "fetched_at": observed_at,
+        "html": html,
+        "data": data,
+    }
+
+
+def load_snapshot_html(snapshot_id: int, *, db_path: str | Path = DB_PATH) -> str | None:
+    with connect(db_path) as db:
+        row = db.execute("SELECT html FROM snapshots WHERE id=?", (int(snapshot_id),)).fetchone()
+    return str(row[0]) if row else None
+
+
 def clear_timetable_cache() -> None:
-    with CACHE_LOCK:
+    """Drop all cached timetables. Safe to call from any thread."""
+    with _KEY_LOCKS_GUARD:
+        locks = list(_KEY_LOCKS.values())
+    for lock in locks:
+        with lock:
+            pass
+    with _KEY_LOCKS_GUARD:
         _TIMETABLE_CACHE.clear()
+        _KEY_LOCKS.clear()
+
+
+def _add_freshness(response: dict) -> dict:
+    """Add observed_at, age_seconds, and stale flag to a timetable response.
+
+    Uses MONITOR_SNAPSHOT_MAX_AGE_S as the staleness threshold, consistent
+    with the monitor's freshness window. A portal outage does not become a
+    full API refusal when a good snapshot exists; clients just see stale=true.
+    """
+    fetched_at = response.get("fetched_at")
+    if fetched_at:
+        try:
+            observed = dt.datetime.fromisoformat(str(fetched_at).replace("Z", "+00:00"))
+            now = dt.datetime.now(dt.timezone.utc)
+            age = (now - observed.astimezone(dt.timezone.utc)).total_seconds()
+            response["observed_at"] = str(fetched_at)
+            response["age_seconds"] = round(age, 1)
+            response["stale"] = age > MONITOR_SNAPSHOT_MAX_AGE_S
+        except (ValueError, TypeError):
+            response["stale"] = True
+    else:
+        response["stale"] = True
+    return response
 
 
 def _load_timetable(cfg: dict) -> dict:
@@ -512,7 +702,7 @@ def _load_timetable(cfg: dict) -> dict:
         raise ParseValidationError(f"unexpected parser failure: {exc}") from exc
     with connect() as db:
         snapshot_id = persist(db, html, url, data)
-    return {
+    return _add_freshness({
         "schema_version": 1,
         "group": cfg["group"],
         "group_ref": cfg,
@@ -520,7 +710,7 @@ def _load_timetable(cfg: dict) -> dict:
         "snapshot_id": snapshot_id,
         "fetched_at": dt.datetime.now(dt.timezone.utc).isoformat(),
         **data,
-    }
+    })
 
 
 def get_timetable(
@@ -533,17 +723,41 @@ def get_timetable(
 ) -> dict:
     cfg = resolve_group(group, inst_id=inst_id, year=year, typ=typ)
     url = source_url(cfg["group"], cfg)
+    if cfg["group"] == DEFAULT_GROUP and cfg == resolve_group(DEFAULT_GROUP):
+        # The monitor is the single upstream owner for the tracked group. Serve
+        # its last good snapshot even during a portal outage instead of issuing
+        # a second fetch from the request path.
+        materialized = load_latest_snapshot(url, max_age_s=0)
+        if materialized is not None:
+            return _add_freshness({
+                "schema_version": 1,
+                "group": cfg["group"],
+                "group_ref": cfg,
+                "source_url": url,
+                "snapshot_id": materialized["snapshot_id"],
+                "fetched_at": materialized["fetched_at"],
+                **materialized["data"],
+            })
     ttl = TIMETABLE_CACHE_TTL_S if cache_ttl is None else max(0.0, float(cache_ttl))
     if ttl <= 0:
         return _load_timetable(cfg)
 
-    with CACHE_LOCK:
+    # Fast path: cache hit without any lock. Dict reads are atomic in CPython
+    # and a stale read only means a slightly outdated schedule, never a crash.
+    current = time.monotonic()
+    cached = _TIMETABLE_CACHE.get(url)
+    if cached and cached[0] > current:
+        return cached[1]
+
+    # Slow path: refresh under a per-key lock so one group's network fetch does
+    # not block other groups, while concurrent requests for the same URL still
+    # collapse into a single upstream call (thundering-herd protection).
+    key_lock = _get_key_lock(url)
+    with key_lock:
         current = time.monotonic()
         cached = _TIMETABLE_CACHE.get(url)
         if cached and cached[0] > current:
             return cached[1]
-        # Lock stays held during refresh to prevent a thundering herd and
-        # duplicate DB writes from ThreadingHTTPServer.
         result = _load_timetable(cfg)
         _TIMETABLE_CACHE[url] = (time.monotonic() + ttl, result)
         for key, (expires, _) in list(_TIMETABLE_CACHE.items()):
@@ -566,10 +780,10 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urllib.parse.urlsplit(self.path)
         path = parsed.path
         query = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
-        if path == "/health":
+        if path in ("/health", "/health/ready"):
             if query:
                 return self.send_json(400, {"error": "bad_request"})
-            return self.send_json(200, {"ok": True})
+            return self._health(path == "/health/ready")
         if path == "/v1/institutes":
             if query:
                 return self.send_json(400, {"error": "bad_request"})
@@ -597,7 +811,7 @@ class Handler(BaseHTTPRequestHandler):
             action_names = {
                 "full": set(),
                 "day": {"date"},
-                "week": {"date", "week"},
+                "week": {"date", "week", "mode"},
                 "next": {"date", "time", "limit"},
             }[action]
             unknown = set(query) - global_names - action_names
@@ -610,6 +824,11 @@ class Handler(BaseHTTPRequestHandler):
 
             target = None
             week_number = None
+            week_mode = _query_one(query, "mode") if action == "week" else None
+            if week_mode not in (None, "auto"):
+                raise ValueError("mode must be auto")
+            if week_mode == "auto" and "week" in query:
+                raise ValueError("use either mode=auto or week, not both")
             start_time = None
             limit = 3
             if action in {"day", "week", "next"}:
@@ -650,6 +869,13 @@ class Handler(BaseHTTPRequestHandler):
             if action == "week":
                 if week_number is not None:
                     week = find_week_by_number(data.get("weeks", []), week_number)
+                elif week_mode == "auto":
+                    week = find_current_or_next_week(data.get("weeks", []), target)
+                    if week is None:
+                        bounds = calendar_bounds(data.get("weeks", []))
+                        if bounds and target > bounds[1]:
+                            return self.send_json(404, {"error": "calendar_ended", "calendar_end": bounds[1].isoformat()})
+                        return self.send_json(404, {"error": "calendar_unavailable"})
                 else:
                     week = find_week(data.get("weeks", []), target)
                 if not week:
@@ -708,6 +934,71 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             LOGGER.exception("groups request failed")
             return self.send_json(502, {"error": "upstream_or_parse_failure"})
+
+    def _health(self, readiness: bool = False) -> None:
+        """Health/readiness endpoint.
+
+        Liveness (/health): process responds, SQLite accessible.
+        Readiness (/health/ready): also checks snapshot freshness and monitor state.
+        Never depends on a live portal request.
+        """
+        result: dict = {"ok": True}
+        problems: list[str] = []
+
+        # SQLite accessibility
+        try:
+            with connect() as db:
+                db.execute("SELECT 1")
+            result["sqlite"] = "ok"
+        except Exception as exc:
+            result["sqlite"] = "error"
+            problems.append(f"sqlite: {exc}")
+
+        if readiness:
+            # Snapshot freshness for default group
+            try:
+                cfg = resolve_group(DEFAULT_GROUP)
+                url = source_url(cfg["group"], cfg)
+                snap = load_latest_snapshot(url, max_age_s=0)
+                if snap is not None:
+                    fetched = str(snap.get("fetched_at") or "")
+                    try:
+                        observed = dt.datetime.fromisoformat(fetched.replace("Z", "+00:00"))
+                        age = (dt.datetime.now(dt.timezone.utc) - observed.astimezone(dt.timezone.utc)).total_seconds()
+                        result["snapshot_age_seconds"] = round(age, 1)
+                        result["snapshot_stale"] = age > MONITOR_SNAPSHOT_MAX_AGE_S
+                        if age > MONITOR_SNAPSHOT_MAX_AGE_S:
+                            problems.append(f"snapshot stale: {int(age)}s old (max {int(MONITOR_SNAPSHOT_MAX_AGE_S)}s)")
+                    except (ValueError, TypeError):
+                        result["snapshot_stale"] = True
+                        problems.append("snapshot: invalid fetched_at")
+                else:
+                    result["snapshot_stale"] = True
+                    problems.append("snapshot: no materialized snapshot for default group")
+            except Exception as exc:
+                problems.append(f"snapshot check: {exc}")
+
+            # Monitor state file freshness
+            try:
+                state_path = ROOT / "state" / "monitor_state.json"
+                if state_path.exists():
+                    import os as _os
+                    mtime = dt.datetime.fromtimestamp(state_path.stat().st_mtime, tz=dt.timezone.utc)
+                    monitor_age = (dt.datetime.now(dt.timezone.utc) - mtime).total_seconds()
+                    result["monitor_age_seconds"] = round(monitor_age, 1)
+                    if monitor_age > 1200:  # 20 minutes
+                        problems.append(f"monitor state stale: {int(monitor_age)}s")
+                else:
+                    problems.append("monitor_state.json missing")
+            except Exception as exc:
+                problems.append(f"monitor check: {exc}")
+
+        if problems:
+            result["ok"] = False
+            result["problems"] = problems
+
+        status = 200 if result["ok"] else 503
+        return self.send_json(status, result)
 
     def send_json(self, status, payload):
         body = json.dumps(payload, ensure_ascii=False).encode()

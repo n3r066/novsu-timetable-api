@@ -4,11 +4,20 @@ from __future__ import annotations
 import datetime as dt
 import json
 import re
+from dataclasses import dataclass
 from pathlib import Path
 from bs4 import BeautifulSoup
 
 import bells
-from portal_parser import day_token as canonical_day, expand_table, find_schedule_table, schedule_header, text
+from portal_parser import (
+    count_schedule_grid_lessons,
+    day_token as canonical_day,
+    expand_table,
+    find_schedule_table,
+    find_schedule_table_grid,
+    schedule_header,
+    text,
+)
 
 DAY_FULL = {
     "Пн": "Понедельник", "Вт": "Вторник", "Ср": "Среда",
@@ -19,8 +28,21 @@ def _text(cell) -> str:
     return text(cell)
 
 
-def parse_calendar(html: str) -> list[dict]:
+@dataclass
+class ParseContext:
+    soup: BeautifulSoup
+    table: object | None
+    grid: list[list[str]] | None
+
+
+def parse_context(html: str) -> ParseContext:
     soup = BeautifulSoup(html, "html.parser")
+    table, grid = find_schedule_table_grid(soup)
+    return ParseContext(soup=soup, table=table, grid=grid)
+
+
+def parse_calendar(html: str, *, context: ParseContext | None = None) -> list[dict]:
+    soup = context.soup if context is not None else BeautifulSoup(html, "html.parser")
     weeks: list[dict] = []
     for tr in soup.find_all("tr"):
         cells = [_text(cell) for cell in tr.find_all(["td", "th"], recursive=False)]
@@ -79,18 +101,19 @@ def _structured_comment(comment: str) -> dict:
     return {"location": location, "delivery_mode": delivery_mode, "link": urls[0] if urls else None}
 
 
-def parse_schedule(html: str) -> dict | None:
+def parse_schedule(html: str, *, context: ParseContext | None = None) -> dict | None:
     """Parse the timetable through a complete logical rowspan/colspan grid.
 
     The live NovSU source contains invalid nested ``tr`` elements for the first
     lesson of every day.  ``portal_parser.expand_table`` deliberately walks all
     rows owned by the table, including those nested rows and normal tbody rows.
     """
-    soup = BeautifulSoup(html, "html.parser")
-    table = _find_schedule_table(soup)
+    if context is None:
+        context = parse_context(html)
+    table = context.table
     if table is None:
         return None
-    grid = expand_table(table)
+    grid = context.grid if context.grid is not None else expand_table(table)
     header = schedule_header(grid)
     if header is None:
         return None
@@ -162,14 +185,15 @@ def parse_schedule(html: str) -> dict | None:
 
 
 
-def extract_teacher_ids(html: str) -> dict[str, str]:
+def extract_teacher_ids(html: str, *, context: ParseContext | None = None) -> dict[str, str]:
     """Extract teacher_text → teacherId mapping from schedule HTML links.
 
     Each teacher cell in the portal contains an <a> link with teacherId=ora_XXXXX.
     Returns a mapping of the link text (teacher name as shown) to the teacherId.
     """
-    soup = BeautifulSoup(html, "html.parser")
-    table = find_schedule_table(soup)
+    if context is None:
+        context = parse_context(html)
+    table = context.table
     if table is None:
         return {}
     mapping: dict[str, str] = {}
@@ -186,8 +210,16 @@ def is_stub_page(html: str) -> bool:
 
 
 def parse_all(html: str) -> dict:
-    schedule = parse_schedule(html)
-    return {"stub": schedule is None, "weeks": parse_calendar(html), "schedule": schedule}
+    context = parse_context(html)
+    schedule = parse_schedule(html, context=context)
+    physical_count = 0 if schedule is None else count_schedule_grid_lessons(context.grid or [])
+    return {
+        "stub": schedule is None,
+        "weeks": parse_calendar(html, context=context),
+        "schedule": schedule,
+        "physical_lesson_count": physical_count,
+        "teacher_ids": extract_teacher_ids(html, context=context),
+    }
 
 
 if __name__ == "__main__":

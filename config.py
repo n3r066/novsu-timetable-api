@@ -22,9 +22,41 @@ if _env_file.exists():
         key, value = line.split("=", 1)
         os.environ.setdefault(key.strip(), value.strip())
 
-PORTAL_TIMETABLE_BASE_URL = "https://portal.novsu.ru/univer/timetable/ochn/i.1103357/"
-PORTAL_TIMETABLE_INDEX_URL = "https://portal.novsu.ru/univer/timetable/ochn/"
+TIMETABLE_ROUTES = {
+    "ochn": {
+        "index_url": "https://portal.novsu.ru/univer/timetable/ochn/",
+        "base_url": "https://portal.novsu.ru/univer/timetable/ochn/i.1103357/",
+    },
+    "zaochn": {
+        "index_url": "https://portal.novsu.ru/univer/timetable/zaochn/",
+        "base_url": "https://portal.novsu.ru/univer/timetable/zaochn/i.1103358/",
+    },
+    "session": {
+        "index_url": "https://portal.novsu.ru/univer/timetable/session/",
+        "base_url": "https://portal.novsu.ru/univer/timetable/ochn/i.1103357/",
+    },
+}
+
+# Backward-compatible aliases for the ochn route.
+PORTAL_TIMETABLE_BASE_URL = TIMETABLE_ROUTES["ochn"]["base_url"]
+PORTAL_TIMETABLE_INDEX_URL = TIMETABLE_ROUTES["ochn"]["index_url"]
 DEFAULT_GROUP = os.environ.get("NOVSU_DEFAULT_GROUP", "6381")
+
+
+def get_route_base_url(route: str) -> str:
+    """Return the base URL for a named timetable route."""
+    try:
+        return TIMETABLE_ROUTES[route]["base_url"]
+    except KeyError:
+        raise ValueError(f"unknown timetable route: {route}") from None
+
+
+def get_route_index_url(route: str) -> str:
+    """Return the index URL for a named timetable route."""
+    try:
+        return TIMETABLE_ROUTES[route]["index_url"]
+    except KeyError:
+        raise ValueError(f"unknown timetable route: {route}") from None
 
 # `year` в запросах портала — год набора группы, а не текущий календарный год.
 GROUPS = {
@@ -33,8 +65,15 @@ GROUPS = {
         "type": os.environ.get("NOVSU_DEFAULT_TYPE", "ДО"),
         "year": os.environ.get("NOVSU_DEFAULT_YEAR", "2026"),
         "institute": "ИЭ",
+        "route": "ochn",
     },
-    "5234": {"inst_id": "868344", "type": "ДО", "year": "2025", "institute": "ИГУМ"},
+    "5234": {
+        "inst_id": "868344",
+        "type": "ДО",
+        "year": "2025",
+        "institute": "ИГУМ",
+        "route": "ochn",
+    },
 }
 
 
@@ -45,19 +84,23 @@ def build_group_url(
     inst_id: str | None = None,
     year: str | None = None,
     typ: str | None = None,
+    route: str | None = None,
 ) -> str:
     """Собрать канонический URL группы.
 
     `year` всегда означает год набора. Функция намеренно не подставляет
-    текущий год.
+    текущий год. `route` выбирает base_url из TIMETABLE_ROUTES; если не
+    указан, используется route из group_ref или "ochn".
     """
     ref = dict(group_ref or {})
     group = str(ref.get("group") or group).strip()
     inst_id = str(inst_id or ref.get("inst_id") or "").strip()
     admission_year = str(year or ref.get("year") or "").strip()
     typ = str(typ or ref.get("type") or "").strip()
+    route = str(route or ref.get("route") or "ochn").strip()
     if not group or not inst_id or not admission_year or not typ:
         raise ValueError("group, inst_id, type and enrollment year are required")
+    base_url = get_route_base_url(route)
     query = urllib.parse.urlencode(
         [
             ("page", "EditViewGroup"),
@@ -67,7 +110,7 @@ def build_group_url(
             ("year", admission_year),
         ]
     )
-    return PORTAL_TIMETABLE_BASE_URL + "?" + query
+    return base_url + "?" + query
 
 
 _DEFAULT_GROUP_REF = GROUPS.get(DEFAULT_GROUP) or {
@@ -201,6 +244,7 @@ FETCH_RETRIES = max(1, int(os.environ.get("NOVSU_FETCH_RETRIES", "3")))
 FETCH_RETRY_DELAY_S = max(0.0, float(os.environ.get("NOVSU_FETCH_RETRY_DELAY", "5")))
 TIMETABLE_CACHE_TTL_S = max(0.0, float(os.environ.get("NOVSU_CACHE_TTL", "60")))
 SNAPSHOT_RETENTION_DAYS = max(0, int(os.environ.get("NOVSU_SNAPSHOT_RETENTION_DAYS", "90")))
+MONITOR_SNAPSHOT_MAX_AGE_S = max(0.0, float(os.environ.get("NOVSU_MONITOR_SNAPSHOT_MAX_AGE", "600")))
 
 # Системный chromium (snap)
 CHROMIUM_BIN = "/usr/bin/chromium-browser"
