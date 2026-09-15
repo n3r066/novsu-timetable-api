@@ -54,7 +54,7 @@ from screenshot import screenshot_html, screenshot_schedule_day_crop_items  # no
 from portal_parser import day_short, norm_text, render_schedule_day_chunk_htmls  # noqa: E402
 from telegram_api import edit_rich_message  # noqa: E402
 
-SCHEDULE_SCREEN_STYLE_VERSION = 6
+SCHEDULE_SCREEN_STYLE_VERSION = 7
 COMPARISON_SCREEN_STYLE_VERSION = 2
 
 

@@ -216,6 +216,11 @@ The closed screenshot section includes its concrete date and links to
 the full unfiltered portal original; filtered screenshots are not labelled as
 the full original.
 
+Long URLs in source comments wrap inside their table cells, so they cannot push
+the right edge beyond the screenshot. Keep the full source link text. Crop the
+empty canvas below short days against the matte page background; verify both
+the PNG dimensions and the actual Telegram image after a screenshot repair.
+
 Versioned policy lives in `knowledge/schedule_notes.json`. It is intentionally
 not a "seen once" runtime cache: identical snapshots must render identically on
 all machines.

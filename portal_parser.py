@@ -1059,6 +1059,7 @@ def wrap_schedule_html(content_html: str, source_url: str, extra_css: str = "") 
   h4, p {{ font-size: 24px; line-height: 1.25; margin: 8px 0; }}
   table {{ width: 100%; border-collapse: collapse; table-layout: auto; font-size: 28px; line-height: 1.22; }}
   th, td {{ border: 1px solid #cdd9e7; padding: 9px 11px; vertical-align: top; background: #fff; }}
+  td {{ overflow-wrap: anywhere; }}
   th {{ background: #e5e7eb; font-weight: 800; text-align: left; }}
   tr:first-child td, tr:first-child th {{ background: #e1eaf5; font-weight: 800; }}
   b {{ font-weight: 800; }}
