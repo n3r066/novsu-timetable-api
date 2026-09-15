@@ -151,11 +151,11 @@ Always call `lesson_applies_on()`, `lessons_for_date()`, `day_view()`, or
 `week_view()`. A formatter must never guess applicability by searching strings.
 
 `lesson_non_applicability_reason()` uses the same evaluator but returns a
-user-facing contextual reason for screenshot annotations. Inactive source rows
-are struck through and labelled with the relevant boundary, for example
-`НЕ НА ЭТОЙ НЕДЕЛЕ · С 9‑Й НЕДЕЛИ`, `... ПОСЛЕ 9‑Й НЕДЕЛИ`,
-`... ТОЛЬКО ВЕРХНЯЯ`, or `НЕ В ЭТУ ДАТУ · С 14.09`. Screenshot code must not
-derive a second, less precise reason from the note.
+user-facing contextual reason for screenshot annotations. The renderer preserves
+the concrete boundary from this result, for example `С 9‑й недели`,
+`После 9‑й недели`, `Только верхняя`, or `С 14.09`, and removes the redundant
+generic prefix. Inactive rows remain readable; only cancellations are struck
+through. Screenshot code must not derive a second, less precise reason from the note.
 
 `lesson_has_expired()` is a conservative presentation-only deadline check. It
 accepts exhausted explicit occurrence lists, ended date ranges, inclusive
@@ -202,7 +202,12 @@ Current user-facing rules:
 
 Weekly screenshots omit definitively expired source lessons rather than leaving
 them crossed out forever. Future/parity-inactive lessons keep their contextual
-labels. The closed screenshot section includes its concrete date and links to
+labels. Inactive rows use readable muted blue text, without opacity dimming or strike-through;
+only actual cancellations are red and struck. Badges show only the concrete
+condition, e.g. “После 9-й недели”, without “Не на этой неделе”. The original
+portal table, columns and headings are preserved. Matte blue, ivory and muted
+teal accents replace harsh grey/bright fills; no replacement page header is added.
+The closed screenshot section includes its concrete date and links to
 the full unfiltered portal original; filtered screenshots are not labelled as
 the full original.
 
@@ -221,27 +226,40 @@ even if the portal content did not change.
 - Each weekday is a closed `details` section whose summary names the concrete
   edits, for example `Четверг (сменили аудиторию)` or
   `Пятница (переименовали пару, убрали пару)` — not a bare change count.
-- Inside the section each edit is one sentence: the subject in bold quotes,
-  context `(пр., 09:00–10:45 · верхняя неделя)` in parentheses, then the delta
-  with the old value struck through and the new one bold. Renames with a
-  common prefix highlight only the added tail; full renames strike the old
-  name and bold the new one. Removed pairs strike the gone time/week/room.
-- Room/place is named only when it is news: a room change crossing into
-  another building (detected via the same room decoder as the freshman guide)
-  appends `— это уже другой корпус: …`; same-building moves stay silent.
-  Undecodable room numbers (gym, slash pairs) never produce invented places.
+- Days with multiple edits start with a short overview grouped by action.
+  Additions, replacements and missing teacher names are distinct actions.
+  Identical new teachers, room deltas or time moves share a row listing the
+  affected subjects; repeated occurrences of one subject get a lesson count.
+  Never infer a meaning from a partial free-form note. Full old/new values,
+  times, week variants and unknown notes remain in a closed “Подробности” section.
+  Only teacher-only days may say that times and rooms did not change.
+- A single edit, and each entry inside the detailed section, is a compact
+  paragraph with separate lines for the bold subject, type/time/week context
+  and the field delta. No repeated “У пары …”.
+  A previously missing teacher is “Указали преподавателя: …”; it is not a
+  replacement. Placeholder dashes are never struck through. Renames retain
+  prefix highlighting so the two full names do not repeat unnecessarily.
+- Moves show old and new times once, and retain any week-specific place changes.
+  Removals strike their former time and place; additions name the supplied place.
+- Room changes across buildings append “Другой корпус: …”, using the existing
+  room decoder. Unknown buildings are never guessed. Teacher-only edits omit
+  unchanged addresses, but preserve dates and unknown condition prose.
 - Time and applicable parity remain visible when supplied by the source.
   Unknown time is omitted rather than rendered as an empty badge.
 - Different upper/lower locations and conditions get separate labelled lines.
   Room/location and `ДОТ` are both retained when the portal supplies both.
 - Unchanged teacher and extra location context do not appear in the post at
   all: they remain available in the pinned dashboard and on the portal.
-- Before/after comparisons live inside the day section and contain only the
-  annotated screenshots: no colour legend and no provenance line — colours
-  and marks read directly from the images. Legacy single screenshots are
-  inlined with a caption.
+- Before/after pairs are nested in a closed “Сравнить расписание” section,
+  with the short caption “Было → стало”. Thin dividers separate individual edits.
+  Teacher-only batch headings name the affected lesson count. Images remain ordered before then
+  after; no repeated swipe instructions. Legacy single images retain captions.
 - One footer links to the source and names the group; a count is included only
-  for multiple changes. Telegram supplies the publication time. A render-time
+  for multiple changes. The notification explicitly shows the persisted detection timestamp in Moscow
+  time, including seconds, and states that the portal does not expose the exact
+  edit time. HTTP Date is response time and must never be used as edit time.
+  Historical posts use original observation events when available; a publication
+  timestamp alone is labelled as publication, never as an observed portal edit. A render-time
   calendar week is never presented as the occurrence week of the changed class.
 
 Field deltas override stale context before grouping, without mutating the raw
@@ -250,9 +268,9 @@ matching parity and an unambiguous pair. Cross-day or ambiguous changes stay
 removed/added. Merged moves retain both before and after week variants; different
 durations/destinations must not collapse into one entry.
 
-The HTML fallback mirrors the same sentences and day summaries, keeps whole
-day sections within 4096 characters, and truncates old/new field values
-independently.
+The HTML fallback mirrors the grouped overview, using an expandable blockquote
+for detailed entries. It keeps whole day sections within 4096 characters and
+truncates old/new field values independently.
 Rich output retains its text/block budget and explicitly reports omissions.
 Notification-only wording changes require no dashboard or screenshot version
 bump. They do not retroactively edit old Telegram posts.

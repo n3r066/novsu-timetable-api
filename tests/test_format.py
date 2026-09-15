@@ -136,14 +136,15 @@ def test_changes_rich_message_structure():
     ]
     change = next(
         block for day in days for block in day["blocks"]
-        if "поменяли аудиторию: 203 → 415" in _plain(block)
+        if "Аудитория: 203 → 415" in _plain(block)
     )
     assert change["type"] == "paragraph"
     assert {"type": "strikethrough", "text": "203"} in change["text"]
     assert {"type": "bold", "text": "415"} in change["text"]
     # Убранная пара: зачёркнуты время и место, отдельного предложения нет.
     assert "В новом расписании этого занятия нет." not in _plain(rm)
-    assert _plain(rm).count("в 15:00–16:45, ауд. 202") == 1
+    assert _plain(rm).count("Убрали пару") == 1
+    assert "15:00–16:45" in _plain(rm) and "ауд. 202" in _plain(rm)
     # Неизменённый преподаватель в пост не попадает.
     assert "Иванов" not in _plain(rm) and "Петров" not in _plain(rm)
     assert not any(node.get("type") in {
@@ -189,13 +190,23 @@ def test_changes_fallback_text_is_valid_and_bounded():
         "<b>Среда (сменили аудиторию)</b>",
         "<b>Четверг (убрали пару)</b>",
     ]
-    assert "поменяли аудиторию: <s>203</s> → <b>415</b>" in text
-    assert "<s>в 15:00–16:45, ауд. 202</s>" in text
+    assert "Аудитория: <s>203</s> → <b>415</b>" in text
+    assert "<s>15:00–16:45</s>" in text and "<s>ауд. 202</s>" in text
     assert "В новом расписании этого занятия нет." not in text
     assert not any(line.startswith(("+", "-", "−", "~")) for line in text.splitlines())
     big = _sample_diff()
     big["added"] = big["added"] * 300
     assert len(changes_fallback_text(big, "https://example.test")) <= 4096
+
+
+def test_changes_fallback_text_stamps_detection_time_when_given():
+    text = changes_fallback_text(
+        _sample_diff(), "https://example.test", now=dt.datetime(2026, 9, 2, 12, 0),
+    )
+    assert "Обнаружено на сайте 02.09.2026 в 12:00:00 МСК" in text
+    # Без now штампа нет — поведение обратно совместимо.
+    plain = changes_fallback_text(_sample_diff(), "https://example.test")
+    assert "Обнаружено на сайте" not in plain
 
 
 def test_dashboard_rich_message_has_week_section():
@@ -349,10 +360,16 @@ def test_large_rich_diff_is_chunked_and_within_documented_limits():
     validate_rich_payload(payload)
     blocks = payload["rich_message"]["blocks"]
     days = [block for block in blocks if block.get("type") == "details"]
-    assert [day["summary"] for day in days] == [
-        "Среда (изменили условия ×17, добавили пару ×15, убрали пару ×17)"]
+    assert len(days) == 1 and days[0]["summary"].startswith("Среда · ")
+    assert "×" not in days[0]["summary"]
+    for action in ("изменили условия", "добавили пары", "убрали пары"):
+        assert days[0]["summary"].count(action) == 1
+    detail = next(b for b in days[0]["blocks"] if str(b.get("summary", "")).startswith("Подробности"))
+    shown = len([b for b in detail["blocks"] if b["type"] == "paragraph"])
+    assert 3 <= shown < 900
+    assert f"ещё {900 - shown} не поместились" in _plain(payload)
     text = _plain(payload)
-    for action in ("изменились условия", "Добавили пару", "убрали совсем"):
+    for action in ("Условия:", "Добавили пару", "Убрали пару"):
         assert text.count(action) > 1
     assert not any(block.get("type") in {"blockquote", "expandable_blockquote"}
                    for block in _walk_rich_blocks(blocks))
@@ -706,7 +723,7 @@ def test_changes_post_comparisons_are_closed_and_ordered_before_after():
     days = [block for block in rm["rich_message"]["blocks"] if block.get("type") == "details"]
     assert [day["summary"].partition(" (")[0] for day in days] == ["Вторник", "Среда", "Четверг"]
     slideshows = [
-        block for day in days for block in day["blocks"] if block.get("type") == "slideshow"
+        node for node in _rich_nodes(rm) if node.get("type") == "slideshow"
     ]
     assert len(slideshows) == 3
     for index, slideshow in enumerate(slideshows):
@@ -717,7 +734,7 @@ def test_changes_post_comparisons_are_closed_and_ordered_before_after():
         assert [_plain(photo["caption"]) for photo in slideshow["blocks"]] == [
             f"Было · {day}", f"Стало · {day}",
         ]
-        assert "сначала старая версия, затем новая" in _plain(slideshow["caption"])
+        assert "Было → стало" in _plain(slideshow["caption"])
     text = _plain(rm)
     for legend in ("Жёлтым выделены", "светло-красным", "зелёным",
                    "подсветка добавлена ботом", "Таблицы из сохранённых"):
@@ -745,11 +762,12 @@ def test_changes_post_comparison_removals_show_old_not_new(versions, count, high
     text = _plain(rm)
     assert "В новом расписании этого занятия нет." not in text
     assert text.count("(пр.) Старый") == 0  # префикс вида выносится в контекст
-    assert text.count("«Старый» убрали совсем") == count
+    assert text.count("Убрали пару") == count
     # Пропавшая пара показана одним зачёркнутым рядом «время, место».
-    assert text.count("в 15:00–16:45, ауд. 202") == count
+    assert text.count("15:00–16:45") == count
+    assert text.count("ауд. 202") == count
     struck = [node for node in _rich_nodes(rm) if node.get("type") == "strikethrough"]
-    assert [node["text"] for node in struck] == ["в 15:00–16:45, ауд. 202"] * count
+    assert [node["text"] for node in struck] == ["15:00–16:45", "ауд. 202"] * count
     assert "Убрано:" not in text
     assert "В новом расписании её уже нет" not in text
     assert "В новом расписании их уже нет" not in text
@@ -761,7 +779,8 @@ def test_changes_post_comparison_removals_show_old_not_new(versions, count, high
     assert "на скрине ниже" not in text
     assert "Их не подсвечиваем" not in text
     days = [block for block in rm["rich_message"]["blocks"] if block.get("type") == "details"]
-    assert len(days) == 1 and days[0]["summary"].startswith("Четверг (убрали пару")
+    assert len(days) == 1
+    assert days[0]["summary"] == ("Четверг (убрали пару)" if count == 1 else "Четверг · убрали пары (2 пары)")
     assert not days[0].get("is_open") and not days[0].get("open")
     photos = [node for node in _rich_nodes(rm) if node.get("type") == "photo" and "photo" in node]
     assert [photo["photo"]["media"] for photo in photos] == [
@@ -851,7 +870,7 @@ def test_changes_post_comparison_uses_applied_kinds_for_moves(before_kinds, afte
     days = [block for block in rm["rich_message"]["blocks"] if block.get("type") == "details"]
     assert [day["summary"] for day in days] == ["Четверг (перенесли пару)"]
     text = _plain(rm)
-    assert "перенесли: 15:00–16:45 → 17:00–18:45" in text
+    assert "Перенесли: 15:00–16:45 → 17:00–18:45" in text
     assert "1. " not in text and "1 изменение" not in text
     # Легенды у сравнения нет независимо от того, что именно подсвечено.
     for word in ("жёлтым", "зелёным", "оранжевым", "светло-красным"):
@@ -1044,7 +1063,7 @@ def test_moved_pair_is_one_entry_not_two_rows():
     sentence = days[0]["blocks"][0]
     assert sentence["type"] == "paragraph"
     assert _plain(sentence) == (
-        "Пару «География туризма» перенесли: 11:00–12:45 → 17:00–18:45."
+        "География туризма\nпр.\nПеренесли: 11:00–12:45 → 17:00–18:45"
     )
     assert {"type": "strikethrough", "text": "11:00–12:45"} in sentence["text"]
     assert {"type": "bold", "text": "17:00–18:45"} in sentence["text"]
@@ -1061,7 +1080,7 @@ def test_moved_pair_is_one_entry_not_two_rows():
     assert _plain(blocks[-1]) == "Группа 6381 · На портале"
     fallback = changes_fallback_text(diff, "https://example.test")
     assert fallback.count("<b>Четверг (перенесли пару)</b>") == 1
-    assert "перенесли: <s>11:00–12:45</s> → <b>17:00–18:45</b>" in fallback
+    assert "Перенесли: <s>11:00–12:45</s> → <b>17:00–18:45</b>" in fallback
     assert "убрали" not in fallback.casefold() and "добавили" not in fallback.casefold()
 
 
@@ -1080,11 +1099,12 @@ def test_real_removal_stays_removal():
     blocks = rm["rich_message"]["blocks"]
     days = [block for block in blocks if block.get("type") == "details"]
     assert [day["summary"] for day in days] == ["Пятница (убрали пару)"]
-    assert days[0]["blocks"] == [{
-        "type": "paragraph",
-        "text": ["«", {"type": "bold", "text": "Экономика"}, "»", " убрали совсем",
-                 ": была ", {"type": "strikethrough", "text": "в 09:00–10:45, ауд. 1306"}, "."],
-    }]
+    assert len(days[0]["blocks"]) == 1
+    card = days[0]["blocks"][0]
+    assert card["type"] == "paragraph"
+    assert _plain(card) == "Экономика\nлек., 09:00–10:45\nУбрали пару\nауд. 1306"
+    assert {"type": "strikethrough", "text": "09:00–10:45"} in card["text"]
+    assert {"type": "strikethrough", "text": "ауд. 1306"} in card["text"]
     text = _plain(rm)
     assert "В новом расписании этого занятия нет." not in text
     assert "09:00–10:45" in text and "ауд. 1306" in text

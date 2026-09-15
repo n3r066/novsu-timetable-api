@@ -83,6 +83,20 @@ def _dm(text: str) -> None:
         print(f"[dm ERR] {e}", file=sys.stderr)
 
 
+def _change_time_msk(event: dict) -> dt.datetime:
+    """Время обнаружения события как московское время (для штампа в посте)."""
+    raw = event.get("ts") if isinstance(event, dict) else None
+    if isinstance(raw, str) and raw:
+        try:
+            value = dt.datetime.fromisoformat(raw)
+            if value.tzinfo is None:
+                value = value.replace(tzinfo=dt.timezone.utc)
+            return value.astimezone(zoneinfo.ZoneInfo("Europe/Moscow"))
+        except ValueError:
+            pass
+    return dt.datetime.now(zoneinfo.ZoneInfo("Europe/Moscow"))
+
+
 def _subject(lesson: dict) -> str:
     return str(lesson.get("subject") or lesson.get("subject_raw") or "").split("\n", 1)[0].strip()
 
@@ -361,9 +375,12 @@ def _post_changes_to_channel(
     old_html: str | None = None,
     fingerprint: str | None = None,
     focus_date: dt.date | None = None,
+    change_time: dt.datetime | None = None,
 ) -> dict:
     """Send the durable text notification before any optional media work."""
-    rich = build_changes_rich_message(diff, weeks, config.GROUP_URL, group_name="6381")
+    rich = build_changes_rich_message(
+        diff, weeks, config.GROUP_URL, group_name="6381", now=change_time,
+    )
     try:
         result = send_rich_message(
             rich, token=config.TG_BOT_TOKEN, chat_id=config.TG_CHANNEL_ID,
@@ -374,7 +391,9 @@ def _post_changes_to_channel(
         result["_rich"] = True
         return result
     print(f"[sendRichMessage FAIL] {result}", file=sys.stderr)
-    text = changes_fallback_text(diff, config.GROUP_URL, group_name="6381")
+    text = changes_fallback_text(
+        diff, config.GROUP_URL, group_name="6381", now=change_time,
+    )
     return _tg_api("sendMessage", chat_id=config.TG_CHANNEL_ID, text=text, parse_mode="HTML")
 
 
@@ -384,6 +403,7 @@ def _queue_media_enhancement(
     weeks: list[dict],
     old_snapshot_id: int | None,
     new_snapshot_id: int | None,
+    change_time: dt.datetime | None = None,
 ) -> None:
     message_id = ((result.get("result") or {}).get("message_id") if isinstance(result.get("result"), dict) else None)
     if not result.get("_rich") or not isinstance(message_id, int) or not (old_snapshot_id or new_snapshot_id):
@@ -398,6 +418,8 @@ def _queue_media_enhancement(
         "old_snapshot_id": old_snapshot_id,
         "new_snapshot_id": new_snapshot_id,
     }
+    if change_time is not None:
+        task["change_time"] = change_time.isoformat(timespec="seconds")
     items = [item for item in items if item.get("message_id") != message_id]
     items.append(task)
     _write_json_atomic(path, {"items": items})
@@ -420,9 +442,16 @@ def _try_pending_media() -> bool | None:
             items.pop(0)
             _write_json_atomic(path, {"items": items}) if items else _unlink(path)
             return True
+        change_time = None
+        raw_change_time = pending.get("change_time")
+        if isinstance(raw_change_time, str) and raw_change_time:
+            try:
+                change_time = dt.datetime.fromisoformat(raw_change_time)
+            except ValueError:
+                change_time = None
         rich = build_changes_rich_message(
             pending["diff"], pending.get("weeks") or [], config.GROUP_URL,
-            group_name="6381", screenshot_media=screenshot_media,
+            group_name="6381", screenshot_media=screenshot_media, now=change_time,
         )
         result = edit_rich_message(
             rich,
@@ -675,6 +704,7 @@ def _run_once_locked(update_post_id: int | None = None, post_date: dt.date | Non
         "stub": stub,
         "snapshot_id": snapshot_id,
     }
+    change_time = _change_time_msk(event)
     with changes_log.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(event, ensure_ascii=False) + "\n")
     # Rotate if the log grows too large.
@@ -726,6 +756,7 @@ def _run_once_locked(update_post_id: int | None = None, post_date: dt.date | Non
                 old_html=old_html,
                 fingerprint=new_fp,
                 focus_date=post_date,
+                change_time=_change_time_msk(pending_notif.get("event") or event),
             )
         except Exception as exc:  # noqa: BLE001
             retry_result = {"ok": False, "error": str(exc)}
@@ -736,6 +767,7 @@ def _run_once_locked(update_post_id: int | None = None, post_date: dt.date | Non
                 data.get("weeks", []),
                 pending_notif.get("old_snapshot_id") or old_snapshot_id,
                 pending_notif.get("new_snapshot_id") or snapshot_id,
+                change_time=_change_time_msk(pending_notif.get("event") or event),
             )
             _unlink(pending_file)
             print("[retry pending] diff posted successfully")
@@ -848,6 +880,7 @@ def _run_once_locked(update_post_id: int | None = None, post_date: dt.date | Non
             old_html=old_html,
             fingerprint=new_fp,
             focus_date=post_date,
+            change_time=change_time,
         )
     except Exception as exc:  # noqa: BLE001
         post_result = {"ok": False, "error": str(exc)}
@@ -857,7 +890,10 @@ def _run_once_locked(update_post_id: int | None = None, post_date: dt.date | Non
         print(f"[delivery pending] fingerprint={new_fp}")
         return {"changed": True, "fingerprint": new_fp, "stub": stub, "posted": False, "delivery_pending": True, **event}
 
-    _queue_media_enhancement(post_result, diff, data.get("weeks", []), old_snapshot_id, snapshot_id)
+    _queue_media_enhancement(
+        post_result, diff, data.get("weeks", []), old_snapshot_id, snapshot_id,
+        change_time=change_time,
+    )
     _save_baseline(event, data, last_change_event=event)
     _unlink(pending_file)
     dashboard_ok = (

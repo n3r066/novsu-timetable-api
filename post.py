@@ -47,14 +47,15 @@ from schedule_logic import (  # noqa: E402
     find_week,
     lesson_has_expired,
     lesson_non_applicability_reason,
+    lesson_non_applicability_struct,
     resolve_dashboard_view,
 )
 from screenshot import screenshot_html, screenshot_schedule_day_crop_items  # noqa: E402
 from portal_parser import day_short, norm_text, render_schedule_day_chunk_htmls  # noqa: E402
 from telegram_api import edit_rich_message  # noqa: E402
 
-SCHEDULE_SCREEN_STYLE_VERSION = 4
-COMPARISON_SCREEN_STYLE_VERSION = 1
+SCHEDULE_SCREEN_STYLE_VERSION = 5
+COMPARISON_SCREEN_STYLE_VERSION = 2
 
 
 def _dashboard_screen_status_key(target_date: dt.date) -> str:
@@ -382,16 +383,24 @@ def _schedule_screenshot_statuses(data: dict, target_date: dt.date) -> dict[str,
         for lesson in lessons or []:
             is_dot = str(lesson.get("delivery_mode") or "").casefold().startswith("remote") or "дот" in str(lesson.get("note") or "").casefold()
             expired = lesson_has_expired(lesson, day_date, week, full_bounds)
-            inactive_reason = lesson_non_applicability_reason(lesson, day_date, week, full_bounds)
-            applies = inactive_reason is None
+            struct = lesson_non_applicability_struct(lesson, day_date, week, full_bounds)
+            applies = struct is None
             if applies and not is_dot and not expired:
                 continue
+            if applies:
+                status = "dot"
+                tag = "ДОТ"
+            else:
+                kind = struct.get("kind")
+                status = "inactive" if kind != "cancelled" else "cancelled"
+                tag = struct.get("display_text") or struct.get("machine_reason") or "НЕ АКТУАЛЬНО"
             items.append({
                 **lesson,
                 "_schedule_dot": is_dot,
                 "_schedule_expired": expired,
-                "_schedule_status": "dot" if applies else "inactive",
-                "_schedule_tag": "ДОТ" if applies else inactive_reason,
+                "_schedule_status": status,
+                "_schedule_tag": tag,
+                "_schedule_struct": struct,
             })
         if items:
             statuses[DAY_TO_SHORT.get(day, day)] = items

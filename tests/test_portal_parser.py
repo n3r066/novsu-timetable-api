@@ -43,14 +43,14 @@ def test_schedule_statuses_dim_inactive_mark_dot_and_leave_in_person_clean():
     clean = next(row for row in rows if "Нижняя очно" in row.get_text(" "))
     assert inactive["data-schedule-status"] == "inactive"
     assert inactive.select("td.schedule-inactive")
-    assert inactive.select_one(".schedule-status-tag").get_text(strip=True) == "НЕ НА ЭТОЙ НЕДЕЛЕ · С 9‑Й НЕДЕЛИ"
+    assert inactive.select_one(".schedule-status-tag").get_text(strip=True) == "С 9‑й недели"
     assert inactive.select_one(".schedule-status-content") is not None
     assert dot["data-schedule-status"] == "dot"
     assert dot.select("td.schedule-dot")
     assert dot.select_one(".schedule-status-tag").get_text(strip=True) == "ДОТ"
     assert not any(name.startswith("schedule-") for name in clean.get("class", []))
     assert chunk["status_marked"] == 2
-    assert "#eef5ff" in chunk["html"] and "text-decoration: line-through" in chunk["html"]
+    assert "#eef7f4" in chunk["html"] and "text-decoration: line-through" in chunk["html"]
 
 
 def test_day_chunk_does_not_duplicate_nested_first_lesson():

@@ -364,7 +364,7 @@ DIFF_HIGHLIGHT_CSS = """
      правки был не виден вообще. Поэтому: насыщенный фон, толстая цветная
      полоса слева у строки и текстовая метка в первой ячейке. */
   tr.diff-row > td { background: #ffe9a8 !important; }
-  tr.diff-row.diff-added > td { background: #d6f5d6 !important; }
+  tr.diff-row.diff-added > td { background: #e4eee7 !important; }
   /* Полосу рисуем inset-тенью, а не border: border добавляет 12px к ширине
      таблицы, и правая колонка «комм.» уезжала за край скрина. */
   tr.diff-row > td:first-child {
@@ -384,7 +384,7 @@ DIFF_HIGHLIGHT_CSS = """
   }
   .diff-tag {
     display: block; margin: 0 0 4px 14px; padding: 2px 8px; border-radius: 5px;
-    background: #c1440e; color: #fff; font-size: 20px; font-weight: 800;
+    background: #f3e1dc; color: #8e5147; color: #fff; font-size: 20px; font-weight: 800;
     letter-spacing: 0.3px; white-space: nowrap; width: fit-content;
   }
   tr.diff-row.diff-added .diff-tag { background: #14682c; }
@@ -398,33 +398,57 @@ DIFF_HIGHLIGHT_CSS = """
 SCHEDULE_STATUS_CSS = """
   /* Обычные очные строки остаются ровно такими, как на портале. */
   tr.schedule-dot > td, td.schedule-dot {
-    background: #eef5ff !important;
+    background: #eef7f4 !important;
   }
   tr.schedule-dot > td:first-child, td.schedule-dot:first-child {
-    box-shadow: inset 7px 0 0 #5b7fa6;
+    box-shadow: inset 3px 0 0 #7ea99c;
   }
   tr.schedule-inactive > td, td.schedule-inactive {
-    background: #f1f3f5 !important;
-    color: #64748b !important;
+    background: #f0f4f9 !important;
+    color: #466489 !important;
   }
   tr.schedule-inactive > td:first-child, td.schedule-inactive:first-child {
-    box-shadow: inset 7px 0 0 #94a3b8;
+    box-shadow: inset 3px 0 0 #9fb6cf;
   }
   tr.schedule-inactive .schedule-status-content, td.schedule-inactive > .schedule-status-content {
-    opacity: .56;
+    opacity: 1;
+  }
+  tr.schedule-cancelled > td, td.schedule-cancelled {
+    background: #fef2f2 !important;
+    color: #991b1b !important;
+  }
+  tr.schedule-cancelled > td:first-child, td.schedule-cancelled:first-child {
+    box-shadow: inset 7px 0 0 #c1440e;
+  }
+  tr.schedule-cancelled .schedule-status-content, td.schedule-cancelled > .schedule-status-content {
+    opacity: .72;
     text-decoration: line-through;
     text-decoration-thickness: 2px;
   }
   .schedule-status-tag {
-    display: block; width: fit-content; margin: 0 0 5px; padding: 2px 8px;
-    border-radius: 5px; color: #fff; background: #5b7fa6;
-    font-size: 19px; line-height: 1.25; font-weight: 800; letter-spacing: .35px;
+    display: block; width: fit-content; margin: 0 0 7px; padding: 4px 8px;
+    border-radius: 5px; color: #416b60; background: #dfeee8;
+    font-size: 18px; line-height: 1.25; font-weight: 600; letter-spacing: 0;
     text-decoration: none !important; white-space: normal; max-width: 100%;
   }
   tr.schedule-inactive .schedule-status-tag, td.schedule-inactive .schedule-status-tag {
-    background: #64748b;
+    background: #e1eaf4; color: #3b5c81;
+  }
+  tr.schedule-cancelled .schedule-status-tag, td.schedule-cancelled .schedule-status-tag {
+    background: #f3e1dc; color: #8e5147;
   }
 """
+
+def _status_label(item: dict) -> str:
+    """Short display only; applicability still comes from schedule_logic."""
+    struct = item.get("_schedule_struct") or {}
+    if struct.get("kind") == "after_week" and struct.get("data", {}).get("week_number"):
+        return f"После {struct['data']['week_number']}‑й недели"
+    label = str(struct.get("display_text") or item.get("_schedule_tag") or "ДОТ")
+    label = re.sub(r"^НЕ (?:НА ЭТОЙ НЕДЕЛЕ|В ЭТУ ДАТУ)\s*·\s*", "", label)
+    return label if label == "ДОТ" else label[:1].upper() + label[1:].lower()
+
+
 
 COMPARISON_SCREEN_CSS = """
   .wrap { width: 1480px; }
@@ -435,16 +459,16 @@ COMPARISON_SCREEN_CSS = """
   }
   .comparison-heading { font-size: 30px; font-weight: 800; margin: 0 0 12px; }
   .comparison-table .comparison-changed {
-    background: #ffe28a !important; box-shadow: inset 0 0 0 3px #b78103;
+    background: #f3ead5 !important; box-shadow: inset 0 0 0 2px #c5ad79;
   }
-  .comparison-table .comparison-added { background: #d6f5d6 !important; }
-  .comparison-table .comparison-removed { background: #fce4e4 !important; }
+  .comparison-table .comparison-added { background: #e4eee7 !important; }
+  .comparison-table .comparison-removed { background: #f4e5e1 !important; }
   .comparison-tag {
-    display: block; width: fit-content; margin: 0 0 5px; padding: 2px 8px;
+    display: block; width: fit-content; margin: 0 0 7px; padding: 4px 8px;
     border-radius: 4px; font-size: 20px; font-weight: 700; line-height: 1.25;
-    background: #14682c; color: #fff;
+    background: #e1eee5; color: #416651;
   }
-  .comparison-removed .comparison-tag { background: #a13434; }
+  .comparison-removed .comparison-tag { background: #efded9; color: #8c5349; }
 """
 
 
@@ -629,11 +653,22 @@ def _status_row_score(row_norm: str, item: dict) -> float:
 
 def _mark_schedule_status(row, item: dict) -> None:
     status = str(item.get("_schedule_status") or "")
-    if status not in {"dot", "inactive"}:
+    struct = item.get("_schedule_struct") or {}
+    kind = struct.get("kind")
+    if status not in {"dot", "inactive"} and kind != "cancelled":
         return
-    row["class"] = [*row.get("class", []), f"schedule-{status}"]
+
+    # Determine CSS class: cancelled gets its own class, dot stays dot, rest are inactive
+    if kind == "cancelled":
+        css_class = "schedule-cancelled"
+    elif status == "dot":
+        css_class = "schedule-dot"
+    else:
+        css_class = "schedule-inactive"
+
+    row["class"] = [*row.get("class", []), css_class]
     cells = row.find_all(["td", "th"], recursive=False)
-    if status == "inactive":
+    if css_class in {"schedule-inactive", "schedule-cancelled"}:
         soup = BeautifulSoup("", "html.parser")
         for cell in cells:
             wrapper = soup.new_tag("span")
@@ -650,7 +685,9 @@ def _mark_schedule_status(row, item: dict) -> None:
         soup = BeautifulSoup("", "html.parser")
         tag = soup.new_tag("span")
         tag["class"] = ["schedule-status-tag"]
-        tag.string = str(item.get("_schedule_tag") or ("ДОТ" if status == "dot" else "НЕ АКТУАЛЬНО"))
+        # Use display_text from struct if available, otherwise fall back to _schedule_tag
+        display_text = struct.get("display_text") or item.get("_schedule_tag") or ("ДОТ" if status == "dot" else "НЕ АКТУАЛЬНО")
+        tag.string = _status_label(item)
         target.insert(0, tag)
 
 
@@ -749,8 +786,13 @@ def _dashboard_schedule_table(table, statuses: dict[str, list[dict]]):
         for r, index in enumerate(kept):
             row = soup.new_tag("tr", attrs=dict(source_rows[index].attrs))
             row["data-source-row"] = str(index)
-            status = marks.get(index, {}).get("_schedule_status")
-            if status in {"dot", "inactive"}:
+            mark = marks.get(index, {})
+            status = mark.get("_schedule_status")
+            struct = mark.get("_schedule_struct") or {}
+            kind = struct.get("kind")
+            if kind == "cancelled":
+                row["data-schedule-status"] = "cancelled"
+            elif status in {"dot", "inactive"}:
                 row["data-schedule-status"] = status
             for c, original in enumerate(matrix[r]):
                 positions = footprints[id(original)]
@@ -770,11 +812,16 @@ def _dashboard_schedule_table(table, statuses: dict[str, list[dict]]):
                     cell["rowspan"] = str(last_row - r + 1)
                 if last_col > c:
                     cell["colspan"] = str(last_col - c + 1)
-                states = {marks.get(kept[rr], {}).get("_schedule_status", "") for rr, _ in positions}
-                if c != date_col and len(states) == 1 and states <= {"dot", "inactive"}:
+                def _cell_state(rr):
+                    m = marks.get(kept[rr], {})
+                    s = m.get("_schedule_status", "")
+                    k = (m.get("_schedule_struct") or {}).get("kind")
+                    return "cancelled" if k == "cancelled" else s
+                states = {_cell_state(rr) for rr, _ in positions}
+                if c != date_col and len(states) == 1 and states <= {"dot", "inactive", "cancelled"}:
                     state = next(iter(states))
                     cell["class"] = [*cell.get("class", []), f"schedule-{state}"]
-                    if state == "inactive":
+                    if state in {"inactive", "cancelled"}:
                         wrapper = soup.new_tag("span", attrs={"class": "schedule-status-content"})
                         for child in list(cell.contents):
                             wrapper.append(child.extract())
@@ -785,18 +832,29 @@ def _dashboard_schedule_table(table, statuses: dict[str, list[dict]]):
             result.append(row)
         for r, index in enumerate(kept):
             mark = marks.get(index, {})
-            if mark.get("_schedule_status") not in {"dot", "inactive"}:
+            mark_struct = mark.get("_schedule_struct") or {}
+            mark_kind = mark_struct.get("kind")
+            effective_status = "cancelled" if mark_kind == "cancelled" else mark.get("_schedule_status")
+            if effective_status not in {"dot", "inactive", "cancelled"}:
                 continue
             candidates = [subject_col, *[c for c in range(width) if c not in {date_col, subject_col}]]
             for c in candidates:
                 positions = footprints[id(matrix[r][c])]
-                tags = {(marks.get(kept[rr], {}).get("_schedule_status"), marks.get(kept[rr], {}).get("_schedule_tag")) for rr, _ in positions}
+                def _tag_key(rr):
+                    m = marks.get(kept[rr], {})
+                    st = m.get("_schedule_struct") or {}
+                    k = st.get("kind")
+                    eff = "cancelled" if k == "cancelled" else m.get("_schedule_status")
+                    text = st.get("display_text") or m.get("_schedule_tag")
+                    return (eff, text)
+                tags = {_tag_key(rr) for rr, _ in positions}
                 if len(tags) != 1:
                     continue
                 cell = rendered_cells[(r, c)]
                 if cell.select_one(".schedule-status-tag") is None:
                     tag = soup.new_tag("span", attrs={"class": "schedule-status-tag"})
-                    tag.string = str(mark.get("_schedule_tag") or "ДОТ")
+                    display = mark_struct.get("display_text") or mark.get("_schedule_tag") or "ДОТ"
+                    tag.string = _status_label(mark)
                     cell.insert(0, tag)
                 break
             else:
@@ -987,18 +1045,19 @@ def wrap_schedule_html(content_html: str, source_url: str, extra_css: str = "") 
 <meta charset="utf-8">
 <base href="{escaped_source_url}">
 <style>
-  html, body {{ margin: 0; padding: 0; background: #fff; }}
-  body {{ font-family: Arial, Helvetica, sans-serif; color: #111827; }}
+  html, body {{ margin: 0; padding: 0; background: #fdfdfb; }}
+  body {{ font-family: Arial, Helvetica, sans-serif; color: #203850; }}
   .wrap {{ width: 1280px; padding: 20px 22px 28px; box-sizing: border-box; }}
   .block_content {{ width: 100%; }}
   h1 {{ font-size: 34px; line-height: 1.15; margin: 0 0 8px; font-weight: 800; }}
   h2 {{ font-size: 31px; line-height: 1.15; margin: 8px 0 10px; font-weight: 800; }}
+  h2[style*="tomato" i] {{ color: #b87565 !important; }}
   h3 {{ font-size: 28px; line-height: 1.2; margin: 12px 0 8px; }}
   h4, p {{ font-size: 24px; line-height: 1.25; margin: 8px 0; }}
   table {{ width: 100%; border-collapse: collapse; table-layout: auto; font-size: 28px; line-height: 1.22; }}
-  th, td {{ border: 2px solid #cbd5e1; padding: 9px 11px; vertical-align: top; background: #fff; }}
+  th, td {{ border: 1px solid #cdd9e7; padding: 9px 11px; vertical-align: top; background: #fff; }}
   th {{ background: #e5e7eb; font-weight: 800; text-align: left; }}
-  tr:first-child td, tr:first-child th {{ background: #dbeafe; font-weight: 800; }}
+  tr:first-child td, tr:first-child th {{ background: #e1eaf5; font-weight: 800; }}
   b {{ font-weight: 800; }}
   a {{ color: inherit; text-decoration: none; }}
   td[style*="width:1px"], th[style*="width:1px"] {{ white-space: nowrap; }}

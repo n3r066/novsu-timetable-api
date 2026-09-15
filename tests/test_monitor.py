@@ -110,7 +110,7 @@ def test_post_changes_falls_back_to_plain_html(monkeypatch):
     assert calls["method"] == "sendMessage"
     assert calls["fields"]["parse_mode"] == "HTML"
     assert "Изменения · группа" in calls["fields"]["text"]
-    assert "добавили пару" in calls["fields"]["text"]
+    assert "добавили пары (2 пары)" in calls["fields"]["text"]
 
 
 def test_run_once_no_change_does_not_post(monkeypatch, tmp_path):

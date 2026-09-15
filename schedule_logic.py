@@ -486,6 +486,190 @@ def _week_condition_tag(prefix: str, number: int) -> str:
     return f"НЕ НА ЭТОЙ НЕДЕЛЕ · {prefix} {number}‑Й НЕДЕЛИ"
 
 
+def lesson_non_applicability_struct(
+    lesson: dict,
+    target: dt.date,
+    week: dict | None,
+    bounds: tuple[dt.date, dt.date] | None = None,
+) -> dict | None:
+    """Return structured non-applicability reason for UI rendering.
+
+    Returns None if lesson is applicable. Otherwise returns dict:
+    {
+        "kind": "parity" | "from_week" | "after_week" | "until_week" | "starts_date" | "ends_date" | "cancelled" | "only_dates" | "outside_calendar",
+        "display_text": str,  # Short human-readable label for screenshot badge
+        "machine_reason": str,  # Existing full string from lesson_non_applicability_reason()
+        "data": {...}  # Structured data (week_number, date, parity, etc.)
+    }
+    """
+    machine_reason = lesson_non_applicability_reason(lesson, target, week, bounds)
+    if machine_reason is None:
+        return None
+
+    if week is None:
+        return {
+            "kind": "outside_calendar",
+            "display_text": "ВНЕ КАЛЕНДАРЯ",
+            "machine_reason": machine_reason,
+            "data": {},
+        }
+
+    if bounds is None:
+        bounds = _week_dates(week)
+
+    condition_text = _condition_text(lesson)
+    low = condition_text.lower()
+    week_number = int(week.get("week") or 0)
+
+    # Check week-based conditions first
+    after_match = _AFTER_WEEK_RE.search(low)
+    if after_match and week_number <= int(after_match.group(1)):
+        n = int(after_match.group(1))
+        return {
+            "kind": "after_week",
+            "display_text": f"С {n + 1}-Й НЕДЕЛИ",
+            "machine_reason": machine_reason,
+            "data": {"week_number": n, "effective_week": n + 1},
+        }
+
+    until_match = _UNTIL_WEEK_RE.search(low)
+    if until_match and week_number >= int(until_match.group(1)):
+        n = int(until_match.group(1))
+        return {
+            "kind": "until_week",
+            "display_text": f"ДО {n}-Й НЕДЕЛИ",
+            "machine_reason": machine_reason,
+            "data": {"week_number": n},
+        }
+
+    from_match = _FROM_WEEK_RE.search(low)
+    if from_match and week_number < int(from_match.group(1)):
+        n = int(from_match.group(1))
+        return {
+            "kind": "from_week",
+            "display_text": f"С {n}-Й НЕДЕЛИ",
+            "machine_reason": machine_reason,
+            "data": {"week_number": n},
+        }
+
+    # Check parity
+    half = week.get("half")
+    parity = lesson_parity(lesson)
+    if parity in {"top", "bottom"} and half != parity:
+        label = "ВЕРХНЯЯ НЕДЕЛЯ" if parity == "top" else "НИЖНЯЯ НЕДЕЛЯ"
+        return {
+            "kind": "parity",
+            "display_text": label,
+            "machine_reason": machine_reason,
+            "data": {"parity": parity, "week_half": half},
+        }
+
+    # Check date-based conditions
+    date_parts = _date_condition_parts(lesson)
+
+    # Check cancelled dates
+    cancelled_dates: set[dt.date] = set()
+    for text in date_parts:
+        for match in _CANCELLED_DATES_RE.finditer(text):
+            cancelled_dates.update(_parsed_dates(match.group("dates"), target.year, bounds))
+    if target in cancelled_dates:
+        return {
+            "kind": "cancelled",
+            "display_text": f"ОТМЕНЕНО {_short_date(target)}",
+            "machine_reason": machine_reason,
+            "data": {"date": target.isoformat()},
+        }
+
+    # Check date ranges
+    ranges: list[tuple[dt.date, dt.date]] = []
+    for text in date_parts:
+        for match in _RANGE_RE.finditer(text):
+            start_token = match.group("from") or match.group("dash_from")
+            end_token = match.group("to") or match.group("dash_to")
+            start = _parse_note_date(start_token, target.year, bounds)
+            end = _parse_note_date(end_token, target.year, bounds)
+            if start is None or end is None:
+                continue
+            end_match = _DATE_RE.fullmatch(end_token.strip())
+            if end < start and end_match and end_match.group(3) is None:
+                try:
+                    end = end.replace(year=start.year + 1)
+                except ValueError:
+                    pass
+            ranges.append((start, end))
+    if ranges and not any(start <= target <= end for start, end in ranges):
+        start, end = ranges[0]
+        return {
+            "kind": "starts_date",
+            "display_text": f"С {_short_date(start)}",
+            "machine_reason": machine_reason,
+            "data": {"start_date": start.isoformat(), "end_date": end.isoformat()},
+        }
+
+    # Check start dates
+    without_ranges = [_RANGE_RE.sub(" ", text) for text in date_parts]
+    start_dates = [
+        parsed
+        for text in without_ranges
+        for parsed in (
+            _parse_note_date(match.group(1), target.year, bounds)
+            for match in _START_DATE_RE.finditer(text)
+        )
+        if parsed is not None
+    ]
+    for text in without_ranges:
+        for match in _START_MONTH_RE.finditer(text):
+            month = _MONTHS[match.group(1).lower()]
+            parsed = _parse_note_date(f"01.{month:02d}", target.year, bounds)
+            if parsed is not None:
+                start_dates.append(parsed)
+    if start_dates and target < max(start_dates):
+        return {
+            "kind": "starts_date",
+            "display_text": f"С {_short_date(max(start_dates))}",
+            "machine_reason": machine_reason,
+            "data": {"start_date": max(start_dates).isoformat()},
+        }
+
+    # Check end dates
+    end_dates = [
+        parsed
+        for text in without_ranges
+        for parsed in (
+            _parse_note_date(match.group(1), target.year, bounds)
+            for match in _END_DATE_RE.finditer(text)
+        )
+        if parsed is not None
+    ]
+    if end_dates and target > min(end_dates):
+        return {
+            "kind": "ends_date",
+            "display_text": f"ПО {_short_date(min(end_dates))}",
+            "machine_reason": machine_reason,
+            "data": {"end_date": min(end_dates).isoformat()},
+        }
+
+    # Check exact dates
+    has_exact_context, exact_dates = _explicit_lesson_dates(lesson, target, bounds)
+    if has_exact_context:
+        if target in exact_dates:
+            return None
+        return {
+            "kind": "only_dates",
+            "display_text": "ТОЛЬКО ПО ДАТАМ",
+            "machine_reason": machine_reason,
+            "data": {"dates": sorted(d.isoformat() for d in exact_dates)},
+        }
+
+    # Fallback: unknown reason
+    return {
+        "kind": "outside_calendar",
+        "display_text": "ВНЕ КАЛЕНДАРЯ",
+        "machine_reason": machine_reason,
+        "data": {},
+    }
+
+
 def lesson_non_applicability_reason(
     lesson: dict,
     target: dt.date,

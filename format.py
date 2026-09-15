@@ -1841,6 +1841,13 @@ _RICH_DIFF_BLOCK_LIMIT = 450
 _MSK = zoneinfo.ZoneInfo("Europe/Moscow")
 
 
+def _as_msk(value: dt.datetime) -> dt.datetime:
+    """Одна точка нормировки «наивная дата → московское время»."""
+    if value.tzinfo is not None:
+        return value.astimezone(_MSK)
+    return value.replace(tzinfo=_MSK)
+
+
 def _rich_payload_stats(value: object) -> tuple[int, int]:
     """Return conservative (display-text chars, counted blocks) for limits."""
     text_chars = 0
@@ -1988,7 +1995,7 @@ _LANGUAGE_ABBREV = {
 }
 #: Портал сокращает по-разному: «нем. яз» и «немец. яз» — одно и то же.
 _LANGUAGE_RE = re.compile(
-    r"\b(англ|нем(?:ец)?|кит|исп|фр(?:анц)?|итал|япон|кор)\.\s*яз\.?", re.I
+    r"\b(англ|нем(?:ец)?|кит|исп|фр(?:анц)?|итал|япон|кор)\.\s*яз(?:ык)?\.?(?!\w)", re.I
 )
 
 
@@ -2067,6 +2074,16 @@ def _entry_brief(kind: str, item: dict) -> str:
     }
     if labels == {"предмет"}:
         return "переименовали пару"
+    if labels == {"преподаватель"} and all(
+        _missing_change_value(field[1]) and not _missing_change_value(field[2]) for field in item.get("fields", [])
+        if isinstance(field, (list, tuple)) and len(field) == 3
+    ):
+        return "указали преподавателя"
+    if labels == {"преподаватель"} and all(
+        _missing_change_value(field[2]) for field in item.get("fields", [])
+        if isinstance(field, (list, tuple)) and len(field) == 3
+    ):
+        return "преподаватель больше не указан"
     if labels and labels <= {"примечание", "место", "формат"}:
         return "изменили условия"
     if labels:
@@ -2082,24 +2099,37 @@ def _entry_brief(kind: str, item: dict) -> str:
     return "обновили пару"
 
 
-def _day_summary(day: str, entries: list[tuple[str, dict, dict | None]]) -> str:
-    """Заголовок раскрывающегося раздела дня.
+def _action_label(brief: str, count: int) -> str:
+    if count == 1:
+        return brief
+    if brief == "преподаватель больше не указан":
+        return "преподаватели больше не указаны"
+    for singular, plural in (("преподавателя", "преподавателей"),
+                             ("аудиторию", "аудитории"), ("название", "названия"),
+                             ("пару", "пары")):
+        brief = brief.replace(singular, plural)
+    return brief
 
-    «Пятница (переименовали пару, убрали пару)»: из свёрнутого раздела уже
-    понятно, что именно поменялось, — раскрывать ради одного глагола не нужно.
-    """
-    counts: dict[str, int] = {}
-    order: list[str] = []
-    for kind, item, _partner in entries:
-        brief = _entry_brief(kind, item)
-        if brief not in counts:
-            order.append(brief)
-        counts[brief] = counts.get(brief, 0) + 1
-    parts = [
-        f"{brief} ×{counts[brief]}" if counts[brief] > 1 else brief
-        for brief in order
-    ]
-    return _truncate_rich_text(f"{day} ({', '.join(parts)})", 180)
+
+def _day_action_groups(entries: list[tuple[str, dict, dict | None]]) -> list[tuple[str, list]]:
+    groups: dict[str, list] = {}
+    for entry in entries:
+        groups.setdefault(_entry_brief(entry[0], entry[1]), []).append(entry)
+    return list(groups.items())
+
+
+def _day_summary(day: str, entries: list[tuple[str, dict, dict | None]]) -> str:
+    """Name each kind of edit once, using ordinary words instead of multipliers."""
+    parts = []
+    for brief, group in _day_action_groups(entries):
+        count = len(group)
+        label = _action_label(brief, count)
+        if count > 1:
+            label += f" ({count} {_pairs_word(count)})"
+        parts.append(label)
+    if len(entries) == 1:
+        return _truncate_rich_text(f"{day} ({', '.join(parts)})", 180)
+    return _truncate_rich_text(f"{day} · {', '.join(parts)}", 180)
 
 
 #: Предел длины добавленного хвоста, который ещё удобно показать подсветкой.
@@ -2328,7 +2358,7 @@ def _comparison_for_day(
             return None
         if len(photos) == 1:
             return photos[0]
-        return _slideshow(photos, "Листай: сначала старая версия, затем новая")
+        return _details("Сравнить расписание", _slideshow(photos, "Было → стало"))
     return None
 
 
@@ -2347,7 +2377,11 @@ def _blockquote(title: list[object] | str, body: list[dict], *,
 
 
 #: Заглушки не зачёркиваем: перечёркнутое «не указано» читается как правка.
-_VALUE_PLACEHOLDERS = {"", "не указано", "не указаны", "название не указано"}
+_VALUE_PLACEHOLDERS = {"", "—", "-", ".", "не указано", "не указаны", "название не указано"}
+
+
+def _missing_change_value(value: object) -> bool:
+    return str(value or "").strip().casefold() in _VALUE_PLACEHOLDERS
 
 
 def _old_value_runs(value: str, limit: int) -> list[object]:
@@ -2522,6 +2556,80 @@ def _change_sentence(kind: str, item: dict, partner: dict | None = None) -> list
     return blocks
 
 
+def _change_card(kind: str, item: dict, partner: dict | None = None) -> list[dict]:
+    """Compact notification: subject, occurrence context, then the actual delta.
+
+    Keep notes attached to their lesson and preserve distinct week variants.
+    Complex renames retain the existing lossless prefix highlighting.
+    """
+    fields = [tuple(field) for field in item.get("fields", [])
+              if isinstance(field, (list, tuple)) and len(field) == 3]
+    labels = {str(field[0]) for field in fields}
+    current = partner or item
+    name, _ = _subject_kind(_subject_first(current))
+    if "предмет" in labels:
+        return _change_sentence(kind, item, partner)
+    runs: list = [{"type": "bold", "text": _truncate_rich_text(name, 400)}]
+    segments = _sentence_ctx(current)
+    if kind == "moved":
+        segments = [segment for segment in segments if not isinstance(segment, dict)]
+    if kind == "removed":
+        segments = [{**segment, "type": "strikethrough"} if isinstance(segment, dict) else segment
+                    for segment in segments]
+    context = _join_ctx(segments)
+    if context:
+        runs += ["\n", *context]
+    lines: list[list] = []
+    if kind == "moved" and partner is not None:
+        lines.append(["Перенесли: ", *_old_value_runs(bells.slot(item.get("time")).label(), 48),
+                      " → ", {"type": "bold", "text": bells.slot(partner.get("time")).label()}])
+        before_place, after_place = _place_line(item, ""), _place_line(partner, "")
+        if before_place != after_place:
+            lines.append(["Место: ", *_old_value_runs(before_place, 200), " → ",
+                          {"type": "bold", "text": _truncate_rich_text(after_place, 200)}])
+    elif kind in {"added", "removed"}:
+        lines.append([{"type": "bold", "text": "Добавили пару" if kind == "added" else "Убрали пару"}])
+        place = _place_line(current, "")
+        if place != "место не указано":
+            lines.append([{"type": "strikethrough", "text": _truncate_rich_text(place, 600)}]
+                         if kind == "removed" else [_truncate_rich_text(place, 600)])
+    else:
+        shown = [f for f in fields if not (f[0] in {"место", "формат"} and "примечание" in labels)]
+        for label, old, new in shown[:6]:
+            label = str(label)
+            noun = _FIELD_CLAUSE.get(label, label).capitalize()
+            if label == "формат":
+                old, new = _FORMAT_MODES.get(old, old), _FORMAT_MODES.get(new, new)
+            if _missing_change_value(old) and not _missing_change_value(new):
+                prefix = "Указали преподавателя" if label == "преподаватель" else noun
+                line = [prefix + ": ", {"type": "bold", "text": _truncate_rich_text(new or "не указано", 200)}]
+            else:
+                line = [noun + ": "]
+                if not _missing_change_value(old):
+                    line += [*_old_value_runs(old, 200), " → "]
+                line += [{"type": "bold", "text": _truncate_rich_text("не указано" if _missing_change_value(new) else new, 200)}]
+            lines.append(line)
+        if len(shown) > 6:
+            lines.append([f"Ещё {len(shown) - 6} полей — на портале"])
+        corpus = _corpus_tail(item)
+        if corpus:
+            lines.append(["Другой корпус: " + corpus.split("корпус: ", 1)[-1]])
+        if not shown:
+            lines.append(["Обновили на портале"])
+        # A teacher-only edit must not repeat unchanged rooms and addresses.
+        if labels & {"ауд.", "место", "формат", "примечание"}:
+            places = {_where(variant) for variant in _variants_of(current)}
+            if len(places) > 1:
+                lines.append([_truncate_rich_text(_place_line(current, ""), 600)])
+    if "примечание" not in labels:
+        note = _note_line(current)
+        if note:
+            lines.append([{"type": "italic", "text": _truncate_rich_text(note, 600)}])
+    for line in lines:
+        runs += ["\n", *line]
+    return [_rich_paragraph(runs)]
+
+
 def _variant_signature(kind: str, item: dict, partner: dict | None) -> tuple:
     """Подпись правки без указания верхней/нижней недели.
 
@@ -2668,6 +2776,78 @@ def _group_by_day(
     return by_day
 
 
+def _summary_subjects(entries: list[tuple[str, dict, dict | None]]) -> list[object]:
+    names: dict[str, int] = {}
+    for _kind, item, partner in entries:
+        name, _ = _subject_kind(_subject_first(partner or item))
+        names[name] = names.get(name, 0) + 1
+    runs: list[object] = []
+    for name, count in names.items():
+        if runs:
+            runs.append(", ")
+        runs.append({"type": "bold", "text": _truncate_rich_text(name, 400)})
+        if count > 1:
+            runs.append(f" ({count} {_pairs_word(count)})")
+    return runs
+
+
+def _summary_delta(kind: str, item: dict, partner: dict | None) -> tuple[tuple, list[object]]:
+    """Overview values only; the lossless old/new context stays in details."""
+    fields = [tuple(field) for field in item.get("fields", [])
+              if isinstance(field, (list, tuple)) and len(field) == 3]
+    labels = {str(field[0]) for field in fields}
+    if kind == "changed" and labels == {"преподаватель"}:
+        value = str(fields[0][2] or "")
+        if _missing_change_value(value):
+            return ("teacher_missing",), []
+        # Different former teachers can share a new one. The heading identifies
+        # a replacement; exact former names remain attached to each occurrence.
+        return ("teacher", value), [_truncate_rich_text(value, 200)]
+    if kind == "changed" and labels == {"ауд."}:
+        old, new = str(fields[0][1] or ""), str(fields[0][2] or "")
+        old_text = "не указана" if _missing_change_value(old) else old
+        new_text = "не указана" if _missing_change_value(new) else new
+        return ("room", old, new), [_truncate_rich_text(old_text, 200), " → ", _truncate_rich_text(new_text, 200)]
+    if kind == "moved" and partner is not None:
+        old = bells.slot(item.get("time")).label()
+        new = bells.slot(partner.get("time")).label()
+        return ("time", old, new), [old, " → ", new]
+    # Free-form portal notes and multi-field edits cannot be shortened by
+    # guessing which substring matters. List the affected subjects together;
+    # their complete deltas remain in the closed details section.
+    return ("subjects",), []
+
+
+def _day_change_blocks(entries: list[tuple[str, dict, dict | None]]) -> list[dict]:
+    details: list[dict] = []
+    for kind, item, partner in entries:
+        if details:
+            details.append(_divider())
+        details.extend(_change_card(kind, item, partner))
+    if len(entries) <= 1:
+        return details
+    blocks: list[dict] = []
+    for brief, group in _day_action_groups(entries):
+        rows: dict[tuple, tuple[list, list]] = {}
+        for entry in group:
+            key, delta = _summary_delta(*entry)
+            if key not in rows:
+                rows[key] = ([], delta)
+            rows[key][0].append(entry)
+        runs: list[object] = [{"type": "bold", "text": _action_label(brief, len(group)).capitalize() + ":"}]
+        for subjects, delta in rows.values():
+            runs.extend(["\n• ", *_summary_subjects(subjects)])
+            if delta:
+                runs.extend([" — ", *delta])
+        blocks.append(_rich_paragraph(runs))
+    if all(kind == "changed" and {str(f[0]) for f in item.get("fields", [])
+                                  if isinstance(f, (list, tuple)) and len(f) == 3} == {"преподаватель"}
+           for kind, item, _ in entries):
+        blocks.append(_paragraph("Время и аудитории не менялись."))
+    blocks.append(_details("Подробности: время, недели и примечания", *details))
+    return blocks
+
+
 def _day_sections(
     added: list[dict],
     removed: list[dict],
@@ -2676,16 +2856,14 @@ def _day_sections(
     source_url: str,
 ) -> list[dict]:
     """Каждый день — раскрывающийся раздел: в сводке, что именно поменялось,
-    внутри — по предложению на правку и сравнение «было/стало» со скринами."""
+    внутри — объединённая сводка, закрытые подробности и сравнение со скринами."""
     by_day = _group_by_day(added, removed, changed)
     order = {name: index for index, name in enumerate(DAYS_ORDER)}
     used: set[str] = set()
     blocks: list[dict] = []
     for day in sorted(by_day, key=lambda name: order.get(name, len(order))):
         entries = by_day[day]
-        content: list[dict] = []
-        for kind, item, partner in entries:
-            content.extend(_change_sentence(kind, item, partner))
+        content = _day_change_blocks(entries)
         kinds = {kind for kind, _, _ in entries}
         if "moved" in kinds:
             kinds |= {"added", "removed"}
@@ -2721,8 +2899,9 @@ def build_changes_rich_message(
 ) -> dict:
     """Action-first notification, bounded independently of optional screenshots.
 
-    Telegram supplies the publication timestamp. The current calendar week is
-    not an occurrence date and must not be presented as the week of a change.
+    ``now`` — московское время обнаружения правки; печатается дословно сверху
+    поста. Это не дата занятия: текущую календарную неделю нельзя выдавать за
+    неделю, на которой произошло изменение.
     """
     added = list(diff.get("added") or [])
     removed = list(diff.get("removed") or [])
@@ -2741,6 +2920,11 @@ def build_changes_rich_message(
     ]
     def assemble() -> dict:
         blocks: list[dict] = []
+        if now is not None:
+            blocks.append(_heading(
+                _as_msk(now).strftime("Обнаружено на сайте %d.%m.%Y в %H:%M:%S МСК"), 3,
+            ))
+            blocks.append(_rich_paragraph([{"type": "italic", "text": "Точное время правки портал не сообщает."}]))
         if transition == "published":
             blocks.append(_heading("Расписание опубликовано на портале", 3))
         elif transition == "vanished":
@@ -2810,10 +2994,15 @@ def _runs_to_html(runs: object) -> str:
     return "".join(out)
 
 
-def changes_fallback_text(diff: dict, source_url: str, *, group_name: str = "6381") -> str:
+def changes_fallback_text(
+    diff: dict, source_url: str, *, group_name: str = "6381", now: dt.datetime | None = None,
+) -> str:
     """Build one valid plain-HTML fallback of at most 4096 characters."""
     header = f"<b>Изменения · группа {_escape_truncated(group_name, 160)}</b>"
     lines = [header]
+    if now is not None:
+        lines.append(_html.escape(_as_msk(now).strftime("Обнаружено на сайте %d.%m.%Y в %H:%M:%S МСК")))
+        lines.append("Точное время правки портал не сообщает.")
     transition = diff.get("transition")
     if transition == "published":
         lines.append("Расписание опубликовано на портале")
@@ -2826,10 +3015,13 @@ def changes_fallback_text(diff: dict, source_url: str, *, group_name: str = "638
     for day in sorted(by_day, key=lambda name: order.get(name, len(order))):
         entries = by_day[day]
         chunk = [f"<b>{_escape_truncated(_day_summary(day, entries), 200)}</b>"]
-        for kind, item, partner in entries:
-            for block in _change_sentence(kind, item, partner):
-                if block.get("type") == "paragraph":
-                    chunk.append(_runs_to_html(block.get("text")))
+        for block in _day_change_blocks(entries):
+            if block.get("type") == "paragraph":
+                chunk.append(_runs_to_html(block.get("text")))
+            elif block.get("type") == "details":
+                body = "\n\n".join(_runs_to_html(part.get("text"))
+                                     for part in block["blocks"] if part.get("type") == "paragraph")
+                chunk.append("<blockquote expandable><b>Подробности</b>\n" + body + "</blockquote>")
         day_chunks.append("\n".join(chunk))
 
     source_line = f'<a href="{_escape_truncated(source_url, 700)}">открыть на портале</a>'

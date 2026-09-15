@@ -8,6 +8,8 @@ from schedule_logic import (
     day_last_pair_end,
     day_view,
     lesson_applies_on,
+    lesson_non_applicability_reason,
+    lesson_non_applicability_struct,
     next_lessons,
     parse_user_date,
     dashboard_presentation_fingerprint,
@@ -540,6 +542,76 @@ def test_day_last_pair_end_and_day_is_live():
     assert not day_is_live(day, dt.datetime(2026, 9, 4, 17, 45))
     assert not day_is_live(day, dt.datetime(2026, 9, 5, 0, 0))
     assert day_is_live(day, dt.datetime(2026, 9, 3, 12, 0))
+
+
+def test_non_applicability_struct_display_text_for_each_kind():
+    """Short badge labels replace the overloaded machine reason on screenshots."""
+    week_8 = {"week": 8, "half": "bottom"}
+    bounds = (dt.date(2026, 10, 19), dt.date(2026, 10, 25))
+    target = bounds[0]
+
+    struct = lesson_non_applicability_struct({"note": "с 9 недели"}, target, week_8, bounds)
+    assert struct["kind"] == "from_week"
+    assert struct["display_text"] == "С 9-Й НЕДЕЛИ"
+    assert struct["machine_reason"] == "НЕ НА ЭТОЙ НЕДЕЛЕ · С 9‑Й НЕДЕЛИ"
+    assert struct["data"] == {"week_number": 9}
+
+    # "после 9 недели" нормализуется в "с 10-й недели": N+1, а не N.
+    struct = lesson_non_applicability_struct({"note": "после 9 недели"}, target, week_8, bounds)
+    assert struct["kind"] == "after_week"
+    assert struct["display_text"] == "С 10-Й НЕДЕЛИ"
+    assert struct["data"] == {"week_number": 9, "effective_week": 10}
+
+    struct = lesson_non_applicability_struct({"note": "до 9 недели"}, target, {"week": 9, "half": "top"}, bounds)
+    assert struct["kind"] == "until_week"
+    assert struct["display_text"] == "ДО 9-Й НЕДЕЛИ"
+
+    struct = lesson_non_applicability_struct({"note": "по верхней неделе"}, target, week_8, bounds)
+    assert struct["kind"] == "parity"
+    assert struct["display_text"] == "ВЕРХНЯЯ НЕДЕЛЯ"
+    assert struct["data"]["parity"] == "top"
+
+    struct = lesson_non_applicability_struct({"note": "по нижней неделе"}, target, {"week": 9, "half": "top"}, bounds)
+    assert struct["kind"] == "parity"
+    assert struct["display_text"] == "НИЖНЯЯ НЕДЕЛЯ"
+
+    struct = lesson_non_applicability_struct({"note": "с 01.11"}, target, week_8, bounds)
+    assert struct["kind"] == "starts_date"
+    assert struct["display_text"] == "С 01.11"
+
+    struct = lesson_non_applicability_struct({"note": "по 20.10"}, dt.date(2026, 10, 21), week_8, bounds)
+    assert struct["kind"] == "ends_date"
+    assert struct["display_text"] == "ПО 20.10"
+
+    struct = lesson_non_applicability_struct(
+        {"note": "19.10 занятий не будет"}, target, week_8, bounds,
+    )
+    assert struct["kind"] == "cancelled"
+    assert struct["display_text"] == "ОТМЕНЕНО 19.10"
+    assert "ОТМЕНЕНО" in struct["display_text"]
+
+    struct = lesson_non_applicability_struct({"note": "только 20.10, 22.10"}, target, week_8, bounds)
+    assert struct["kind"] == "only_dates"
+    assert struct["display_text"] == "ТОЛЬКО ПО ДАТАМ"
+
+    assert lesson_non_applicability_struct({"note": "с 9 недели"}, target, None, bounds)["kind"] == "outside_calendar"
+    assert lesson_non_applicability_struct({"note": "с 9 недели"}, target, None, bounds)["display_text"] == "ВНЕ КАЛЕНДАРЯ"
+
+    # Applicable lesson → None.
+    assert lesson_non_applicability_struct({"note": ""}, target, week_8, bounds) is None
+
+
+def test_non_applicability_reason_backward_compat_strings_unchanged():
+    """The legacy wrapper keeps returning the exact historical strings."""
+    week_8 = {"week": 8, "half": "bottom"}
+    bounds = (dt.date(2026, 10, 19), dt.date(2026, 10, 25))
+    target = bounds[0]
+    assert lesson_non_applicability_reason({"note": "с 9 недели"}, target, week_8, bounds) == "НЕ НА ЭТОЙ НЕДЕЛЕ · С 9‑Й НЕДЕЛИ"
+    assert lesson_non_applicability_reason({"note": "после 9 недели"}, target, week_8, bounds) == "НЕ НА ЭТОЙ НЕДЕЛЕ · ПОСЛЕ 9‑Й НЕДЕЛИ"
+    assert lesson_non_applicability_reason({"note": "по верхней неделе"}, target, week_8, bounds) == "НЕ НА ЭТОЙ НЕДЕЛЕ · ТОЛЬКО ВЕРХНЯЯ"
+    assert lesson_non_applicability_reason({"note": "19.10 занятий не будет"}, target, week_8, bounds) == "ЗАНЯТИЯ НЕ БУДЕТ · 19.10"
+    assert lesson_non_applicability_reason({"note": "только 20.10, 22.10"}, target, week_8, bounds) == "ТОЛЬКО ПО ДАТАМ · 20.10, 22.10"
+    assert lesson_non_applicability_reason({"note": ""}, target, week_8, bounds) is None
 
 
 def test_visible_week_days_hides_today_after_last_pair():

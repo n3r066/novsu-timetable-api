@@ -89,9 +89,12 @@ def test_missing_time_does_not_create_empty_badge_or_invent_date():
     before = build_changes_rich_message(diff, [], "https://example.test", now=dt.datetime(2026, 9, 4))
     after = build_changes_rich_message(diff, [{"week": 20, "half": "bottom", "start": "01.12.2026", "end": "07.12.2026"}],
                                        "https://example.test", now=dt.datetime(2026, 12, 4))
-    assert before == after
+    # У пары нет времени — пост не выдумывает ни дефис-заглушку, ни календарную
+    # неделю правки. Время обнаружения при этом своё у каждого поста.
     assert "—" not in visible(before)
     assert "Неделя 20" not in visible(after)
+    assert "Обнаружено на сайте 04.09.2026 в 00:00:00 МСК" in visible(before)
+    assert "Обнаружено на сайте 04.12.2026 в 00:00:00 МСК" in visible(after)
 
 
 def test_upper_lower_locations_are_separate_not_a_room_remote_slash():
@@ -110,10 +113,10 @@ def test_upper_lower_locations_are_separate_not_a_room_remote_slash():
 
 
 @pytest.mark.parametrize(("label", "old", "new", "brief", "sentence"), [
-    ("ауд.", "1318", "1331", "сменили аудиторию", "поменяли аудиторию: 1318 → 1331"),
-    ("преподаватель", "Петров", "Иванов", "сменили преподавателя", "сменился преподаватель: Петров → Иванов"),
-    ("формат", "in_person", "remote_or_hybrid", "изменили условия", "изменился формат: без ДОТ → с использованием ДОТ"),
-    ("ауд.", "1318", "", "сменили аудиторию", "поменяли аудиторию: 1318 → не указано"),
+    ("ауд.", "1318", "1331", "сменили аудиторию", "Аудитория: 1318 → 1331"),
+    ("преподаватель", "Петров", "Иванов", "сменили преподавателя", "Преподаватель: Петров → Иванов"),
+    ("формат", "in_person", "remote_or_hybrid", "изменили условия", "Формат: без ДОТ → с использованием ДОТ"),
+    ("ауд.", "1318", "", "сменили аудиторию", "Аудитория: 1318 → не указано"),
 ])
 def test_change_kind_has_specific_summary_and_new_value_emphasis(label, old, new, brief, sentence):
     diff = rename_diff()
@@ -123,7 +126,7 @@ def test_change_kind_has_specific_summary_and_new_value_emphasis(label, old, new
     days = day_sections(payload)
     assert [day["summary"] for day in days] == [f"Понедельник ({brief})"]
     change = next(block for block in sentences(payload) if sentence in text(block))
-    styled = [run for run in change["text"] if isinstance(run, dict)]
+    styled = [run for run in change["text"] if isinstance(run, dict) and run.get("type") == "bold"]
     shown_new = {"in_person": "без ДОТ", "remote": "ДОТ",
                  "remote_or_hybrid": "с использованием ДОТ"}.get(new, new) if label == "формат" else new
     assert styled[-1] == {"type": "bold", "text": shown_new or "не указано"}
@@ -134,7 +137,7 @@ def test_room_change_to_another_building_says_so_and_same_building_stays_silent(
     diff = rename_diff()
     diff["changed"][0]["fields"] = [["ауд.", "1318", "3207"]]
     main = visible(build_changes_rich_message(diff, [], "https://example.test"))
-    assert "это уже другой корпус: корпус 3 — Б. Санкт-Петербургская, 41" in main
+    assert "Другой корпус: корпус 3 — Б. Санкт-Петербургская, 41" in main
     diff["changed"][0]["fields"] = [["ауд.", "418", "415"]]
     main = visible(build_changes_rich_message(diff, [], "https://example.test"))
     assert "другой корпус" not in main
@@ -155,10 +158,10 @@ def test_multi_field_change_names_fields_and_flags_building_move():
     assert [day["summary"] for day in days] == [
         "Понедельник (сменили преподавателя и аудиторию)"]
     main = visible(payload)
-    assert "поменялось сразу несколько: преподаватель Барышева Ангелина Алексеевна → " \
-           "Иванова Ольга Петровна, аудитория 1318 → 415" in main
+    assert "Преподаватель: Барышева Ангелина Алексеевна → " \
+           "Иванова Ольга Петровна\nАудитория: 1318 → 415" in main
     # 1318 (старый корпус) → 415 (новый): здание другое, кампус тот же.
-    assert "это уже другой корпус: новый корпус — кампус Антоново" in main
+    assert "Другой корпус: новый корпус — кампус Антоново" in main
 
 
 def test_dot_does_not_hide_physical_location_or_unknown_conditions():
@@ -188,7 +191,7 @@ def test_comment_edit_does_not_repeat_derived_location_and_mode_edits():
     ]
     payload = build_changes_rich_message(diff, [], "https://example.test")
     main = visible(payload)
-    assert "изменились условия: Антоново → с использованием ДОТ с 14.09" in main
+    assert "Условия: Антоново → с использованием ДОТ с 14.09" in main
     assert "изменился формат" not in main and "сменилось место" not in main
     assert main.count("с 14.09") == 1
 
@@ -199,7 +202,7 @@ def test_fallback_keeps_same_day_time_move_as_one_action_and_keeps_parity():
     fallback = changes_fallback_text({"removed": [lesson], "added": [{**lesson, "time": "11:00 12:00"}]},
                                      "https://example.test?a=1&b=2")
     assert fallback.count("перенесли пару") == 1
-    assert "перенесли: <s>09:00–10:45</s> → <b>11:00–12:45</b>, верхняя неделя" in fallback
+    assert "Перенесли: <s>09:00–10:45</s> → <b>11:00–12:45</b>" in fallback
     assert "убрали" not in fallback and "добавили" not in fallback
     assert len(fallback) <= 4096
 
@@ -233,7 +236,7 @@ def test_fallback_long_old_value_does_not_hide_new_value_or_clearing():
     fallback = changes_fallback_text(diff, "https://example.test")
     assert "→ <b>не указано</b>" in fallback
     assert "<s>&lt;&amp;&gt;" in fallback
-    assert "условия:" in fallback
+    assert "Условия:" in fallback
     assert len(fallback) <= 4096
 
 
@@ -261,12 +264,15 @@ def test_day_summary_lists_every_change_and_details_hold_the_sentences():
     payload = build_changes_rich_message(diff, [], "https://example.test")
     validate_rich_payload(payload)
     days = day_sections(payload)
-    assert [day["summary"] for day in days] == ["Среда (добавили пару, убрали пару)"]
-    sentences_text = [text(block) for block in days[0]["blocks"] if block["type"] == "paragraph"]
+    assert [day["summary"] for day in days] == ["Среда · добавили пару, убрали пару"]
+    summary = [text(block) for block in days[0]["blocks"] if block["type"] == "paragraph"]
+    assert summary == ["Добавили пару:\n• Проектная деятельность", "Убрали пару:\n• Психология"]
+    details = next(block for block in days[0]["blocks"] if str(block.get("summary", "")).startswith("Подробности"))
+    assert not details.get("is_open")
+    sentences_text = [text(block) for block in details["blocks"] if block["type"] == "paragraph"]
     assert sentences_text == [
-        "Добавили пару «Проектная деятельность» (17:00–18:45 · ауд. 301).",
-        "с 10.09",
-        "«Психология» убрали совсем: была в 09:00–10:45, ауд. 1306.",
+        "Проектная деятельность\n17:00–18:45\nДобавили пару\nауд. 301\nс 10.09",
+        "Психология\n09:00–10:45\nУбрали пару\nауд. 1306",
     ]
 
 
@@ -275,11 +281,11 @@ def test_time_comes_before_the_edit_and_old_value_is_cancelled():
     diff["changed"][0]["fields"] = [["ауд.", "1318", "1331"]]
     payload = build_changes_rich_message(diff, [], "https://example.test")
     sentence = next(block for block in sentences(payload)
-                    if "поменяли аудиторию" in text(block))
+                    if "Аудитория:" in text(block))
     line = text(sentence)
     assert line.index("09:00–10:45") < line.index("1318 → 1331")
     assert {"type": "strikethrough", "text": "1318"} in sentence["text"]
-    assert sentence["text"][-1] == "."
+    assert "У пары" not in line and "\nАудитория:" in line
     assert {"type": "bold", "text": "1331"} in sentence["text"]
 
 
@@ -288,8 +294,8 @@ def test_placeholder_old_value_is_not_struck_through():
     diff["changed"][0]["fields"] = [["ауд.", "", "1331"]]
     payload = build_changes_rich_message(diff, [], "https://example.test")
     sentence = next(block for block in sentences(payload)
-                    if "поменяли аудиторию" in text(block))
-    assert "не указано → 1331" in text(sentence)
+                    if "Аудитория:" in text(block))
+    assert "Аудитория: 1331" in text(sentence)
     assert {"type": "strikethrough", "text": "не указано"} not in sentence["text"]
     assert {"type": "bold", "text": "1331"} in sentence["text"]
 

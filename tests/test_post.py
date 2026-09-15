@@ -499,14 +499,101 @@ def test_screenshot_statuses_use_selected_week_and_date():
     }
     items = post._schedule_screenshot_statuses(data, dt.date(2026, 9, 7))["Пн"]
     by_subject = {item["subject"]: item for item in items}
-    assert by_subject["Верхняя"]["_schedule_tag"] == "НЕ НА ЭТОЙ НЕДЕЛЕ · ТОЛЬКО ВЕРХНЯЯ"
+    # Badges carry the short display text; the full machine reason stays in _schedule_struct.
+    assert by_subject["Верхняя"]["_schedule_tag"] == "ВЕРХНЯЯ НЕДЕЛЯ"
+    assert by_subject["Верхняя"]["_schedule_struct"]["machine_reason"] == "НЕ НА ЭТОЙ НЕДЕЛЕ · ТОЛЬКО ВЕРХНЯЯ"
+    assert by_subject["Верхняя"]["_schedule_struct"]["kind"] == "parity"
     assert by_subject["Нижняя ДОТ"]["_schedule_status"] == "dot"
-    assert by_subject["С 14.09"]["_schedule_tag"] == "НЕ В ЭТУ ДАТУ · С 14.09"
-    assert by_subject["С 9 недели"]["_schedule_tag"] == "НЕ НА ЭТОЙ НЕДЕЛЕ · С 9‑Й НЕДЕЛИ"
+    assert by_subject["С 14.09"]["_schedule_tag"] == "С 14.09"
+    assert by_subject["С 14.09"]["_schedule_struct"]["kind"] == "starts_date"
+    assert by_subject["С 9 недели"]["_schedule_tag"] == "С 9-Й НЕДЕЛИ"
+    assert by_subject["С 9 недели"]["_schedule_struct"]["machine_reason"] == "НЕ НА ЭТОЙ НЕДЕЛЕ · С 9‑Й НЕДЕЛИ"
     assert by_subject["С 9 недели ДОТ"]["_schedule_status"] == "inactive"
-    assert by_subject["С 9 недели ДОТ"]["_schedule_tag"] == "НЕ НА ЭТОЙ НЕДЕЛЕ · С 9‑Й НЕДЕЛИ"
-    assert by_subject["После 9 недели"]["_schedule_tag"] == "НЕ НА ЭТОЙ НЕДЕЛЕ · ПОСЛЕ 9‑Й НЕДЕЛИ"
+    assert by_subject["С 9 недели ДОТ"]["_schedule_tag"] == "С 9-Й НЕДЕЛИ"
+    assert by_subject["После 9 недели"]["_schedule_tag"] == "С 10-Й НЕДЕЛИ"
+    assert by_subject["После 9 недели"]["_schedule_struct"]["kind"] == "after_week"
     assert "Нижняя очно" not in by_subject
+
+
+def test_schedule_status_css_semantics():
+    """Inactive rows are dimmed but never struck through; only real cancellations are red."""
+    from portal_parser import SCHEDULE_STATUS_CSS
+
+    inactive_block = SCHEDULE_STATUS_CSS.split("tr.schedule-inactive .schedule-status-content")[1].split("}")[0]
+    assert "line-through" not in inactive_block
+    assert "opacity" in inactive_block
+
+    # Cancelled rows get their own class with a red accent and strike-through.
+    assert "tr.schedule-cancelled" in SCHEDULE_STATUS_CSS
+    cancelled_block = SCHEDULE_STATUS_CSS.split("tr.schedule-cancelled .schedule-status-content")[1].split("}")[0]
+    assert "line-through" in cancelled_block
+    assert "#c1440e" in SCHEDULE_STATUS_CSS  # red accent for cancelled
+
+    # Inactive badge is neutral grey, not the DOT blue.
+    inactive_tag = SCHEDULE_STATUS_CSS.split("tr.schedule-inactive .schedule-status-tag")[1].split("}")[0]
+    assert "#e1eaf4" in inactive_tag
+    assert "#5b7fa6" not in inactive_tag
+
+
+def test_mark_schedule_status_uses_display_text_and_cancelled_class():
+    """Badges show the short display_text; cancelled rows get the red class."""
+    from bs4 import BeautifulSoup
+    from portal_parser import _mark_schedule_status
+
+    row_html = (
+        '<tr><td>Пн</td><td>09:00 10:00</td><td></td>'
+        '<td>(лек.) Предмет</td><td>Иванов</td><td>101</td><td>с 9 недели</td></tr>'
+    )
+
+    # from_week: grey inactive badge with short text, no strike-through wrapper class.
+    soup = BeautifulSoup(row_html, "html.parser")
+    row = soup.find("tr")
+    _mark_schedule_status(row, {
+        "subject": "(лек.) Предмет",
+        "_schedule_status": "inactive",
+        "_schedule_tag": "НЕ НА ЭТОЙ НЕДЕЛЕ · С 9‑Й НЕДЕЛИ",
+        "_schedule_struct": {
+            "kind": "from_week",
+            "display_text": "С 9-Й НЕДЕЛИ",
+            "machine_reason": "НЕ НА ЭТОЙ НЕДЕЛЕ · С 9‑Й НЕДЕЛИ",
+            "data": {"week_number": 9},
+        },
+    })
+    assert "schedule-inactive" in row["class"]
+    assert "schedule-cancelled" not in row["class"]
+    tag = row.select_one(".schedule-status-tag")
+    assert tag.text == "С 9-й недели"
+
+    # cancelled: red class + ОТМЕНЕНО badge.
+    soup = BeautifulSoup(row_html, "html.parser")
+    row = soup.find("tr")
+    _mark_schedule_status(row, {
+        "subject": "(лек.) Предмет",
+        "_schedule_status": "cancelled",
+        "_schedule_tag": "ЗАНЯТИЯ НЕ БУДЕТ · 19.10",
+        "_schedule_struct": {
+            "kind": "cancelled",
+            "display_text": "ОТМЕНЕНО 19.10",
+            "machine_reason": "ЗАНЯТИЯ НЕ БУДЕТ · 19.10",
+            "data": {"date": "2026-10-19"},
+        },
+    })
+    assert "schedule-cancelled" in row["class"]
+    tag = row.select_one(".schedule-status-tag")
+    assert tag.text == "Отменено 19.10"
+
+    # dot: unchanged blue class and ДОТ badge.
+    soup = BeautifulSoup(row_html, "html.parser")
+    row = soup.find("tr")
+    _mark_schedule_status(row, {
+        "subject": "(лек.) Предмет",
+        "_schedule_status": "dot",
+        "_schedule_tag": "ДОТ",
+        "_schedule_struct": None,
+    })
+    assert "schedule-dot" in row["class"]
+    tag = row.select_one(".schedule-status-tag")
+    assert tag.text == "ДОТ"
 
 
 def _rollover_stubs(monkeypatch, tmp_path, weeks, today):
