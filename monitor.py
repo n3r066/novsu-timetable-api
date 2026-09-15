@@ -367,6 +367,14 @@ def _comparison_screen_media(
     return media, files
 
 
+def _change_notifications_silent(now: dt.datetime | None = None) -> bool:
+    """Quiet hours follow actual send time in Moscow, not the source timestamp."""
+    timezone = zoneinfo.ZoneInfo("Europe/Moscow")
+    now = now or dt.datetime.now(timezone)
+    now = now.replace(tzinfo=timezone) if now.tzinfo is None else now.astimezone(timezone)
+    return now.hour >= 22 or now.hour < 7
+
+
 def _post_changes_to_channel(
     diff: dict,
     weeks: list[dict],
@@ -384,6 +392,7 @@ def _post_changes_to_channel(
     try:
         result = send_rich_message(
             rich, token=config.TG_BOT_TOKEN, chat_id=config.TG_CHANNEL_ID,
+            disable_notification=_change_notifications_silent(),
         )
     except Exception as exc:  # local validation/transport failure also falls back
         result = {"ok": False, "error": str(exc)}
@@ -394,7 +403,10 @@ def _post_changes_to_channel(
     text = changes_fallback_text(
         diff, config.GROUP_URL, group_name="6381", now=change_time,
     )
-    return _tg_api("sendMessage", chat_id=config.TG_CHANNEL_ID, text=text, parse_mode="HTML")
+    return _tg_api(
+        "sendMessage", chat_id=config.TG_CHANNEL_ID, text=text, parse_mode="HTML",
+        disable_notification=_change_notifications_silent(),
+    )
 
 
 def _queue_media_enhancement(

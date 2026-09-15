@@ -65,7 +65,7 @@ def call_multipart(
     for key, value in payload.items():
         if value is None:
             continue
-        if isinstance(value, (dict, list)):
+        if isinstance(value, (dict, list, bool)):
             value = json.dumps(value, ensure_ascii=False)
         parts.append(f"--{boundary}\r\n".encode())
         parts.append(f'Content-Disposition: form-data; name="{key}"\r\n\r\n'.encode())
@@ -296,9 +296,12 @@ def send_rich_message(
     chat_id: int,
     files: dict[str, Path] | None = None,
     timeout: int = 30,
+    disable_notification: bool | None = None,
 ) -> dict[str, Any]:
     """Отправить rich-сообщение. files — attach://-медиа (скриншоты и т. п.)."""
     payload = {"chat_id": chat_id, **rich_message}
+    if disable_notification is not None:
+        payload["disable_notification"] = disable_notification
     validate_rich_payload(payload)
     if files:
         return call_multipart(token, "sendRichMessage", payload, files, timeout=timeout)

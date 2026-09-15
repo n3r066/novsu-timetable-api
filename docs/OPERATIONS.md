@@ -285,6 +285,21 @@ Rich output retains its text/block budget and explicitly reports omissions.
 Notification-only wording changes require no dashboard or screenshot version
 bump. They do not retroactively edit old Telegram posts.
 
+### Notification quiet hours
+
+Change posts are sent immediately and silently from 22:00 inclusive until 07:00
+exclusive in `Europe/Moscow`. `_change_notifications_silent()` evaluates the
+actual send time, including a queued retry; the persisted observation timestamp
+remains the source of the post's date label. Both `sendRichMessage` and the plain
+HTML fallback receive `disable_notification`; the fallback checks the clock
+again in case rich delivery crossed the night boundary. At 07:00 ordinary
+notifications resume. Daytime importance filtering is not enabled.
+
+This is Telegram's silent-message flag: subscribers can still receive a visual
+notification, with no sound. Posts are not held until morning and no morning
+duplicate or summary is sent. Media enhancement and dashboard edits continue to
+edit existing messages. Technical DM alerts keep their existing policy.
+
 ## 8. Fingerprints and Caches
 
 These identities solve different problems:
