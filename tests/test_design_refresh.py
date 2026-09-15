@@ -71,5 +71,5 @@ def test_original_layout_and_headings_remain_with_muted_blue_status():
     soup = BeautifulSoup(chunk["html"], "html.parser")
     assert soup.h1.text == "Расписание занятий" and soup.h2.text == "Группа 6381"
     assert soup.select_one(".screen-header") is None
-    assert "color: #466489" in SCHEDULE_STATUS_CSS and "opacity: 1" in SCHEDULE_STATUS_CSS
+    assert "color: #4d627a" in SCHEDULE_STATUS_CSS and "opacity: 1" in SCHEDULE_STATUS_CSS
     assert "История" in soup.get_text() and "Петров" in soup.get_text()

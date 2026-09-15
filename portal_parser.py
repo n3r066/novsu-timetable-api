@@ -404,14 +404,17 @@ SCHEDULE_STATUS_CSS = """
     box-shadow: inset 3px 0 0 #7ea99c;
   }
   tr.schedule-inactive > td, td.schedule-inactive {
-    background: #f0f4f9 !important;
-    color: #466489 !important;
+    background: #e7edf4 !important;
+    color: #4d627a !important;
   }
   tr.schedule-inactive > td:first-child, td.schedule-inactive:first-child {
     box-shadow: inset 3px 0 0 #9fb6cf;
   }
   tr.schedule-inactive .schedule-status-content, td.schedule-inactive > .schedule-status-content {
     opacity: 1;
+    text-decoration: line-through;
+    text-decoration-thickness: 2px;
+    text-decoration-color: #7b8da3;
   }
   tr.schedule-cancelled > td, td.schedule-cancelled {
     background: #fef2f2 !important;
@@ -432,7 +435,7 @@ SCHEDULE_STATUS_CSS = """
     text-decoration: none !important; white-space: normal; max-width: 100%;
   }
   tr.schedule-inactive .schedule-status-tag, td.schedule-inactive .schedule-status-tag {
-    background: #e1eaf4; color: #3b5c81;
+    background: #d8e2ee; color: #3f5873;
   }
   tr.schedule-cancelled .schedule-status-tag, td.schedule-cancelled .schedule-status-tag {
     background: #f3e1dc; color: #8e5147;

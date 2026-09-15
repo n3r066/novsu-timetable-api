@@ -154,8 +154,9 @@ Always call `lesson_applies_on()`, `lessons_for_date()`, `day_view()`, or
 user-facing contextual reason for screenshot annotations. The renderer preserves
 the concrete boundary from this result, for example `С 9‑й недели`,
 `После 9‑й недели`, `Только верхняя`, or `С 14.09`, and removes the redundant
-generic prefix. Inactive rows remain readable; only cancellations are struck
-through. Screenshot code must not derive a second, less precise reason from the note.
+generic prefix. Inactive lesson content has a thin strike-through while its
+reason badge stays clear. Applicable DOT lessons remain unstruck. Screenshot
+code must not derive a second, less precise reason from the note.
 
 `lesson_has_expired()` is a conservative presentation-only deadline check. It
 accepts exhausted explicit occurrence lists, ended date ranges, inclusive
@@ -202,8 +203,12 @@ Current user-facing rules:
 
 Weekly screenshots omit definitively expired source lessons rather than leaving
 them crossed out forever. Future/parity-inactive lessons keep their contextual
-labels. Inactive rows use readable muted blue text, without opacity dimming or strike-through;
-only actual cancellations are red and struck. Badges show only the concrete
+labels. Inactive rows use readable muted blue text and a slightly darker matte
+background with a thin strike-through, so the distinction survives phone-sized
+display. Do not strike reason badges or cells shared with active lessons.
+Applicable DOT lessons retain their normal text and green tint. A DOT lesson
+that does not apply on the selected date is inactive like any other lesson.
+Only actual cancellations are red. Badges show only the concrete
 condition, e.g. “После 9-й недели”, without “Не на этой неделе”. The original
 portal table, columns and headings are preserved. Matte blue, ivory and muted
 teal accents replace harsh grey/bright fills; no replacement page header is added.

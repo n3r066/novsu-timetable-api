@@ -516,12 +516,17 @@ def test_screenshot_statuses_use_selected_week_and_date():
 
 
 def test_schedule_status_css_semantics():
-    """Inactive rows are dimmed but never struck through; only real cancellations are red."""
+    """Inactive content is struck; reason badges and applicable DOT remain clear."""
     from portal_parser import SCHEDULE_STATUS_CSS
 
     inactive_block = SCHEDULE_STATUS_CSS.split("tr.schedule-inactive .schedule-status-content")[1].split("}")[0]
-    assert "line-through" not in inactive_block
-    assert "opacity" in inactive_block
+    assert "line-through" in inactive_block
+    assert "text-decoration-thickness: 2px" in inactive_block
+    assert "opacity: 1" in inactive_block
+    dot_block = SCHEDULE_STATUS_CSS.split("tr.schedule-dot > td,")[1].split("}")[0]
+    assert "line-through" not in dot_block
+    badge_block = SCHEDULE_STATUS_CSS.split("  .schedule-status-tag {")[1].split("}")[0]
+    assert "text-decoration: none !important" in badge_block
 
     # Cancelled rows get their own class with a red accent and strike-through.
     assert "tr.schedule-cancelled" in SCHEDULE_STATUS_CSS
@@ -529,9 +534,9 @@ def test_schedule_status_css_semantics():
     assert "line-through" in cancelled_block
     assert "#c1440e" in SCHEDULE_STATUS_CSS  # red accent for cancelled
 
-    # Inactive badge is neutral grey, not the DOT blue.
+    # Inactive badge is muted blue, separate from DOT's green tint.
     inactive_tag = SCHEDULE_STATUS_CSS.split("tr.schedule-inactive .schedule-status-tag")[1].split("}")[0]
-    assert "#e1eaf4" in inactive_tag
+    assert "#d8e2ee" in inactive_tag
     assert "#5b7fa6" not in inactive_tag
 
 

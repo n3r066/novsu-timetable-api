@@ -53,9 +53,10 @@ screenshots, state handling, or systemd files.
     logs, documentation, commits, or answers.
 15. Dashboard screenshots omit definitively expired rows using
     `lesson_has_expired()` with the full academic calendar bounds. Retained
-    inactive rows use readable muted blue text and a compact contextual reason
-    from `lesson_non_applicability_reason()`; only cancellations are struck
-    through. Never infer expiry from labels,
+    inactive rows use a thin strike-through and a muted blue background. The
+    compact contextual reason from `lesson_non_applicability_reason()` remains
+    unstruck. Applicable DOT lessons remain unstruck; actual cancellations use
+    a red accent. Never infer expiry from labels,
     parity alone, or absence of future matches. Source snapshots and change
     comparison evidence must remain unfiltered.
 

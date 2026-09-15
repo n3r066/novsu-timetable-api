@@ -182,7 +182,7 @@ def test_old_style_cache_is_regenerated_and_empty_cache_is_reused(monkeypatch, t
     assert post._dashboard_screens(THURSDAY, "same", dt.date(2026, 9, 7), data=data) == []
     assert len(calls) == 1
     assert calls[0]["schedule_statuses"]["Чт"][0]["_schedule_expired"] is True
-    assert post._read_json(tmp_path / "dashboard_screens.json")["status_key"] == "v5:2026-09-07"
+    assert post._read_json(tmp_path / "dashboard_screens.json")["status_key"] == "v6:2026-09-07"
 
 
 def test_failed_new_render_never_reuses_old_policy_images(monkeypatch, tmp_path):
