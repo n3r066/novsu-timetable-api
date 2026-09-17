@@ -762,8 +762,11 @@ department publishes two public Google files, configured in `config.py`
   length, later start; the note stays visible), tolerates a lost closing bracket in
   the teacher cell, repairs a date typo in a repeated header from the first
   header of the same table, and infers the year closest to today.
-- `build_data()` keeps only members of `DEFAULT_GROUP`; the cache never stores
-  the whole faculty list.
+- `build_data()` keeps members of `DEFAULT_GROUP` plus `mates` — members of the
+  same virtual groups from other academic groups (with institute from the portal
+  index, fetched best-effort via `fetch_html(..., page_kind="index")`); the cache
+  never stores the whole faculty list. `CACHE_VERSION` 2; an older cache is
+  ignored entirely and refreshed at once.
 - `load_opd()` serves `state/opd_cache.json`: refresh after `OPD_CACHE_TTL_S`
   (6 h); on any failure the previous cache is kept and the next attempt waits
   `OPD_RETRY_DELAY_S` (30 min). It never raises — the dashboard degrades to its
@@ -781,10 +784,14 @@ Dashboard integration (`post.edit_dashboard_post` → `format`):
 - `dashboard_presentation_fingerprint(fp, view, extra=digest)`: the extra digest
   is empty without ОПД data, so the fingerprint of a plain dashboard is unchanged.
 - `_opd_section()` renders a collapsed `details` block right after the day
-  table: one table per building (largest first; rows ordered by block —
-  14:00 before 16:00 — then alphabetically: student + ВГ, block time with notes
-  such as «с 15:00», room + institute + teacher), then a «❌ Занятий не будет»
-  line, then source links. No intro paragraph and no data timestamp. The section is strictly about
+  table: one collapsed `details` per building (largest first), inside one
+  collapsed `details` per student ordered by slot — 14:00 before 16:00 — then
+  alphabetically (summary: student, ВГ, slot with notes such as «с 15:00», room +
+  institute, teacher), and inside that the student's virtual-group mates from
+  other academic groups grouped by institute (short name from the portal index
+  `<th>` headings, full name and home building from `opd.INSTITUTE_NAMES` /
+  `INSTITUTE_BUILDINGS`; the portal publishes no specialty). Then a «❌ Занятий
+  не будет» line, then source links. No intro paragraph and no data timestamp. The section is strictly about
   the current week: virtual groups alternate weeks, members who are free today
   are not listed and no next dates («далее DD.MM») are shown — notes exist only
   for special cases (cancellation, shifted start). `day_view()` still carries

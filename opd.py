@@ -43,7 +43,28 @@ BLOCK_MINUTES = 60
 DEFAULT_BLOCKS = (("14:00", "15:00"), ("16:00", "17:00"))
 
 CACHE_FILE = "opd_cache.json"
-CACHE_VERSION = 1
+CACHE_VERSION = 2
+
+#: Индекс портала подписывает блоки групп короткими именами институтов в <th>.
+INSTITUTE_NAMES = {
+    "ИЭ": "Институт экономики",
+    "ИГУМ": "Гуманитарный институт",
+    "ПТИ": "Политехнический институт",
+    "ХТИ": "Химико-технологический институт",
+    "ПИ": "Педагогический институт",
+    "ИЮР": "Юридический институт",
+    "МИ": "Медицинский институт",
+}
+#: Домашний корпус института, если он известен по расписанию; остальные не выдумываем.
+INSTITUTE_BUILDINGS = {
+    "ИЭ": "Антоново",
+    "ИГУМ": "Антоново",
+    "ПТИ": "Б. Санкт-Петербургская, 41",
+    "ХТИ": "ул. Советской Армии, 7",
+    "ПИ": "ул. Псковская, 3",
+}
+_INDEX_TH_RE = re.compile(r"<th[^>]*>(.*?)</th>", re.S | re.I)
+_INDEX_LINK_RE = re.compile(r"instId=(\d+)&(?:amp;)?name=([^&\"'<>]+)")
 MAX_BYTES = 2 * 1024 * 1024
 USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0 Safari/537.36"
 
@@ -446,6 +467,30 @@ def group_members(members: list[dict], group: str) -> list[dict]:
     return [member for member in members if member.get("group") == str(group)]
 
 
+def parse_index_institutes(index_html: str) -> dict[str, dict]:
+    """Номер группы → институт по индексу портала.
+
+    Страница идёт блоками: ``<th>ИЭ</th>``, дальше ссылки групп с ``instId``.
+    Ссылка относится к последнему заголовку перед ней. Специальности на
+    портале нет, поэтому дальше института не идём.
+    """
+    if not index_html:
+        return {}
+    headings = [
+        (m.start(), " ".join(html.unescape(re.sub(r"<[^>]+>", " ", m.group(1))).split()))
+        for m in _INDEX_TH_RE.finditer(index_html)
+    ]
+    headings = [(pos, name) for pos, name in headings if re.fullmatch(r"[А-ЯЁ]{2,6}", name)]
+    result: dict[str, dict] = {}
+    for m in _INDEX_LINK_RE.finditer(index_html):
+        inst_id, name = m.group(1), html.unescape(m.group(2)).strip()
+        short = next((title for pos, title in reversed(headings) if pos < m.start()), "")
+        code = _group_code(name)
+        if code and short and code not in result:
+            result[code] = {"inst_id": inst_id, "short": short}
+    return result
+
+
 # --------------------------------------------------------------------------
 # Сборка данных и кэш
 # --------------------------------------------------------------------------
@@ -457,21 +502,40 @@ def build_data(
     group: str | None = None,
     today: dt.date | None = None,
     fetched_at: str | None = None,
+    index_html: str | None = None,
 ) -> dict:
     group = str(group or config.DEFAULT_GROUP)
     sessions = parse_sessions(parse_doc_tables(doc_html), today=today)
-    members = group_members(parse_members(members_csv), group)
+    everyone = parse_members(members_csv)
+    members = group_members(everyone, group)
     if not sessions:
         raise ValueError("opd document has no sessions")
     if not members:
         raise ValueError(f"opd sheet has no members of group {group}")
+    # Состав своей ВГ: кто из других групп ходит вместе, из какого института.
+    institutes = parse_index_institutes(index_html or "")
+    my_vgs = {member["vg"] for member in members}
+    mates = [
+        {
+            "vg": member["vg"],
+            "last_name": member["last_name"],
+            "first_name": member["first_name"],
+            "patronymic": member["patronymic"],
+            "group": member["group"],
+            "institute": institutes.get(member["group"], {}).get("short", ""),
+        }
+        for member in everyone
+        if member["vg"] in my_vgs and member["group"] != group
+    ]
     return {
         "version": CACHE_VERSION,
         "group": group,
         "fetched_at": fetched_at or dt.datetime.now(MOSCOW).isoformat(timespec="seconds"),
         "members": members,
         "sessions": sessions,
-        "digest": _digest({"members": members, "sessions": sessions}),
+        "mates": mates,
+        "institutes_known": bool(institutes),
+        "digest": _digest({"members": members, "sessions": sessions, "mates": mates}),
         "sources": {
             "sheet": config.OPD_SHEET_VIEW_URL,
             "doc": config.OPD_DOC_VIEW_URL,
@@ -535,6 +599,17 @@ def _has_data(cache: dict) -> bool:
     return bool(cache.get("members")) and bool(cache.get("sessions")) and cache.get("version") == CACHE_VERSION
 
 
+def _fetch_index_html() -> str:
+    """Индекс портала для институтов одногруппников по ВГ. Необязателен:
+    без него состав ВГ показывается с номерами групп, но без институтов."""
+    try:
+        import fetch  # локальный импорт: fetch тянет портальный парсер
+
+        return fetch.fetch_html(config.get_route_index_url("ochn"), page_kind="index")
+    except Exception:  # noqa: BLE001 — портал медленный или лежит: обойдёмся без институтов
+        return ""
+
+
 def refresh(now: dt.datetime | None = None, *, group: str | None = None) -> dict:
     """Скачать оба файла и собрать данные. Исключения — наружу (для CLI)."""
     now = now or dt.datetime.now(MOSCOW)
@@ -546,6 +621,7 @@ def refresh(now: dt.datetime | None = None, *, group: str | None = None) -> dict
         group=group,
         today=now.astimezone(MOSCOW).date(),
         fetched_at=now.astimezone(MOSCOW).isoformat(timespec="seconds"),
+        index_html=_fetch_index_html(),
     )
 
 
@@ -561,6 +637,8 @@ def load_opd(now: dt.datetime | None = None, *, group: str | None = None, allow_
     now = now or dt.datetime.now(MOSCOW)
     group = str(group or config.DEFAULT_GROUP)
     cache = _read_cache()
+    if cache and cache.get("version") != CACHE_VERSION:
+        cache = {}  # старый формат кэша не считается ни данными, ни недавней попыткой
     usable = _has_data(cache) and cache.get("group") == group
     fetched = _parse_ts(cache.get("fetched_at")) if usable else None
     if fetched is not None and (now - fetched).total_seconds() < config.OPD_CACHE_TTL_S:
@@ -604,6 +682,22 @@ def teacher_short(name: str) -> str:
     return parts[0] + " " + " ".join(f"{part[0]}." for part in parts[1:3])
 
 
+def mates_of(opd: dict | None, vg: str) -> list[dict]:
+    """Одногруппники по ВГ из других академических групп: институт, потом фамилия."""
+    if not opd:
+        return []
+    rows = [
+        {
+            "student": student_label(mate),
+            "group": mate.get("group", ""),
+            "institute": mate.get("institute", ""),
+        }
+        for mate in opd.get("mates") or []
+        if str(mate.get("vg")) == str(vg)
+    ]
+    return sorted(rows, key=lambda row: (row["institute"] == "", row["institute"], row["student"].casefold()))
+
+
 def day_view(opd: dict | None, date: dt.date) -> dict | None:
     """Кто из группы идёт в этот день, во сколько и куда. None — даты нет в документе."""
     if not opd or not _has_data(opd):
@@ -643,6 +737,7 @@ def day_view(opd: dict | None, date: dt.date) -> dict | None:
             "vg": member["vg"],
             "status": status,
             "next_date": upcoming[0] if upcoming else "",
+            "mates": mates_of(opd, member["vg"]),
         }
         if session is not None:
             row.update({

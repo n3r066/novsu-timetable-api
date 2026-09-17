@@ -19,8 +19,52 @@ def _html() -> str:
     return (FIXTURES / "opd_doc.html").read_text(encoding="utf-8")
 
 
+def _index() -> str:
+    return (FIXTURES / "opd_index.html").read_text(encoding="utf-8")
+
+
 def _data() -> dict:
-    return opd.build_data(_csv(), _html(), group="6381", today=TODAY, fetched_at="2026-09-17T10:00:00+03:00")
+    return opd.build_data(_csv(), _html(), group="6381", today=TODAY, fetched_at="2026-09-17T10:00:00+03:00",
+                          index_html=_index())
+
+
+def test_index_maps_groups_to_institute_headings():
+    institutes = opd.parse_index_institutes(_index())
+    assert institutes["6311"]["short"] == "ПТИ" and institutes["6311"]["inst_id"] == "2159922"
+    assert institutes["6001"]["short"] == "ИЭ" and institutes["6381"]["short"] == "ИЭ"
+    assert opd.parse_index_institutes("") == {}
+
+
+def test_mates_come_from_other_groups_with_institutes():
+    data = _data()
+    assert data["institutes_known"] is True
+    assert {(m["vg"], m["last_name"], m["institute"]) for m in data["mates"]} == {
+        ("101", "Лебедев", "ИЭ"), ("118", "Морозов", "ПТИ"), ("118", "Орлова", "ИЭ"), ("117", "Соколов", "ПТИ"),
+    }
+    view = opd.day_view(data, TODAY)
+    zhukova = next(row for row in view["rows"] if row["vg"] == "118")
+    assert [(m["student"], m["group"], m["institute"]) for m in zhukova["mates"]] == [
+        ("Орлова В. П.", "6001", "ИЭ"), ("Морозов И. И.", "6311", "ПТИ"),
+    ]
+    assert next(row for row in view["rows"] if row["vg"] == "105")["mates"] == []
+    # Без индекса портала состав есть, но институты пустые.
+    plain = opd.build_data(_csv(), _html(), group="6381", today=TODAY)
+    assert plain["institutes_known"] is False
+    assert {m["institute"] for m in plain["mates"]} == {""}
+
+
+def test_old_cache_version_is_ignored_entirely(monkeypatch, tmp_path):
+    cache = tmp_path / "opd_cache.json"
+    monkeypatch.setattr(opd, "_cache_path", lambda: cache)
+    monkeypatch.setattr(opd.config, "OPD_ENABLED", True)
+    stale = _data()
+    stale["version"] = 1
+    stale["last_attempt"] = "2026-09-17T09:59:00+03:00"  # минуту назад — но это старый формат
+    cache.write_text(json.dumps(stale, ensure_ascii=False), encoding="utf-8")
+    calls: list[str] = []
+    monkeypatch.setattr(opd, "_download", _fake_download(calls, fail=True))
+    assert opd.load_opd(dt.datetime(2026, 9, 17, 10, 0, tzinfo=opd.MOSCOW), group="6381") is None
+    assert len(calls) == 1  # попытка обновления сделана, старый кэш не сдержал её
 
 
 def test_members_only_default_group_and_title_case():

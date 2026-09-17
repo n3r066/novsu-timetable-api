@@ -1374,6 +1374,7 @@ def _opd_fixture() -> dict:
         group="6381",
         today=dt.date(2026, 9, 17),
         fetched_at="2026-09-17T10:00:00+03:00",
+        index_html=(fixtures / "opd_index.html").read_text(encoding="utf-8"),
     )
 
 
@@ -1388,20 +1389,31 @@ def test_dashboard_thursday_has_opd_section_by_buildings():
     blob = json.dumps(rm, ensure_ascii=False)
     assert "ОПД · ПО ВИРТУАЛЬНЫМ ГРУППАМ" in blob
     assert "идут 6 из 10" in blob
-    # По корпусам, внутри корпуса сначала 14:00, потом 16:00.
+    # Разделы по корпусам, внутри — раздел на студента (сначала 14:00, потом 16:00).
     for building in ("📍 Антоново", "📍 ул. Псковская, 3", "📍 ул. Советской Армии, 7"):
         assert building in blob
     assert "🕑" not in blob
-    assert "Жукова К. А." in blob and "ВГ 118" in blob and '"16:00–17:00"' in blob and '"14:00–15:00"' in blob
-    # Слоты ОПД не приводятся к парам: внутри раздела нет 15:45/17:45 (в таблице дня они есть — это портальная пара).
     section = json.dumps(_find_details(rm["rich_message"]["blocks"], "ОПД · ПО"), ensure_ascii=False)
-    assert "15:45" not in section and "17:45" not in section
-    # «с 15:00» у Зайцева-Петрова: слот 15:00–16:00 и подсвеченная пометка рядом.
-    assert '"15:00–16:00"' in section and '"с 15:00"' in section
-    assert blob.index("Елисеев А. Д.") < blob.index("Жукова К. А.")  # 14:00 раньше 16:00 в Антоново
-    assert "ауд. 402 · ИЭ" in blob and "Трезорова О. Ю." in blob
+    assert "15:45" not in section and "17:45" not in section  # слоты ОПД не приводятся к парам
+    assert '"15:00–16:00"' in section and '"с 15:00"' in section  # «с 15:00» у Зайцева-Петрова
+    antonovo = _find_details(rm["rich_message"]["blocks"], "📍 Антоново")
+    people = [b for b in antonovo["blocks"] if b.get("type") == "details"]
+    summaries = [json.dumps(b["summary"], ensure_ascii=False) for b in people]
+    assert len(people) == 2 and "Елисеев А. Д." in summaries[0] and "Жукова К. А." in summaries[1]
+    assert "ВГ 118" in summaries[1] and '"16:00–17:00"' in summaries[1] and '"14:00–15:00"' in summaries[0]
+    assert "ауд. 402 · ИЭ" in summaries[1] and "Трезорова О. Ю." in summaries[1]
+    # Состав ВГ студента: по институтам (крупные первыми), с корпусом института.
+    zhukova = json.dumps(people[1]["blocks"], ensure_ascii=False)
+    assert "Вместе в ВГ 118" in zhukova and "2 чел. из других групп" in zhukova
+    assert "ИЭ · Институт экономики · Антоново: " in zhukova and "Орлова В. П. (6001)" in zhukova
+    assert "ПТИ · Политехнический институт · Б. Санкт-Петербургская, 41: " in zhukova
+    assert "Морозов И. И. (6311)" in zhukova
+    assert zhukova.index("Орлова") < zhukova.index("Морозов")
+    # У Григорьева (ВГ 105) одногруппников по ВГ в таблице нет.
+    sovarmii = _find_details(rm["rich_message"]["blocks"], "📍 ул. Советской Армии, 7")
+    grigoriev = next(b for b in sovarmii["blocks"] if "Григорьев" in json.dumps(b["summary"], ensure_ascii=False))
+    assert "пока не найден" in json.dumps(grigoriev["blocks"], ensure_ascii=False)
     assert "ауд. 106хк · ХТИ" in blob and "рядом с" not in blob
-    assert '"время"' in blob
     # Метка и список лежат в разных фрагментах rich-текста.
     assert '"❌ Занятий не будет: "' in blob
     assert "Алексеева А. П. (ВГ 101), Борисов Г. О. (ВГ 102)" in blob
@@ -1537,3 +1549,4 @@ def test_opd_building_table_orders_by_time_before_alphabet():
     }
     blob = json.dumps(_opd_section(view), ensure_ascii=False)
     assert blob.index("Яковлев Я. Я.") < blob.index("Антонов А. А.")
+    assert "пока не найден" in blob  # строки без состава ВГ рендерятся

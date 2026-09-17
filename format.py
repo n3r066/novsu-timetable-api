@@ -603,32 +603,62 @@ def _opd_summary(view: dict) -> list[object]:
     ]
 
 
-def _opd_table(rows: list[dict], building: str) -> dict:
-    """Таблица одного корпуса: сначала блок 14:00, потом 16:00, внутри блока —
-    по алфавиту. Колонка «куда» — аудитория и институт, преподаватель ниже."""
-    table = _table([[("студент", "bold"), ("время", "bold"), ("куда", "bold")]])
-    cells = table["cells"]
-    ordered = sorted(rows, key=lambda row: (str(row.get("block_start") or ""), row["student"].casefold()))
-    for row in ordered:
-        student_cell: list[object] = [
-            {"type": "bold", "text": row["student"]},
-            "\n",
-            {"type": "code", "text": f"ВГ {row['vg']}"},
-        ]
-        time_cell: list[object] = [{"type": "code", "text": f"{row['block_start']}–{row['block_end']}"}]
-        if row.get("note"):
-            time_cell += ["\n", {"type": "marked", "text": row["note"]}]
-        where = f"ауд. {row['room']}" if row.get("room") else "аудитория уточняется"
-        hint = opd_module.place_hint(row.get("place", ""), building)
-        where_cell: list[object] = [{"type": "bold", "text": where + (f" · {hint}" if hint else "")}]
-        if row.get("teacher_short"):
-            where_cell += ["\n", {"type": "italic", "text": row["teacher_short"]}]
-        cells.append([
-            _table_cell(student_cell, "plain"),
-            _table_cell(time_cell, "plain"),
-            _table_cell(where_cell, "plain"),
-        ])
-    return table
+def _opd_person_summary(row: dict, building: str) -> list[object]:
+    """Заголовок раздела студента: кто, ВГ, слот, аудитория, преподаватель."""
+    parts: list[object] = [
+        {"type": "bold", "text": row["student"]},
+        f"  ·  ВГ {row['vg']}  ·  ",
+        {"type": "code", "text": f"{row['block_start']}–{row['block_end']}"},
+    ]
+    if row.get("note"):
+        parts += [" ", {"type": "marked", "text": row["note"]}]
+    where = f"ауд. {row['room']}" if row.get("room") else "аудитория уточняется"
+    hint = opd_module.place_hint(row.get("place", ""), building)
+    parts += ["  ·  ", {"type": "bold", "text": where + (f" · {hint}" if hint else "")}]
+    if row.get("teacher_short"):
+        parts += ["  ·  ", {"type": "italic", "text": row["teacher_short"]}]
+    return parts
+
+
+def _opd_mates_blocks(row: dict) -> list[dict]:
+    """Состав виртуальной группы студента: одногруппники по ВГ из других групп,
+    сгруппированные по институту (крупные первыми), с корпусом института."""
+    mates = row.get("mates") or []
+    if not mates:
+        return [_paragraph("Состав виртуальной группы в таблице кафедры пока не найден.")]
+    by_institute: dict[str, list[dict]] = {}
+    for mate in mates:
+        by_institute.setdefault(str(mate.get("institute") or ""), []).append(mate)
+    ordered = sorted(by_institute.items(), key=lambda item: (item[0] == "", -len(item[1]), item[0]))
+    blocks: list[dict] = [_rich_paragraph([
+        {"type": "bold", "text": f"Вместе в ВГ {row['vg']}"},
+        f"  ·  {len(mates)} чел. из других групп",
+    ])]
+    for short, people in ordered:
+        title = short or "институт не определён"
+        full = opd_module.INSTITUTE_NAMES.get(short)
+        building = opd_module.INSTITUTE_BUILDINGS.get(short)
+        if full:
+            title += f" · {full}"
+        if building:
+            title += f" · {building}"
+        names = ", ".join(f"{person['student']} ({person['group']})" for person in people)
+        blocks.append(_rich_paragraph([{"type": "bold", "text": title + ": "}, names]))
+    return blocks
+
+
+def _opd_building_section(building: str, people: list[dict]) -> dict:
+    """Раздел корпуса: внутри сначала слот 14:00, потом 16:00, далее по алфавиту;
+    у каждого студента свой раздел с составом его ВГ."""
+    ordered = sorted(people, key=lambda row: (str(row.get("block_start") or ""), row["student"].casefold()))
+    person_blocks = [
+        _details(_opd_person_summary(row, building), *_opd_mates_blocks(row))
+        for row in ordered
+    ]
+    return _details(
+        [{"type": "bold", "text": f"📍 {building}"}, f"  ·  {len(people)} чел."],
+        *person_blocks,
+    )
 
 
 def _opd_people_line(label: str, rows: list[dict]) -> dict:
@@ -670,9 +700,9 @@ def _opd_sources(view: dict) -> dict:
 def _opd_section(view: dict) -> dict:
     """Сворачиваемый раздел «ОПД по виртуальным группам» для дня закрепа.
 
-    Только про этот день и без пояснений: кто идёт — таблицами по корпусам
-    (внутри сначала 14:00, потом 16:00, далее по алфавиту), у кого занятие
-    отменено, ссылки на источники. Кого нет в таблицах, у того ОПД на этой неделе нет;
+    Только про этот день и без пояснений: кто идёт — сворачиваемыми разделами
+    по корпусам (внутри сначала 14:00, потом 16:00, далее по алфавиту), у каждого
+    студента свой раздел с составом его ВГ; у кого занятие отменено; ссылки. Кого нет в таблицах, у того ОПД на этой неделе нет;
     чужие даты и штампы времени в закреп не попадают.
     """
     rows = view["rows"]
@@ -686,11 +716,7 @@ def _opd_section(view: dict) -> dict:
             by_building.setdefault(row.get("building") or "адрес уточняется", []).append(row)
         ordered = sorted(by_building.items(), key=lambda item: (-len(item[1]), item[0]))
         for building, people in ordered:
-            blocks.append(_rich_paragraph([
-                {"type": "bold", "text": f"📍 {building}"},
-                f"  ·  {len(people)} чел.",
-            ]))
-            blocks.append(_opd_table(people, building))
+            blocks.append(_opd_building_section(building, people))
     else:
         blocks.append(_paragraph(
             "У группы в этот день ОПД нет: все её виртуальные группы занимаются в другие четверги."
