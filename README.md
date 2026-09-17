@@ -33,14 +33,14 @@
 | `monitor.py` | **Мониторинг**: `--interval 3 --jitter 0.25` — цикл 3 мин ± 15 с; единый snapshot, text-first доставка, очередь media enhancement и HTML-фоллбек |
 | `format.py` | Билдеры rich-сообщений (Bot API 10.2): дашборд-закреп, дифф изменений `build_changes_rich_message`, текстовые фоллбеки |
 | `post.py` | Оркестратор постинга: скриншот + caption, stub-сообщения, обновление закрепа |
-| `screenshot.py` | Headless chromium: PNG таблицы, нарезка по дням |
+| `screenshot.py` | Headless Chrome (`google-chrome`): один процесс на пачку скринов через Playwright, PNG по высоте контента, CLI-фоллбек |
 | `api.py` | JSON-фасад: `/v1/timetables/...`, `/v1/groups`, `/v1/institutes` |
 | `telegram_api.py` | Транспорт Bot API: `sendRichMessage` / `editMessageText`, multipart с файлами |
 
 ## Мониторинг изменений (главное)
 
 ```bash
-python3 monitor.py --interval 3 --jitter 0.25 --update-post <MESSAGE_ID>
+python3 monitor.py --interval 3 --jitter 0.25   # id закрепа из NOVSU_DASHBOARD_POST_ID
 ```
 
 - Проверка примерно каждые **3 минуты ± 15 секунд** по времени старта циклов, круглосуточно.
@@ -82,11 +82,11 @@ sudo systemctl start novsu-timetable-monitor.service
 sudo systemctl status novsu-timetable-monitor.service
 ```
 
-Сервис запускает `monitor.py --interval 3 --jitter 0.25`, перезапускается после сбоя и имеет доступ на запись только к каталогу `state/`. После ошибок upstream интервал экспоненциально увеличивается максимум до 20 минут.
+Сервис запускает `monitor.py --interval 3 --jitter 0.25` от пользователя `novsu` (`NoNewPrivileges`, `MemoryMax=1G`), перезапускается после сбоя и имеет доступ на запись только к каталогу `state/`. Каталог `state/` принадлежит `novsu`; после ручных прогонов от root верни владельца: `chown -R novsu:novsu state`. После ошибок upstream интервал экспоненциально увеличивается максимум до 20 минут.
 
 ## Ролловер закрепа по московскому времени
 
-Закреплённый пост (`message_id` из `NOVSU_DASHBOARD_POST_ID`, сейчас `3`) показывает только актуальные дни учебной недели. Сегодняшний день исчезает после окончания последней применимой пары, остальные прошедшие дни — при смене даты по Москве:
+Закреплённый пост (`message_id` из `NOVSU_DASHBOARD_POST_ID`, сейчас `184`) показывает только актуальные дни учебной недели. Сегодняшний день исчезает после окончания последней применимой пары, остальные прошедшие дни — при смене даты по Москве:
 
 - в пятницу в разделе остаются `Пятница` и `Суббота`, прошедшие пн–чт исчезают;
 - подпись раздела меняется с `Полное расписание` на `Расписание до конца недели`, чтобы не обещать лишнего;
@@ -97,7 +97,7 @@ sudo systemctl status novsu-timetable-monitor.service
 
 - monitor вычисляет `presentation_fingerprint` и вызывает Telegram edit только при смене расписания, текущего набора дней или учебной недели;
 - отдельный rollover timer не нужен: трёхминутный monitor замечает полночь, окончание последней пары и переход недели через единый `resolve_dashboard_view()`;
-- вручную: `python3 post.py --roll` или `python3 post.py --roll 3`.
+- вручную: `python3 post.py --roll` (id из `.env`) или `python3 post.py --roll <MESSAGE_ID>`.
 
 Логика: `schedule_logic.visible_week_days()` (имя дня берётся из реальной даты — неделя 1 начинается во вторник 01.09, а не в понедельник), `format._day_not_past()` и фильтр скринов в `post.edit_dashboard_post()`. «Сегодня» всегда считается по Москве (`post._today_msk()`), хотя сервер живёт в UTC.
 
@@ -134,19 +134,19 @@ python3 api.py --once                # разовый JSON группы 6381
 python3 api.py --host 127.0.0.1 --port 8787
 # или установить systemd-юниты (monitor + API + hourly healthcheck)
 sudo ./deploy/install-monitor-service.sh
-python3 monitor.py --interval 3 --jitter 0.25 --update-post 3  # мониторинг + уведомления в канал
+python3 monitor.py --interval 3 --jitter 0.25  # мониторинг + уведомления в канал
 python3 post.py --force              # пост расписания со скрином
 ```
 
 `.env` (в репо не лежит):
 
 ```
-TG_BOT_TOKEN=...
+TG_BOT_TOKEN=...            # бот канала, закрепа и алертов
 TG_CHANNEL_ID=-100...
 TG_DM_TARGET=...
 ```
 
-Дефолтная группа **6381** (`inst_id=2244947`, `type=ДО`, `year=2026`). Резолвер ищет любую группу по индексу портала; `6381` всегда первая и используется для `default`/`me`/пустой группы.
+Сервис ведёт только группу **6381** (`inst_id=2244947`, `type=ДО`, `year=2026`). API отдаёт `404` для других групп, `/v1/groups` и `/v1/institutes`; `default`/`me`/пустая группа означают 6381. Снять ограничение можно переменной `NOVSU_API_DEFAULT_GROUP_ONLY=0`.
 
 ## Документация Для Сопровождения
 
@@ -169,3 +169,4 @@ python3 -m pytest -q
 ```
 
 Покрыто: парсер (rowspan, заглушки, структурирование комментариев), дата-логика (верх/низ, «с …», «только …»), fetch (ротация UA, `--fail`, ретраи, стабильность отпечатка), monitor (дифф add/remove/change, stub-переходы, тишина при сетевых ошибках и волатильных таймстемпах, фоллбек постинга), rich-форматирование (структура блоков, лимиты 4096/1024, экранирование HTML).
+NOVSU_DASHBOARD_POST_ID=... # id закреплённого поста, который редактирует монитор

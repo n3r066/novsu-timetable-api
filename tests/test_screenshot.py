@@ -185,3 +185,147 @@ def test_matte_short_day_trims_tail_without_losing_last_row(tmp_path):
     cropped = Image.open(path)
     assert cropped.width == image.width and 350 < cropped.height <= 375
     assert cropped.crop((0, 0, 600, 351)).tobytes() == image.crop((0, 0, 600, 351)).tobytes()
+
+
+def test_trim_keeps_content_that_differs_in_a_single_channel(tmp_path):
+    """Обрезка хвоста считает контентом любой канал, отличный от фона, как и старый цикл."""
+    from PIL import Image
+
+    from screenshot import _trim_bottom_whitespace
+
+    path = tmp_path / "one-channel.png"
+    image = Image.new("RGB", (300, 900), (255, 255, 255))
+    for x in range(300):
+        image.putpixel((x, 500), (240, 255, 255))  # только красный канал отличается на 15
+    image.save(path)
+    _trim_bottom_whitespace(path, bg=(255, 255, 255))
+    assert Image.open(path).size == (300, 520)
+
+
+def test_trim_leaves_blank_image_alone(tmp_path):
+    from PIL import Image
+
+    from screenshot import _trim_bottom_whitespace
+
+    path = tmp_path / "blank.png"
+    Image.new("RGB", (300, 400), (255, 255, 255)).save(path)
+    _trim_bottom_whitespace(path, bg=(255, 255, 255))
+    assert Image.open(path).size == (300, 400)
+
+
+class _FakeSession:
+    started = 0
+    closed = 0
+    rendered: list[str] = []
+
+    def start(self):
+        type(self).started += 1
+
+    def ensure_started(self):
+        if not getattr(self, "_running", False):
+            try:
+                self.start()
+            except Exception:
+                return False
+            self._running = True
+        return True
+
+    def render(self, target, out_png, **kwargs):
+        type(self).rendered.append(target)
+        Path(out_png).write_bytes(b"\x89PNG" + b"0" * 2000)
+
+    def close(self):
+        type(self).closed += 1
+
+
+def _reset_fake():
+    _FakeSession.started = 0
+    _FakeSession.closed = 0
+    _FakeSession.rendered = []
+
+
+def test_browser_session_reuses_one_chrome_for_a_batch(monkeypatch, tmp_path):
+    import screenshot as ss
+
+    _reset_fake()
+    monkeypatch.setattr(ss, "_PlaywrightSession", _FakeSession)
+    monkeypatch.setattr(ss, "_trim_bottom_whitespace", lambda *a, **k: None)
+    with ss.browser_session():
+        with ss.browser_session():  # вложенный блок переиспользует внешний браузер
+            ss.screenshot_html("<p>a</p>", tmp_path / "a.png")
+        ss.screenshot_html("<p>b</p>", tmp_path / "b.png")
+    assert _FakeSession.started == 1
+    assert _FakeSession.closed == 1
+    assert len(_FakeSession.rendered) == 2
+    assert ss._ACTIVE_SESSION is None
+
+
+def test_screenshot_outside_session_uses_one_off_browser(monkeypatch, tmp_path):
+    import screenshot as ss
+
+    _reset_fake()
+    monkeypatch.setattr(ss, "_PlaywrightSession", _FakeSession)
+    monkeypatch.setattr(ss, "_trim_bottom_whitespace", lambda *a, **k: None)
+    ss.screenshot_html("<p>a</p>", tmp_path / "a.png")
+    ss.screenshot_html("<p>b</p>", tmp_path / "b.png")
+    assert _FakeSession.started == 2 and _FakeSession.closed == 2
+
+
+def test_screenshot_falls_back_to_cli_when_playwright_is_unavailable(monkeypatch, tmp_path):
+    import screenshot as ss
+
+    class Broken(_FakeSession):
+        def start(self):
+            raise ImportError("no playwright")
+
+    calls = []
+
+    def fake_cli(args, out_png, timeout):
+        calls.append(args)
+        Path(out_png).write_bytes(b"\x89PNG" + b"0" * 2000)
+
+    monkeypatch.setattr(ss, "_PlaywrightSession", Broken)
+    monkeypatch.setattr(ss, "_run_browser", fake_cli)
+    monkeypatch.setattr(ss, "_trim_bottom_whitespace", lambda *a, **k: None)
+    with ss.browser_session():
+        ss.screenshot_html("<p>a</p>", tmp_path / "a.png", width=1480, height=3200, scale_factor=2)
+    assert len(calls) == 1
+    assert "--window-size=1480,3200" in calls[0]
+
+
+def test_session_render_error_is_reported_as_screenshot_failure(monkeypatch, tmp_path):
+    import screenshot as ss
+
+    class Failing(_FakeSession):
+        def render(self, target, out_png, **kwargs):
+            raise TimeoutError("page.goto: Timeout 90000ms exceeded")
+
+    monkeypatch.setattr(ss, "_PlaywrightSession", Failing)
+    with pytest.raises(RuntimeError, match="chromium screenshot failed"):
+        ss.screenshot_html("<p>a</p>", tmp_path / "a.png")
+    assert ss._ACTIVE_SESSION is None
+
+
+def test_browser_session_does_not_launch_chrome_when_nothing_renders(monkeypatch):
+    import screenshot as ss
+
+    _reset_fake()
+    monkeypatch.setattr(ss, "_PlaywrightSession", _FakeSession)
+    with ss.browser_session():
+        pass
+    assert _FakeSession.started == 0
+
+
+def test_trim_skips_rewrite_when_tail_already_holds_content(tmp_path):
+    from PIL import Image, ImageDraw
+
+    from screenshot import _trim_bottom_whitespace
+
+    path = tmp_path / "tight.png"
+    image = Image.new("RGB", (300, 400), (255, 255, 255))
+    ImageDraw.Draw(image).rectangle((10, 10, 290, 380), fill=(0, 0, 0))
+    image.save(path)
+    before = path.stat().st_mtime_ns
+    _trim_bottom_whitespace(path, bg=(255, 255, 255))
+    assert path.stat().st_mtime_ns == before
+    assert Image.open(path).size == (300, 400)

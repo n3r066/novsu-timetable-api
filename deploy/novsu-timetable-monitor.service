@@ -8,12 +8,27 @@ Type=simple
 WorkingDirectory=/root/novsu-timetable-api
 EnvironmentFile=/root/novsu-timetable-api/.env
 Environment=PYTHONUNBUFFERED=1
-ExecStart=/usr/bin/python3 /root/novsu-timetable-api/monitor.py --interval 3 --jitter 0.25 --update-post 3
+# ID закрепа берётся из NOVSU_DASHBOARD_POST_ID в .env, а не зашивается в юнит.
+ExecStart=/usr/bin/python3 /root/novsu-timetable-api/monitor.py --interval 3 --jitter 0.25
 Restart=always
 RestartSec=20
 TimeoutStopSec=20
+# Изоляция: отдельный пользователь, без повышения привилегий, только state/ на запись.
+# Скрины рендерит /usr/bin/google-chrome (не snap), поэтому NoNewPrivileges= допустим;
+# /root открыт пользователю novsu только на проход (ACL u:novsu:x).
+User=novsu
+Group=novsu
+NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
+ProtectHome=false
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictRealtime=true
+MemoryMax=1G
 ReadWritePaths=/root/novsu-timetable-api/state
 
 [Install]

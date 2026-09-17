@@ -8,18 +8,21 @@ same change.
 ## 1. Purpose and Production Shape
 
 The project tracks NovSU group `6381`, exposes a local JSON API, posts semantic
-schedule changes to a Telegram channel, and continuously edits pinned Telegram
-message `3` into a date-aware dashboard.
+schedule changes to a Telegram channel, and continuously edits the pinned
+Telegram message named by `NOVSU_DASHBOARD_POST_ID` (currently `184`) into a
+date-aware dashboard.
 
 The deployed host currently runs:
 
 - `novsu-timetable-monitor.service`: polling and Telegram delivery;
-- `novsu-timetable-api.service`: local API on `127.0.0.1:8787`;
+- `novsu-timetable-api.service`: local API on `127.0.0.1:8787` with a
+  snapshot-bound response cache (`NOVSU_RESPONSE_CACHE_TTL`, default one day);
 - `novsu-timetable-healthcheck.timer`: hourly liveness check and DM alert;
 - `novsu-timetable-rollover.timer`: intentionally disabled because the main
   monitor reevaluates dashboard rollover every cycle.
 
-The repository unit starts the monitor with `--interval 3 --jitter 0.25`, which
+The repository unit starts the monitor with `--interval 3 --jitter 0.25` (the
+dashboard id comes from `NOVSU_DASHBOARD_POST_ID`, not the unit), which
 means a start-to-start period of about 3 minutes plus or minus 15 seconds.
 Network/portal failures use exponential backoff capped at about 20 minutes.
 
@@ -66,7 +69,7 @@ group rather than independently hitting the portal.
 | `bells.py` | Academic-hour parsing and all interval/end-time arithmetic |
 | `schedule_logic.py` | Date parsing, parity, note conditions, applicable lessons, day/week views, dashboard rollover |
 | `format.py` | Telegram rich messages, fallback text, dashboard presentation, guide content |
-| `screenshot.py` | Headless Chromium rendering and image trimming |
+| `screenshot.py` | Headless Chrome rendering: one Playwright browser per batch (`browser_session()`), full-page PNGs, CLI fallback, fast tail trim |
 | `post.py` | Dashboard orchestration, media attachment, screenshot caches, manual posting commands |
 | `monitor.py` | Poll loop, baseline, confirmation, diff, durable notification, retries, technical alerts |
 | `telegram_api.py` | Rich payload validation, JSON/multipart transport, Telegram retries |
@@ -481,6 +484,11 @@ NOVSU_DM_SILENT
 
 ## 13. API
 
+The service is single-group by policy: with `NOVSU_API_DEFAULT_GROUP_ONLY`
+(default on) every group other than `6381` (`default`, `me`), any `inst_id` /
+`year` / `type` override, `/v1/groups` and `/v1/institutes` answer `404`.
+The multi-group code paths remain for tests and for a deliberate opt-out.
+
 The local service listens on `127.0.0.1:8787` by default.
 
 ```text
@@ -540,6 +548,24 @@ sudo systemctl start novsu-timetable-monitor.service
 ```
 
 The installer intentionally does not start the monitor until `.env` is checked.
+
+Service identity: monitor, API and rollover run as the unprivileged user
+`novsu` with `NoNewPrivileges=true`, kernel protections and `MemoryMax`.
+Prerequisites on the host:
+
+- user `novsu` exists (`useradd --system --no-create-home --shell /usr/sbin/nologin --user-group novsu`);
+- `/root` grants traverse only: `setfacl -m u:novsu:x /root`;
+- `state/` is owned by `novsu` (`chown -R novsu:novsu state`); re-run after any
+  manual `post.py`/`monitor.py` invocation as root;
+- `.env` stays root-only; systemd passes it through `EnvironmentFile=`.
+- Manual runs: `systemd-run --wait --pipe --uid=novsu --gid=novsu -p EnvironmentFile=/root/novsu-timetable-api/.env -p WorkingDirectory=/root/novsu-timetable-api /usr/bin/python3 post.py --roll`.
+
+Screenshots use `/usr/bin/google-chrome` (see `config.CHROMIUM_BIN`,
+override with `NOVSU_CHROMIUM_BIN`). The snap `chromium-browser` wrapper cannot
+run under `NoNewPrivileges` and is only a last-resort fallback. Chrome gets a
+writable `HOME` under `state/.chrome-home`. When `playwright` is importable, a
+batch of days renders in one browser (about 14 s per week instead of a minute);
+otherwise the CLI `--screenshot` path is used automatically.
 The API is enabled and started. The standalone rollover timer is disabled
 because monitor polling already performs rollover.
 
@@ -670,7 +696,9 @@ rich message rather than only local JSON.
 2. Increment `SCHEDULE_SCREEN_STYLE_VERSION` for dashboard output changes, or
    `COMPARISON_SCREEN_STYLE_VERSION` for notification-only comparisons.
 3. Test cache invalidation across target weeks.
-4. Verify text-only delivery still succeeds if Chromium fails.
+4. Verify text-only delivery still succeeds if Chrome fails.
+5. Keep batch renders inside `screenshot.browser_session()`; one-off calls
+   still work but pay a browser launch each.
 
 ### Change monitor delivery
 

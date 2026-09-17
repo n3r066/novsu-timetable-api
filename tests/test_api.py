@@ -581,3 +581,93 @@ def test_known_groups_6381_and_5234_keep_ochn_route():
 
     # default alias still resolves to 6381 with ochn route
     assert api.resolve_group("default")["route"] == "ochn"
+
+
+
+def test_response_cache_serves_views_until_snapshot_changes(monkeypatch):
+    """Кеш day/week живёт до суток, но любой новый snapshot делает его недействительным."""
+    api.clear_response_cache()
+    snapshot = {"id": 1}
+    data = api.parse_all(SCHEDULE_HTML)
+
+    def fake_get_timetable(group, **kwargs):
+        return {"group": "6381", "source_url": "https://example.test/6381", "snapshot_id": snapshot["id"],
+                "weeks": data.get("weeks", []), "schedule": data.get("schedule")}
+
+    monkeypatch.setattr(api, "get_timetable", fake_get_timetable)
+    view_calls = {"n": 0}
+    real_day_view = api.day_view
+
+    def counting_day_view(*args, **kwargs):
+        view_calls["n"] += 1
+        return real_day_view(*args, **kwargs)
+
+    monkeypatch.setattr(api, "day_view", counting_day_view)
+    server = ThreadingHTTPServer(("127.0.0.1", 0), api.Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+
+    def get(path):
+        with urllib.request.urlopen(f"http://127.0.0.1:{server.server_port}{path}", timeout=3) as response:
+            return response.status, json.loads(response.read())
+
+    try:
+        assert get("/v1/timetables/6381/day?date=2026-09-02")[0] == 200
+        assert get("/v1/timetables/6381/day?date=2026-09-02")[0] == 200
+        assert view_calls["n"] == 1  # второй запрос — из кеша
+        assert get("/v1/timetables/6381/day?date=2026-09-03")[0] == 200
+        assert view_calls["n"] == 2  # другая дата — другой ключ
+        snapshot["id"] = 2
+        assert get("/v1/timetables/6381/day?date=2026-09-02")[0] == 200
+        assert view_calls["n"] == 3  # новый snapshot сбросил запись
+        # /next без явного времени зависит от текущей минуты и не кешируется
+        next_calls = {"n": 0}
+        real_next = api.next_lessons
+
+        def counting_next(*args, **kwargs):
+            next_calls["n"] += 1
+            return real_next(*args, **kwargs)
+
+        monkeypatch.setattr(api, "next_lessons", counting_next)
+        get("/v1/timetables/6381/next?limit=1")
+        get("/v1/timetables/6381/next?limit=1")
+        assert next_calls["n"] == 2
+        # а с явными датой и временем — кешируется
+        get("/v1/timetables/6381/next?date=2026-09-02&time=09:00&limit=1")
+        get("/v1/timetables/6381/next?date=2026-09-02&time=09:00&limit=1")
+        assert next_calls["n"] == 3
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=3)
+        api.clear_response_cache()
+
+
+
+def test_duplicate_index_rows_do_not_make_a_group_ambiguous(monkeypatch):
+    """Индекс портала печатает одну группу дважды — это одна ссылка, а не две группы."""
+    row = {"inst_id": "868344", "group": "5231", "type": "ДО", "year": "2025", "route_path": "x", "route": "ochn", "institute": None}
+    monkeypatch.setattr(api, "_all_index_html", lambda: {"ochn": "<html/>"})
+    monkeypatch.setattr(api, "parse_groups", lambda html, inst_id=None: [dict(row), dict(row), {**row, "type": "ЗО"}])
+    found = api.find_groups("5231")
+    assert [(g["group"], g["type"]) for g in found] == [("5231", "ДО"), ("5231", "ЗО")]
+    assert [(g["group"], g["type"]) for g in api.find_groups("5231", typ="ДО")] == [("5231", "ДО")]
+    assert len(api.list_groups()) == 2
+
+
+
+def test_api_serves_only_the_default_group(monkeypatch):
+    """Сервис ведёт одну группу: чужие группы, индекс групп и институтов недоступны."""
+    monkeypatch.setattr(api.config, "API_DEFAULT_GROUP_ONLY", True)
+    payload = {"schema_version": 1, "group": "6381", "stub": False, "schedule": {"days": {}}, "weeks": [], "source_url": "https://example.test", "snapshot_id": 1}
+    calls = []
+    assert _request(monkeypatch, payload, "/v1/timetables/5234/day?date=2026-09-01", calls=calls)[0] == 404
+    assert _request(monkeypatch, payload, "/v1/timetables/6381?year=2025", calls=calls)[0] == 404
+    assert calls == []  # до фетча дело не доходит
+    status, body = _request(monkeypatch, payload, "/v1/groups?q=52")
+    assert (status, body["error"]) == (404, "not_found")
+    assert _request(monkeypatch, payload, "/v1/institutes")[0] == 404
+    assert _request(monkeypatch, payload, "/v1/timetables/6381")[0] == 200
+    assert _request(monkeypatch, payload, "/v1/timetables/me/day?date=2026-09-01")[0] == 200
+    monkeypatch.setattr(api.config, "API_DEFAULT_GROUP_ONLY", False)
+    assert _request(monkeypatch, payload, "/v1/timetables/5234/day?date=2026-09-01", calls=calls)[0] == 200

@@ -11,6 +11,7 @@ import sqlite3
 import threading
 import time
 import urllib.parse
+import zoneinfo
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -70,6 +71,45 @@ _TIMETABLE_CACHE: dict[str, tuple[float, dict]] = {}
 _INDEX_CACHE: dict[str, tuple[float, str]] = {}
 _INDEX_CACHE_TTL_S = 300.0
 _INDEX_CACHE_LOCK = threading.Lock()
+
+# Кеш готовых JSON-ответов day/week/next. Ключ — маршрут + параметры + дата по
+# Москве; запись привязана к snapshot_id и живёт не дольше суток. Любой новый
+# снимок расписания (монитор нашёл изменение) делает записи недействительными
+# на первом же запросе, поэтому «сутки» — верхняя граница, а не задержка.
+RESPONSE_CACHE_TTL_S = max(0.0, float(config.RESPONSE_CACHE_TTL_S))
+_RESPONSE_CACHE: dict[tuple, tuple[float, int, int, dict]] = {}
+_RESPONSE_CACHE_LOCK = threading.Lock()
+_RESPONSE_CACHE_MAX = 512
+
+
+def _response_cache_get(key: tuple, snapshot_id: int) -> tuple[int, dict] | None:
+    with _RESPONSE_CACHE_LOCK:
+        entry = _RESPONSE_CACHE.get(key)
+        if entry is None:
+            return None
+        expires, cached_snapshot, status, payload = entry
+        if cached_snapshot != snapshot_id or expires <= time.monotonic():
+            _RESPONSE_CACHE.pop(key, None)
+            return None
+        return status, payload
+
+
+def _response_cache_put(key: tuple, snapshot_id: int, status: int, payload: dict) -> None:
+    if RESPONSE_CACHE_TTL_S <= 0:
+        return
+    with _RESPONSE_CACHE_LOCK:
+        if len(_RESPONSE_CACHE) >= _RESPONSE_CACHE_MAX:
+            now = time.monotonic()
+            for stale_key in [k for k, v in _RESPONSE_CACHE.items() if v[0] <= now or v[1] != snapshot_id]:
+                _RESPONSE_CACHE.pop(stale_key, None)
+            if len(_RESPONSE_CACHE) >= _RESPONSE_CACHE_MAX:
+                _RESPONSE_CACHE.pop(next(iter(_RESPONSE_CACHE)), None)
+        _RESPONSE_CACHE[key] = (time.monotonic() + RESPONSE_CACHE_TTL_S, snapshot_id, status, payload)
+
+
+def clear_response_cache() -> None:
+    with _RESPONSE_CACHE_LOCK:
+        _RESPONSE_CACHE.clear()
 
 
 class ParseValidationError(ValueError):
@@ -171,6 +211,19 @@ def _all_index_html() -> dict[str, str]:
     return result
 
 
+def _dedupe_groups(groups: list[dict]) -> list[dict]:
+    """Индекс портала повторяет одну и ту же группу дважды; ссылка на расписание при этом одна."""
+    seen: set[tuple] = set()
+    unique: list[dict] = []
+    for item in groups:
+        key = (item.get("route"), item.get("inst_id"), item.get("group"), item.get("type"), item.get("year"))
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(item)
+    return unique
+
+
 def list_institutes(html: str | None = None) -> list[dict]:
     return parse_institutes(html if html is not None else _index_html())
 
@@ -182,7 +235,7 @@ def list_groups(inst_id: str | None = None, html: str | None = None) -> list[dic
             groups = parse_groups(html, inst_id=inst_id)
         except Exception as exc:  # malformed upstream HTML is not a client error
             raise ParseValidationError(f"unexpected groups parser failure: {exc}") from exc
-        return sorted(groups, key=_group_sort_key)
+        return sorted(_dedupe_groups(groups), key=_group_sort_key)
     # Search across all routes.
     all_groups: list[dict] = []
     for route, route_html in _all_index_html().items():
@@ -194,7 +247,7 @@ def list_groups(inst_id: str | None = None, html: str | None = None) -> list[dic
         for g in groups:
             g.setdefault("route", route)
         all_groups.extend(groups)
-    return sorted(all_groups, key=_group_sort_key)
+    return sorted(_dedupe_groups(all_groups), key=_group_sort_key)
 
 
 def find_groups(
@@ -220,6 +273,7 @@ def find_groups(
             if typ and item["type"].casefold() != str(typ).casefold():
                 continue
             candidates.append(item)
+    candidates = _dedupe_groups(candidates)
     if not query:
         return sorted(candidates, key=_group_sort_key)
     exact = [item for item in candidates if item["group"] == query]
@@ -784,6 +838,8 @@ class Handler(BaseHTTPRequestHandler):
             if query:
                 return self.send_json(400, {"error": "bad_request"})
             return self._health(path == "/health/ready")
+        if config.API_DEFAULT_GROUP_ONLY and path in ("/v1/institutes", "/v1/groups"):
+            return self.send_json(404, {"error": "not_found"})
         if path == "/v1/institutes":
             if query:
                 return self.send_json(400, {"error": "bad_request"})
@@ -805,6 +861,12 @@ class Handler(BaseHTTPRequestHandler):
         action = rest[1] if len(rest) > 1 else "full"
         if action not in {"full", "day", "week", "next"}:
             return self.send_json(404, {"error": "not_found"})
+        if config.API_DEFAULT_GROUP_ONLY and (
+            group not in {DEFAULT_GROUP, "default", "_default", "me"}
+            or any(name in query for name in ("inst_id", "year", "type"))
+        ):
+            # Сервис ведёт одну группу; чужие группы и переопределения ссылки не обслуживаются.
+            return self.send_json(404, {"error": "unknown_group", "message": f"only group {DEFAULT_GROUP} is served"})
 
         try:
             global_names = {"inst_id", "year", "type"}
@@ -858,8 +920,23 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json(200, data)
             if action == "full":
                 return self.send_json(200, data)
+            # «next» без явных даты и времени зависит от текущей минуты — не кешируем.
+            cache_key = None
+            snapshot_id = data.get("snapshot_id")
+            if isinstance(snapshot_id, int) and not (action == "next" and (date_value is None or start_time is None)):
+                today_msk = dt.datetime.now(zoneinfo.ZoneInfo("Europe/Moscow")).date().isoformat()
+                cache_key = (data.get("source_url"), action, tuple(sorted((k, tuple(v)) for k, v in query.items())), today_msk)
+                hit = _response_cache_get(cache_key, snapshot_id)
+                if hit is not None:
+                    return self.send_json(*hit)
+
+            def respond(status: int, payload: dict):
+                if cache_key is not None:
+                    _response_cache_put(cache_key, snapshot_id, status, payload)
+                return self.send_json(status, payload)
+
             if action == "day":
-                return self.send_json(
+                return respond(
                     200,
                     day_view(
                         data.get("schedule"), data.get("weeks", []), target,
@@ -874,20 +951,20 @@ class Handler(BaseHTTPRequestHandler):
                     if week is None:
                         bounds = calendar_bounds(data.get("weeks", []))
                         if bounds and target > bounds[1]:
-                            return self.send_json(404, {"error": "calendar_ended", "calendar_end": bounds[1].isoformat()})
-                        return self.send_json(404, {"error": "calendar_unavailable"})
+                            return respond(404, {"error": "calendar_ended", "calendar_end": bounds[1].isoformat()})
+                        return respond(404, {"error": "calendar_unavailable"})
                 else:
                     week = find_week(data.get("weeks", []), target)
                 if not week:
-                    return self.send_json(404, {"error": "week_not_found"})
-                return self.send_json(
+                    return respond(404, {"error": "week_not_found"})
+                return respond(
                     200,
                     week_view(
                         data.get("schedule"), data.get("weeks", []), week,
                         group=data["group"], source_url=data["source_url"],
                     ),
                 )
-            return self.send_json(
+            return respond(
                 200,
                 next_lessons(
                     data.get("schedule"), data.get("weeks", []), target,

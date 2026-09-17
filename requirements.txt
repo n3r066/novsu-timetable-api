@@ -1,3 +1,4 @@
 beautifulsoup4>=4.12
 pillow>=10.0
 fake-useragent>=1.5
+# optional: playwright — один Chrome на пачку скриншотов (без него работает CLI-фоллбек)

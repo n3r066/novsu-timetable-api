@@ -8,3 +8,8 @@ Type=oneshot
 WorkingDirectory=/root/novsu-timetable-api
 EnvironmentFile=/root/novsu-timetable-api/.env
 ExecStart=/usr/bin/python3 /root/novsu-timetable-api/healthcheck.py
+# Работает от root: читает journalctl и дёргает systemctl. Ничего не рендерит.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/root/novsu-timetable-api/state

@@ -12,10 +12,16 @@ ROOT = pathlib.Path(__file__).resolve().parent
 STATE_DIR = ROOT / "state"
 STATE_DIR.mkdir(exist_ok=True)
 
-# Загружаем .env, если он есть. Fetch и API не требуют Telegram-секретов.
+# Загружаем .env, если он есть и читается. Fetch и API не требуют Telegram-секретов.
+# Под systemd переменные уже приходят через EnvironmentFile=, а сам .env принадлежит
+# root и недоступен сервисному пользователю — это штатно, а не ошибка.
 _env_file = ROOT / ".env"
-if _env_file.exists():
-    for line in _env_file.read_text(encoding="utf-8").splitlines():
+try:
+    _env_lines = _env_file.read_text(encoding="utf-8").splitlines()
+except OSError:
+    _env_lines = []
+if _env_lines:
+    for line in _env_lines:
         line = line.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
@@ -245,6 +251,19 @@ FETCH_RETRY_DELAY_S = max(0.0, float(os.environ.get("NOVSU_FETCH_RETRY_DELAY", "
 TIMETABLE_CACHE_TTL_S = max(0.0, float(os.environ.get("NOVSU_CACHE_TTL", "60")))
 SNAPSHOT_RETENTION_DAYS = max(0, int(os.environ.get("NOVSU_SNAPSHOT_RETENTION_DAYS", "90")))
 MONITOR_SNAPSHOT_MAX_AGE_S = max(0.0, float(os.environ.get("NOVSU_MONITOR_SNAPSHOT_MAX_AGE", "600")))
+# API обслуживает только группу по умолчанию (6381): чужие группы, поиск групп и
+# институтов отдают 404. Снять ограничение: NOVSU_API_DEFAULT_GROUP_ONLY=0.
+API_DEFAULT_GROUP_ONLY = os.environ.get("NOVSU_API_DEFAULT_GROUP_ONLY", "1").strip() not in ("0", "false", "False", "")
+# Кеш готовых ответов API (day/week/next): максимум сутки, сбрасывается новым снимком.
+RESPONSE_CACHE_TTL_S = max(0.0, float(os.environ.get("NOVSU_RESPONSE_CACHE_TTL", str(24 * 3600))))
 
-# Системный chromium (snap)
-CHROMIUM_BIN = "/usr/bin/chromium-browser"
+# Headless-браузер для скриншотов. Предпочитаем обычный google-chrome:
+# snap-обёртка chromium-browser требует смены AppArmor-профиля и не работает
+# под NoNewPrivileges= и отдельным пользователем в systemd.
+_BROWSER_CANDIDATES = ("/usr/bin/google-chrome", "/usr/bin/chromium", "/usr/bin/chromium-browser")
+CHROMIUM_BIN = os.environ.get("NOVSU_CHROMIUM_BIN") or next(
+    (path for path in _BROWSER_CANDIDATES if os.path.exists(path)), _BROWSER_CANDIDATES[-1]
+)
+# Chrome требует записываемый HOME (crashpad, профиль). Держим его внутри state/,
+# потому что только state/ доступен на запись сервису с ProtectSystem=strict.
+BROWSER_HOME = STATE_DIR / ".chrome-home"

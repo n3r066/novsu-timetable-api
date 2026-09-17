@@ -50,7 +50,7 @@ from schedule_logic import (  # noqa: E402
     lesson_non_applicability_struct,
     resolve_dashboard_view,
 )
-from screenshot import screenshot_html, screenshot_schedule_day_crop_items  # noqa: E402
+from screenshot import browser_session, screenshot_html, screenshot_schedule_day_crop_items  # noqa: E402
 from portal_parser import day_short, norm_text, render_schedule_day_chunk_htmls  # noqa: E402
 from telegram_api import edit_rich_message  # noqa: E402
 
@@ -481,24 +481,25 @@ def _cached_day_screens(
     directory.mkdir(parents=True, exist_ok=True)
     items = []
     render_kwargs = {"schedule_statuses": schedule_statuses} if schedule_statuses is not None else {}
-    for chunk in render_schedule_day_chunk_htmls(
-        html, config.GROUP_URL, days_per_chunk=1, **render_kwargs,
-    ):
-        if not isinstance(chunk, dict):
-            continue
-        label = str(chunk.get("label") or "")
-        if only_labels is not None and label not in only_labels:
-            continue
-        rendered = str(chunk.get("html") or "")
-        digest = hashlib.sha256(rendered.encode("utf-8")).hexdigest()
-        path = directory / f"{digest}.png"
-        if not path.exists() or path.stat().st_size < 1000:
-            screenshot_html(rendered, path, width=1480, height=3200, scale_factor=2, bg=(255, 255, 255))
-            try:
-                path.with_suffix(".html").unlink()
-            except OSError:
-                pass
-        items.append({"label": label, "path": str(path), "cache_key": digest})
+    chunks = render_schedule_day_chunk_htmls(html, config.GROUP_URL, days_per_chunk=1, **render_kwargs)
+    # Один Chrome на всю неделю: дни, которых нет в кеше, рендерятся в одном процессе.
+    with browser_session():
+        for chunk in chunks:
+            if not isinstance(chunk, dict):
+                continue
+            label = str(chunk.get("label") or "")
+            if only_labels is not None and label not in only_labels:
+                continue
+            rendered = str(chunk.get("html") or "")
+            digest = hashlib.sha256(rendered.encode("utf-8")).hexdigest()
+            path = directory / f"{digest}.png"
+            if not path.exists() or path.stat().st_size < 1000:
+                screenshot_html(rendered, path, width=1480, height=3200, scale_factor=2, bg=(255, 255, 255))
+                try:
+                    path.with_suffix(".html").unlink()
+                except OSError:
+                    pass
+            items.append({"label": label, "path": str(path), "cache_key": digest})
     _prune_day_screen_cache({Path(item["path"]) for item in items})
     return items
 
@@ -570,60 +571,62 @@ def comparison_day_screens(old_html: str | None, new_html: str | None, diff: dic
     order = {day: index for index, day in enumerate(("Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"))}
     items = []
     protected = set()
-    for label in sorted(wanted, key=lambda item: order.get(item, 9)):
-        pair = [side.get(label) for side in sides]
-        if not any(pair):
-            continue
-        signature = json.dumps([COMPARISON_SCREEN_STYLE_VERSION, 1480, 3200, 2,
-                                [chunk["html"] if chunk else None for chunk in pair]], ensure_ascii=False)
-        digest = hashlib.sha256(signature.encode("utf-8")).hexdigest()
-        item = {"label": label}
-        paths = []
-        for side, chunk in zip(("before", "after"), pair):
-            item[f"{side}_path"] = None
-            item[f"{side}_kinds"] = chunk.get("comparison_kinds", []) if chunk else []
-            if chunk is None:
+    # Обе стороны сравнения (Было / Стало) рендерятся одним процессом Chrome.
+    with browser_session():
+        for label in sorted(wanted, key=lambda item: order.get(item, 9)):
+            pair = [side.get(label) for side in sides]
+            if not any(pair):
                 continue
-            path = directory / f"{digest}_{side}.png"
-            try:
-                with Image.open(path) as image:
-                    image.verify()
-                cached = True
-            except (OSError, ValueError, SyntaxError):
-                cached = False
-            if not cached:
-                staging = path.with_name(path.stem + ".render.png")
+            signature = json.dumps([COMPARISON_SCREEN_STYLE_VERSION, 1480, 3200, 2,
+                                    [chunk["html"] if chunk else None for chunk in pair]], ensure_ascii=False)
+            digest = hashlib.sha256(signature.encode("utf-8")).hexdigest()
+            item = {"label": label}
+            paths = []
+            for side, chunk in zip(("before", "after"), pair):
+                item[f"{side}_path"] = None
+                item[f"{side}_kinds"] = chunk.get("comparison_kinds", []) if chunk else []
+                if chunk is None:
+                    continue
+                path = directory / f"{digest}_{side}.png"
                 try:
-                    staging.unlink(missing_ok=True)
-                    screenshot_html(chunk["html"], staging, width=1480, height=3200, scale_factor=2, bg=(255, 255, 255))
-                    with Image.open(staging) as image:
-                        image.verify()
-                    staging.replace(path)
-                finally:
-                    staging.unlink(missing_ok=True)
-                    staging.with_suffix(".html").unlink(missing_ok=True)
-            item[f"{side}_path"] = str(path)
-            paths.append(path)
-        if len(paths) == 2:
-            sizes = []
-            for path in paths:
-                with Image.open(path) as image:
-                    sizes.append(image.size)
-            canvas_size = (max(size[0] for size in sizes), max(size[1] for size in sizes))
-            for path, size in zip(paths, sizes):
-                if size != canvas_size:
                     with Image.open(path) as image:
-                        canvas = Image.new("RGB", canvas_size, "white")
-                        canvas.paste(image, (0, 0))
-                    staging = path.with_name(path.stem + ".padding.png")
+                        image.verify()
+                    cached = True
+                except (OSError, ValueError, SyntaxError):
+                    cached = False
+                if not cached:
+                    staging = path.with_name(path.stem + ".render.png")
                     try:
-                        canvas.save(staging)
+                        staging.unlink(missing_ok=True)
+                        screenshot_html(chunk["html"], staging, width=1480, height=3200, scale_factor=2, bg=(255, 255, 255))
+                        with Image.open(staging) as image:
+                            image.verify()
                         staging.replace(path)
                     finally:
                         staging.unlink(missing_ok=True)
-        protected.update(paths)
-        items.append(item)
-    _prune_day_screen_cache(protected)
+                        staging.with_suffix(".html").unlink(missing_ok=True)
+                item[f"{side}_path"] = str(path)
+                paths.append(path)
+            if len(paths) == 2:
+                sizes = []
+                for path in paths:
+                    with Image.open(path) as image:
+                        sizes.append(image.size)
+                canvas_size = (max(size[0] for size in sizes), max(size[1] for size in sizes))
+                for path, size in zip(paths, sizes):
+                    if size != canvas_size:
+                        with Image.open(path) as image:
+                            canvas = Image.new("RGB", canvas_size, "white")
+                            canvas.paste(image, (0, 0))
+                        staging = path.with_name(path.stem + ".padding.png")
+                        try:
+                            canvas.save(staging)
+                            staging.replace(path)
+                        finally:
+                            staging.unlink(missing_ok=True)
+            protected.update(paths)
+            items.append(item)
+        _prune_day_screen_cache(protected)
     return items
 
 

@@ -118,7 +118,9 @@ def fetch_html(
 
 def save_html(html: str, label: str = "6381") -> Path:
     """Сохранить последний успешный сырой ответ атомарно."""
-    out = STATE_DIR / f"{label}.html"
+    # config.STATE_DIR читается при вызове, а не при импорте: тесты подменяют
+    # его на tmp_path, и боевой state/6381.html не должен затираться фикстурой.
+    out = config.STATE_DIR / f"{label}.html"
     temporary = out.with_name(f".{out.name}.{os.getpid()}.tmp")
     temporary.write_text(html, encoding="utf-8")
     os.replace(temporary, out)
