@@ -1,3 +1,4 @@
+import json
 from copy import deepcopy
 
 import pytest
@@ -194,3 +195,31 @@ def test_group_by_day_keeps_cross_day_moves_as_removed_and_added():
 
     assert [kind for kind, _, _ in grouped[gone["day"]]] == ["removed"]
     assert [kind for kind, _, _ in grouped[arrived["day"]]] == ["added"]
+
+
+def test_time_less_lesson_does_not_break_day_grouping():
+    """«Проектный день» стоит в сетке без времени («—»): дифф с такой строкой
+    не должен ронять пост сравнением None с временем."""
+    import datetime as dt
+    import zoneinfo
+
+    from format import build_changes_rich_message, changes_fallback_text
+    from telegram_api import validate_rich_payload
+
+    diff = {
+        "added": [{"day": "Среда", "time": "14:00 15:00", "subject": "(пр.) Основы российской государственности",
+                   "room": "303", "teacher": "Иванов Иван Иванович", "note": ""}],
+        "removed": [{"day": "Среда", "time": "—", "subject": "Проектный день\n23.09, 21.10 и 16.12",
+                     "room": "—", "teacher": "—", "note": "23.09, 21.10 и 16.12"},
+                    {"day": "Среда", "time": "9:00 10:00", "subject": "(лек.) История России",
+                     "room": "1201", "teacher": "Петров Пётр Петрович", "note": ""}],
+        "changed": [],
+        "transition": None,
+    }
+    now = dt.datetime(2026, 9, 14, 11, 51, tzinfo=zoneinfo.ZoneInfo("Europe/Moscow"))
+    rich = build_changes_rich_message(diff, [], "https://example.test", now=now)
+    validate_rich_payload(rich)
+    blob = json.dumps(rich, ensure_ascii=False)
+    assert "Проектный день" in blob and "История России" in blob
+    text = changes_fallback_text(diff, "https://example.test", now=now)
+    assert "Проектный день" in text

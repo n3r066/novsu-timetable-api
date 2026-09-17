@@ -2948,10 +2948,13 @@ def _group_by_day(
         for item in rest_removed:
             entries.append(("removed", item, None))
         # Сначала по важности правки, потом по времени: читатель видит
-        # переносы и изменения раньше мелких добавлений.
+        # переносы и изменения раньше мелких добавлений. Пара без времени
+        # («Проектный день», в сетке «—») уходит в конец дня, а не роняет
+        # сортировку сравнением None с временем.
         entries.sort(key=lambda triple: (
             _KIND_ORDER.get(triple[0], 9),
-            bells.slot(triple[1].get("time")).start,
+            bells.slot(triple[1].get("time")).start or dt.time.max,
+            _subject_first(triple[1]).casefold(),
         ))
         by_day[day] = _merge_week_variants(entries)
     return by_day
