@@ -739,7 +739,8 @@ rich message rather than only local JSON.
 
 The portal shows «Основы проектной деятельности» as one 14:00 slot for the whole
 group. The real lesson runs per **virtual group (ВГ)**: each student has their
-own dates, block (14:00–15:45 or 16:00–17:45), building, room and teacher. The
+own dates, an hour-long slot (14:00–15:00 or 16:00–17:00 — the department's
+own format, never mapped to portal pairs or `bells.py`), building, room and teacher. The
 department publishes two public Google files, configured in `config.py`
 (`OPD_SHEET_ID`, `OPD_DOC_ID`, overridable via `NOVSU_OPD_SHEET_ID` /
 `NOVSU_OPD_DOC_ID`):
@@ -755,8 +756,10 @@ department publishes two public Google files, configured in `config.py`
 - `parse_doc_tables()` expands rowspan/colspan exactly like the department's
   reference parser; paragraphs inside a cell are joined with newlines so
   «101 ВГ» / «занятий не будет» stay separable.
-- `parse_sessions()` reads the «время проведения занятий» row for block
-  starts (falls back to sub-column order), tolerates a lost closing bracket in
+- `parse_sessions()` reads the «время проведения занятий» row for slot bounds
+  («14.00 15.00» → 14:00–15:00; a lone time means a one-hour slot; falls back
+  to sub-column order), shifts a slot when the ВГ cell says «с 15:00» (same
+  length, later start; the note stays visible), tolerates a lost closing bracket in
   the teacher cell, repairs a date typo in a repeated header from the first
   header of the same table, and infers the year closest to today.
 - `build_data()` keeps only members of `DEFAULT_GROUP`; the cache never stores
@@ -773,8 +776,8 @@ department publishes two public Google files, configured in `config.py`
 Dashboard integration (`post.edit_dashboard_post` → `format`):
 
 - `resolve_dashboard_view(..., late_ends=...)` and `day_is_live(..., late_end=...)`
-  keep Thursday in focus until 17:45 when a group member has a 16:00 block, even
-  though the portal slot ends at 15:45.
+  keep Thursday in focus until 17:00 when a group member has a 16:00 slot, even
+  though the portal pair ends at 15:45.
 - `dashboard_presentation_fingerprint(fp, view, extra=digest)`: the extra digest
   is empty without ОПД data, so the fingerprint of a plain dashboard is unchanged.
 - `_opd_section()` renders a collapsed `details` block right after the day

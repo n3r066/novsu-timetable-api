@@ -1,8 +1,8 @@
 """ОПД («Основы проектной деятельности»): виртуальные группы 1 курса.
 
-Портал ставит ОПД в четверг одним слотом на всю группу, а реальные дата, блок
-(14:00 или 16:00), корпус, аудитория и преподаватель зависят от виртуальной
-группы (ВГ) студента. Кафедра публикует два открытых Google-файла:
+Портал ставит ОПД в четверг одним слотом на всю группу, а реальные дата, слот
+(14:00–15:00 или 16:00–17:00 — свой часовой формат кафедры, не пары портала),
+корпус, аудитория и преподаватель зависят от виртуальной группы (ВГ) студента. Кафедра публикует два открытых Google-файла:
 
 - таблица ВГ (Google Sheets): ВГ, ФИО, академическая группа;
 - расписание ВГ (Google Doc): строка преподавателя = аудитория и адрес, колонки
@@ -34,10 +34,13 @@ import config
 
 MOSCOW = zoneinfo.ZoneInfo("Europe/Moscow")
 
-#: Блок ОПД — два академических часа: 45 + 15 перерыв + 45 → 14:00–15:45.
-BLOCK_MINUTES = 105
-#: Порядок подколонок даты, если строка «время проведения занятий» не читается.
-DEFAULT_BLOCK_STARTS = ("14:00", "16:00")
+#: Слоты ОПД — свой формат кафедры, а не пары портала: в строке «время
+#: проведения занятий» стоит «14.00 15.00» и «16.00 17.00», то есть час.
+#: Границы берём из документа как есть и никогда не приводим к сетке bells.
+#: Если в ячейке одно время — считаем слот часовым.
+BLOCK_MINUTES = 60
+#: Подколонки даты, если строка времени не читается: левая 14:00, правая 16:00.
+DEFAULT_BLOCKS = (("14:00", "15:00"), ("16:00", "17:00"))
 
 CACHE_FILE = "opd_cache.json"
 CACHE_VERSION = 1
@@ -239,11 +242,15 @@ def _repair_dates(dates: dict[int, dt.date], primary: dict[int, dt.date]) -> dic
     return repaired
 
 
-def _block_from_start(start: str) -> tuple[str, str]:
+def _block_bounds(times: list[str]) -> tuple[str, str]:
+    """«14:00 15:00» → (14:00, 15:00); одно время → часовой слот от него."""
+    start = times[0]
+    later = [value for value in times[1:] if value > start]
+    if later:
+        return start, later[0]
     hours, minutes = (int(part) for part in start.split(":"))
-    begin = dt.datetime(2000, 1, 1, hours, minutes)
-    end = begin + dt.timedelta(minutes=BLOCK_MINUTES)
-    return begin.strftime("%H:%M"), end.strftime("%H:%M")
+    end = dt.datetime(2000, 1, 1, hours, minutes) + dt.timedelta(minutes=BLOCK_MINUTES)
+    return start, end.strftime("%H:%M")
 
 
 def _parse_time_row(row: list[str]) -> dict[int, tuple[str, str]]:
@@ -251,18 +258,16 @@ def _parse_time_row(row: list[str]) -> dict[int, tuple[str, str]]:
     for col, cell in enumerate(row):
         if col == 0:
             continue
-        match = _TIME_RE.search(cell or "")
-        if not match:
-            continue
-        blocks[col] = _block_from_start(f"{int(match.group(1)):02d}:{match.group(2)}")
+        times = [f"{int(h):02d}:{m}" for h, m in _TIME_RE.findall(cell or "")]
+        if times:
+            blocks[col] = _block_bounds(times)
     return blocks
 
 
 def _default_block(col: int, dates: dict[int, dt.date]) -> tuple[str, str]:
     same = sorted(c for c, value in dates.items() if value == dates[col])
     position = same.index(col) if col in same else 0
-    start = DEFAULT_BLOCK_STARTS[min(position, len(DEFAULT_BLOCK_STARTS) - 1)]
-    return _block_from_start(start)
+    return DEFAULT_BLOCKS[min(position, len(DEFAULT_BLOCKS) - 1)]
 
 
 def building_of(place: str) -> str:
@@ -319,6 +324,25 @@ def _parse_teacher_cell(text: str) -> dict | None:
     }
 
 
+_SHIFT_RE = re.compile(r"^с\s+(\d{1,2})[.:](\d{2})$", re.I)
+
+
+def _apply_note_shift(start: str, end: str, note: str) -> tuple[str, str]:
+    """Пометка «с 15:00» в ячейке ВГ: слот той же длины начинается позже."""
+    match = _SHIFT_RE.match((note or "").strip())
+    if not match:
+        return start, end
+    shifted = f"{int(match.group(1)):02d}:{match.group(2)}"
+    try:
+        old_start = dt.datetime.strptime(start, "%H:%M")
+        old_end = dt.datetime.strptime(end, "%H:%M")
+        new_start = dt.datetime.strptime(shifted, "%H:%M")
+    except ValueError:
+        return start, end
+    duration = old_end - old_start if old_end > old_start else dt.timedelta(minutes=BLOCK_MINUTES)
+    return shifted, (new_start + duration).strftime("%H:%M")
+
+
 def _parse_vg_cell(text: str) -> list[tuple[str, str, bool]]:
     """Ячейка «118 ВГ» / «101 ВГ\\nзанятий не будет» / «121 ВГ\\nс 15:00»."""
     found = _VG_RE.findall(text or "")
@@ -364,6 +388,8 @@ def parse_sessions(grids: list[list[list[str]]], *, today: dt.date | None = None
                     continue
                 for vg, note, cancelled in _parse_vg_cell(cell):
                     start, end = blocks.get(col) or _default_block(col, dates)
+                    if not cancelled:
+                        start, end = _apply_note_shift(start, end, note)
                     sessions.append({
                         "date": dates[col].isoformat(),
                         "block_start": start,

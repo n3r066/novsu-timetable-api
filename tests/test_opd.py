@@ -37,15 +37,20 @@ def test_members_only_default_group_and_title_case():
 def test_sessions_follow_date_subcolumns():
     data = _data()
     thursday = {(s["vg"], s["block_start"]): s for s in data["sessions"] if s["date"] == "2026-09-17"}
-    assert thursday[("117", "14:00")]["block_end"] == "15:45"
-    assert thursday[("118", "16:00")]["block_end"] == "17:45"
+    # Слоты ОПД часовые, как в строке времени документа, а не пары 14:00–15:45.
+    assert thursday[("117", "14:00")]["block_end"] == "15:00"
+    assert thursday[("118", "16:00")]["block_end"] == "17:00"
+    assert thursday[("105", "14:00")]["block_end"] == "15:00"  # «14.00-15.00» через дефис
     assert thursday[("118", "16:00")]["room"] == "402"
     assert thursday[("118", "16:00")]["place"] == "ИЭ, Антоново"
     assert thursday[("118", "16:00")]["building"] == "Антоново"
     assert thursday[("118", "16:00")]["teacher"] == "Трезорова Ольга Юрьевна"
     assert thursday[("101", "14:00")]["cancelled"] and thursday[("102", "16:00")]["cancelled"]
-    assert thursday[("121", "14:00")]["note"] == "с 15:00"
-    assert not thursday[("121", "14:00")]["cancelled"]
+    # «с 15:00» сдвигает часовой слот: 15:00–16:00, пометка остаётся видимой.
+    assert thursday[("121", "15:00")]["note"] == "с 15:00"
+    assert thursday[("121", "15:00")]["block_end"] == "16:00"
+    assert not thursday[("121", "15:00")]["cancelled"]
+    assert ("121", "14:00") not in thursday
     # Потерянная закрывающая скобка и «ауд.503» без пробела читаются.
     assert thursday[("122", "16:00")]["room"] == "503"
     assert thursday[("122", "16:00")]["place"] == "ПИ, ул. Псковская, 3"
@@ -78,7 +83,9 @@ def test_year_inferred_closest_to_today():
     assert {s["date"][:4] for s in spring} == {"2026"}
     explicit = opd.parse_sessions([[["ДАТА", "05.03.27", "05.03.27"], ["Ионова Софья Валерьевна (ауд. 1, ИЭ, Антоново)", "101 ВГ", "102 ВГ"]]], today=TODAY)
     assert {s["date"] for s in explicit} == {"2027-03-05"}
-    assert {s["block_start"] for s in explicit} == {"14:00", "16:00"}  # без строки времени — по порядку подколонок
+    assert {(s["block_start"], s["block_end"]) for s in explicit} == {("14:00", "15:00"), ("16:00", "17:00")}  # без строки времени — по порядку подколонок
+    single = opd.parse_sessions([[["ДАТА", "05.03.27"], ["время", "15.30"], ["Ионова Софья Валерьевна (ауд. 1, ИЭ, Антоново)", "101 ВГ"]]], today=TODAY)
+    assert (single[0]["block_start"], single[0]["block_end"]) == ("15:30", "16:30")  # одно время → часовой слот
 
 
 def status_next(view: dict, vg: str) -> str:
@@ -97,10 +104,11 @@ def test_day_view_alphabetical_with_statuses():
     assert status["Жукова К. А."] == "session"
     assert view["counts"] == {"session": 6, "cancelled": 2, "free": 2}
     zhukova = next(row for row in view["rows"] if row["vg"] == "118")
-    assert (zhukova["block_start"], zhukova["block_end"], zhukova["room"]) == ("16:00", "17:45", "402")
+    assert (zhukova["block_start"], zhukova["block_end"], zhukova["room"]) == ("16:00", "17:00", "402")
     assert zhukova["teacher_short"] == "Трезорова О. Ю."
     late = next(row for row in view["rows"] if row["vg"] == "121")
     assert late["note"] == "с 15:00"
+    assert (late["block_start"], late["block_end"]) == ("15:00", "16:00")
     # Через неделю: у идущих сегодня следующая дата 01.10, у свободных — 24.09,
     # у отменённых — их ближайшее неотменённое занятие.
     assert zhukova["next_date"] == "2026-10-01"
@@ -120,9 +128,9 @@ def test_day_view_none_for_dates_outside_document():
 
 def test_late_ends_cover_second_block_of_group_members():
     ends = opd.late_ends(_data())
-    assert ends[TODAY] == dt.time(17, 45)
-    assert ends[dt.date(2026, 9, 10)] == dt.time(17, 45)  # ВГ 143 в блоке 16:00
-    assert ends[dt.date(2026, 10, 1)] == dt.time(17, 45)
+    assert ends[TODAY] == dt.time(17, 0)
+    assert ends[dt.date(2026, 9, 10)] == dt.time(17, 0)  # ВГ 143 в слоте 16:00
+    assert ends[dt.date(2026, 10, 1)] == dt.time(17, 0)
     assert opd.late_ends(None) == {}
 
 

@@ -1353,6 +1353,17 @@ _OPD_SCHEDULE = {"days": {"Четверг": [
 _OPD_WEEKS = [{"week": 3, "half": "top", "start": "14.09.2026", "end": "19.09.2026"}]
 
 
+def _find_details(blocks: list[dict], summary_marker: str) -> dict | None:
+    for block in blocks:
+        if block.get("type") == "details":
+            if summary_marker in json.dumps(block.get("summary"), ensure_ascii=False):
+                return block
+            found = _find_details(block.get("blocks") or [], summary_marker)
+            if found:
+                return found
+    return None
+
+
 def _opd_fixture() -> dict:
     import opd
 
@@ -1381,7 +1392,12 @@ def test_dashboard_thursday_has_opd_section_by_buildings():
     for building in ("📍 Антоново", "📍 ул. Псковская, 3", "📍 ул. Советской Армии, 7"):
         assert building in blob
     assert "🕑" not in blob
-    assert "Жукова К. А." in blob and "ВГ 118" in blob and '"16:00–17:45"' in blob and '"14:00–15:45"' in blob
+    assert "Жукова К. А." in blob and "ВГ 118" in blob and '"16:00–17:00"' in blob and '"14:00–15:00"' in blob
+    # Слоты ОПД не приводятся к парам: внутри раздела нет 15:45/17:45 (в таблице дня они есть — это портальная пара).
+    section = json.dumps(_find_details(rm["rich_message"]["blocks"], "ОПД · ПО"), ensure_ascii=False)
+    assert "15:45" not in section and "17:45" not in section
+    # «с 15:00» у Зайцева-Петрова: слот 15:00–16:00 и подсвеченная пометка рядом.
+    assert '"15:00–16:00"' in section and '"с 15:00"' in section
     assert blob.index("Елисеев А. Д.") < blob.index("Жукова К. А.")  # 14:00 раньше 16:00 в Антоново
     assert "ауд. 402 · ИЭ" in blob and "Трезорова О. Ю." in blob
     assert "ауд. 106хк · ХТИ" in blob and "рядом с" not in blob
@@ -1444,7 +1460,7 @@ def test_dashboard_opd_second_block_keeps_thursday_live():
     during_second_block = dt.datetime(2026, 9, 17, 16, 30, tzinfo=msk)
     assert "ЧЕТВЕРГ · 17.09" in _blob(during_second_block, opd=_opd_fixture())
     assert "ЧЕТВЕРГ · 17.09" not in _blob(during_second_block)  # портальная пара кончилась в 15:45
-    after_second_block = dt.datetime(2026, 9, 17, 17, 50, tzinfo=msk)
+    after_second_block = dt.datetime(2026, 9, 17, 17, 5, tzinfo=msk)  # слот 16:00–17:00 уже прошёл
     assert "ЧЕТВЕРГ · 17.09" not in _blob(after_second_block, opd=_opd_fixture())
 
 
@@ -1515,8 +1531,8 @@ def test_opd_building_table_orders_by_time_before_alphabet():
         "date": "2026-09-17", "group": "6381", "fetched_at": "", "sources": {},
         "counts": {"session": 2, "cancelled": 0, "free": 0},
         "rows": [
-            {**row, "student": "Антонов А. А.", "vg": "106", "block_start": "16:00", "block_end": "17:45"},
-            {**row, "student": "Яковлев Я. Я.", "vg": "105", "block_start": "14:00", "block_end": "15:45"},
+            {**row, "student": "Антонов А. А.", "vg": "106", "block_start": "16:00", "block_end": "17:00"},
+            {**row, "student": "Яковлев Я. Я.", "vg": "105", "block_start": "14:00", "block_end": "15:00"},
         ],
     }
     blob = json.dumps(_opd_section(view), ensure_ascii=False)
