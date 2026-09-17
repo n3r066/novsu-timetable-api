@@ -2095,7 +2095,9 @@ def _chunked(values: list, size: int) -> list[list]:
     return [values[index:index + size] for index in range(0, len(values), size)]
 
 
-_KIND_MARK = {"added": "+", "removed": "−", "changed": "~"}
+_KIND_MARK = {"added": "+", "removed": "−", "changed": "~", "moved": "↔"}
+#: Больше строк в таблице дня не показываем: остальное — на портале.
+_RICH_DIFF_MAX_ROWS_PER_DAY = 40
 _KIND_RANK = {"added": 0, "removed": 1, "changed": 2}
 
 # Человеческие названия правок: читателю нужен глагол, а не значок.
@@ -3028,33 +3030,190 @@ def _summary_delta(kind: str, item: dict, partner: dict | None) -> tuple[tuple, 
     return ("subjects",), []
 
 
-def _day_change_blocks(entries: list[tuple[str, dict, dict | None]]) -> list[dict]:
-    details: list[dict] = []
+def _fields_of(item: dict) -> list[tuple[str, str, str]]:
+    return [
+        (str(field[0]), str(field[1] or ""), str(field[2] or ""))
+        for field in (item.get("fields") or [])
+        if isinstance(field, (list, tuple)) and len(field) == 3
+    ]
+
+
+def _time_runs(item: dict) -> list[object]:
+    label = bells.slot(item.get("time")).label()
+    if not label or label == "—":
+        return []
+    return [{"type": "code", "text": _truncate_rich_text(label, 48)}]
+
+
+def _old_new_runs(old: str, new: str, limit: int, *, missing: str = "не указано") -> list[object]:
+    """«старое → новое»: старое зачёркнуто, новое жирным; пустое старое не печатаем."""
+    runs: list[object] = []
+    if not _missing_change_value(old):
+        runs += [*_old_value_runs(old, limit), " → "]
+    runs.append({"type": "bold", "text": _truncate_rich_text(missing if _missing_change_value(new) else new, limit)})
+    return runs
+
+
+def _place_runs(text: str, *, struck: bool = False) -> list[object]:
+    if not text or text == "место не указано":
+        return ["—"]
+    text = _truncate_rich_text(text, 300)
+    return [{"type": "strikethrough", "text": text}] if struck else [text]
+
+
+def _change_what_cell(kind: str, item: dict, partner: dict | None) -> list[object]:
+    """Знак правки и время пары; у переноса — старое время зачёркнуто, новое жирным."""
+    mark = {"type": "code", "text": _KIND_MARK.get(kind, "?")}
+    if kind == "moved" and partner is not None:
+        old = bells.slot(item.get("time")).label()
+        new = bells.slot(partner.get("time")).label()
+        return [mark, "\n", *_old_value_runs(old, 48), " → ", {"type": "bold", "text": _truncate_rich_text(new, 48)}]
+    runs: list[object] = [mark]
+    time = _time_runs(partner or item)
+    if time and kind == "removed":
+        time = [{"type": "strikethrough", "text": time[0]["text"]}]
+    if time:
+        runs += ["\n", *time]
+    return runs
+
+
+def _change_lesson_cell(kind: str, item: dict, partner: dict | None) -> list[object]:
+    """Название (у переименования — старое зачёркнуто или подсвечен хвост),
+    вид пары и неделя, преподаватель (у смены — старый зачёркнут, новый жирным)."""
+    current = partner or item
+    fields = _fields_of(item)
+    labels = {label for label, _, _ in fields}
+    name, abbrev = _subject_kind(_subject_first(current))
+    runs: list[object] = []
+    if "предмет" in labels:
+        tail = _rename_tail(item)
+        old_raw = next((old for label, old, _ in fields if label == "предмет"), "")
+        old_name, _ = _subject_kind(old_raw.split("\n", 1)[0].strip())
+        if tail:
+            base = name[: max(0, len(name) - len(tail))].rstrip()
+            runs += [{"type": "bold", "text": _truncate_rich_text(base, 400)}, " ",
+                     {"type": "marked", "text": _truncate_rich_text(tail, _RENAME_TAIL_LIMIT)}]
+        else:
+            runs += [*_old_value_runs(old_name or "название не указано", 400), "\n",
+                     {"type": "bold", "text": _truncate_rich_text(name, 400)}]
+    else:
+        runs.append({"type": "bold", "text": _truncate_rich_text(name, 400)})
+    context: list[str] = []
+    if abbrev:
+        context.append(_truncate_rich_text(abbrev, 16))
+    parity = _parity_context(current)
+    if parity:
+        context.append(parity)
+    if context:
+        runs += ["\n", {"type": "italic", "text": " · ".join(context)}]
+    teacher_field = next((field for field in fields if field[0] == "преподаватель"), None)
+    if teacher_field:
+        runs += ["\n", *_old_new_runs(teacher_field[1], teacher_field[2], 160)]
+    else:
+        teacher = str(current.get("teacher") or "").strip()
+        if teacher and not _missing_change_value(teacher):
+            runs += ["\n", {"type": "italic", "text": _truncate_rich_text(teacher, 160)}]
+    return runs
+
+
+def _change_where_cell(kind: str, item: dict, partner: dict | None) -> list[object]:
+    """Аудитория, корпус и формат: у правок старое зачёркнуто, новое жирным,
+    у убранной пары всё зачёркнуто, у переноса — место только если сменилось."""
+    current = partner or item
+    fields = _fields_of(item)
+    labels = {label for label, _, _ in fields}
+    if kind == "moved" and partner is not None:
+        before, after = _place_line(item, ""), _place_line(partner, "")
+        if before != after:
+            return [*_old_value_runs(before, 200), "\n", {"type": "bold", "text": _truncate_rich_text(after, 200)}]
+        return _place_runs(after)
+    if kind in {"added", "removed"}:
+        return _place_runs(_place_line(current, ""), struck=kind == "removed")
+    place_fields = [
+        field for field in fields
+        if field[0] in {"ауд.", "место", "формат"} and not (field[0] in {"место", "формат"} and "примечание" in labels)
+    ]
+    if not place_fields:
+        return _place_runs(_place_line(current, ""))
+    runs: list[object] = []
+    for index, (label, old, new) in enumerate(place_fields):
+        if index:
+            runs.append("\n")
+        if label == "формат":
+            old, new = _FORMAT_MODES.get(old, old), _FORMAT_MODES.get(new, new)
+        runs += _old_new_runs(old, new, 200)
+        if label == "ауд.":
+            corpus = _corpus_tail(item)
+            if corpus:
+                runs += ["\n", {"type": "italic", "text": "другой корпус: " + corpus.split("корпус: ", 1)[-1]}]
+    wheres = [_where(variant) for variant in _variants_of(current)]
+    if len(dict.fromkeys(wheres)) > 1:
+        runs += ["\n", {"type": "italic", "text": _truncate_rich_text(_place_line(current, ""), 300)}]
+    return runs
+
+
+def _details_when_cell(current: dict) -> list[object]:
+    """Время и неделя; без времени портала — так и пишем, дефис не выдумываем."""
+    runs = _time_runs(current)
+    parity = _parity_context(current)
+    if parity:
+        runs += (["\n"] if runs else []) + [parity]
+    return runs or ["время не указано"]
+
+
+def _details_note_cell(kind: str, item: dict, partner: dict | None) -> list[object]:
+    current = partner or item
+    note_field = next((field for field in _fields_of(item) if field[0] == "примечание"), None)
+    if note_field:
+        return _old_new_runs(note_field[1], note_field[2], 300)
+    note = _note_line(current)
+    if not note:
+        return ["—"]
+    text = _truncate_rich_text(note, 300)
+    return [{"type": "strikethrough", "text": text}] if kind == "removed" else [text]
+
+
+def _day_change_table(entries: list[tuple[str, dict, dict | None]]) -> dict:
+    table = _table([[("что", "bold"), ("занятие", "bold"), ("где", "bold")]])
     for kind, item, partner in entries:
-        if details:
-            details.append(_divider())
-        details.extend(_change_card(kind, item, partner))
-    if len(entries) <= 1:
-        return details
-    blocks: list[dict] = []
-    for brief, group in _day_action_groups(entries):
-        rows: dict[tuple, tuple[list, list]] = {}
-        for entry in group:
-            key, delta = _summary_delta(*entry)
-            if key not in rows:
-                rows[key] = ([], delta)
-            rows[key][0].append(entry)
-        runs: list[object] = [{"type": "bold", "text": _action_label(brief, len(group)).capitalize() + ":"}]
-        for subjects, delta in rows.values():
-            runs.extend(["\n• ", *_summary_subjects(subjects)])
-            if delta:
-                runs.extend([" — ", *delta])
-        blocks.append(_rich_paragraph(runs))
-    if all(kind == "changed" and {str(f[0]) for f in item.get("fields", [])
-                                  if isinstance(f, (list, tuple)) and len(f) == 3} == {"преподаватель"}
-           for kind, item, _ in entries):
-        blocks.append(_paragraph("Время и аудитории не менялись."))
-    blocks.append(_details("Подробности: время, недели и примечания", *details))
+        table["cells"].append([
+            _table_cell(_change_what_cell(kind, item, partner), "plain"),
+            _table_cell(_change_lesson_cell(kind, item, partner), "plain"),
+            _table_cell(_change_where_cell(kind, item, partner), "plain"),
+        ])
+    return table
+
+
+def _day_details_table(entries: list[tuple[str, dict, dict | None]]) -> dict:
+    table = _table([[("занятие", "bold"), ("время · недели", "bold"), ("примечание", "bold")]])
+    for kind, item, partner in entries:
+        current = partner or item
+        name, abbrev = _subject_kind(_subject_first(current))
+        lesson: list[object] = [{"type": "bold", "text": _truncate_rich_text(name, 400)}]
+        if abbrev:
+            lesson += ["\n", {"type": "italic", "text": _truncate_rich_text(abbrev, 16)}]
+        table["cells"].append([
+            _table_cell(lesson, "plain"),
+            _table_cell(_details_when_cell(current), "plain"),
+            _table_cell(_details_note_cell(kind, item, partner), "plain"),
+        ])
+    return table
+
+
+def _day_change_blocks(entries: list[tuple[str, dict, dict | None]]) -> list[dict]:
+    """Тело раздела дня: таблица правок и свёрнутые подробности таблицей.
+
+    Основная таблица: знак и время, занятие с преподавателем, где. Старые
+    значения зачёркнуты, новые жирным. В «Подробностях» — время, недели и
+    примечания каждой пары. Больше _RICH_DIFF_MAX_ROWS_PER_DAY строк не
+    печатаем: при переопубликовании всего расписания пост остался бы читаемым.
+    """
+    shown = entries[:_RICH_DIFF_MAX_ROWS_PER_DAY]
+    blocks: list[dict] = [_day_change_table(shown)]
+    hidden = len(entries) - len(shown)
+    if hidden > 0:
+        blocks.append(_paragraph(f"Ещё {hidden} {_changes_word(hidden)} этого дня не поместились — смотри портал."))
+    blocks.append(_details("Подробности: время, недели и примечания", _day_details_table(shown)))
     return blocks
 
 
@@ -3204,6 +3363,17 @@ def _runs_to_html(runs: object) -> str:
     return "".join(out)
 
 
+def _table_rows_html(table: dict) -> list[str]:
+    """Строки таблицы одной строкой HTML каждая: ячейки через « · », без шапки."""
+    lines: list[str] = []
+    for row in table.get("cells") or []:
+        if any(cell.get("is_header") for cell in row):
+            continue
+        cells = [_runs_to_html(cell.get("text")).replace("\n", " ") for cell in row]
+        lines.append(" · ".join(cell for cell in cells if cell))
+    return lines
+
+
 def changes_fallback_text(
     diff: dict, source_url: str, *, group_name: str = "6381", now: dt.datetime | None = None,
 ) -> str:
@@ -3228,9 +3398,14 @@ def changes_fallback_text(
         for block in _day_change_blocks(entries):
             if block.get("type") == "paragraph":
                 chunk.append(_runs_to_html(block.get("text")))
+            elif block.get("type") == "table":
+                chunk.extend(_table_rows_html(block))
             elif block.get("type") == "details":
-                body = "\n\n".join(_runs_to_html(part.get("text"))
-                                     for part in block["blocks"] if part.get("type") == "paragraph")
+                body = "\n".join(
+                    "\n".join(_table_rows_html(part)) if part.get("type") == "table"
+                    else _runs_to_html(part.get("text"))
+                    for part in block["blocks"] if part.get("type") in {"paragraph", "table"}
+                )
                 chunk.append("<blockquote expandable><b>Подробности</b>\n" + body + "</blockquote>")
         day_chunks.append("\n".join(chunk))
 

@@ -234,38 +234,34 @@ even if the portal content did not change.
 
 ### Change notification layout
 
-`build_changes_rich_message()` uses a separate, action-first layout:
+`build_changes_rich_message()` uses a per-day, table-first layout without emoji:
 
 - Each weekday is a closed `details` section whose summary names the concrete
   edits, for example `Четверг (сменили аудиторию)` or
   `Пятница (переименовали пару, убрали пару)` — not a bare change count.
-- Days with multiple edits start with a short overview grouped by action.
-  Additions, replacements and missing teacher names are distinct actions.
-  Identical new teachers, room deltas or time moves share a row listing the
-  affected subjects; repeated occurrences of one subject get a lesson count.
-  Never infer a meaning from a partial free-form note. Full old/new values,
-  times, week variants and unknown notes remain in a closed “Подробности” section.
-  Only teacher-only days may say that times and rooms did not change.
-- A single edit, and each entry inside the detailed section, is a compact
-  paragraph with separate lines for the bold subject, type/time/week context
-  and the field delta. No repeated “У пары …”.
-  A previously missing teacher is “Указали преподавателя: …”; it is not a
-  replacement. Placeholder dashes are never struck through. Renames retain
-  prefix highlighting so the two full names do not repeat unnecessarily.
-- Moves show old and new times once, and retain any week-specific place changes.
-  Removals strike their former time and place; additions name the supplied place.
-- Room changes across buildings append “Другой корпус: …”, using the existing
-  room decoder. Unknown buildings are never guessed. Teacher-only edits omit
-  unchanged addresses, but preserve dates and unknown condition prose.
-- Time and applicable parity remain visible when supplied by the source.
-  Unknown time is omitted rather than rendered as an empty badge.
-- Different upper/lower locations and conditions get separate labelled lines.
-  Room/location and `ДОТ` are both retained when the portal supplies both.
-- Unchanged teacher and extra location context do not appear in the post at
-  all: they remain available in the pinned dashboard and on the portal.
+- The body of a day is one rich `table` («что · занятие · где») with a row per
+  edit, ordered moves → changes → additions → removals, then by time:
+  - «что»: the mark `+` `−` `~` `↔` on the first line and the pair time on the
+    second (a move shows the old time struck and the new one bold; a removal
+    strikes the time; a missing time is simply omitted);
+  - «занятие»: the subject in bold (a rename strikes the old name above the new
+    one, or highlights the added tail when the old name is a prefix), then the
+    lesson type and applicable parity in italics, then the teacher (a teacher
+    edit shows old struck → new bold; a newly supplied teacher has no arrow);
+  - «где»: `_place_line()` — room, location and `ДОТ`, per week when upper and
+    lower differ; room/format/location edits show old struck → new bold and
+    append «другой корпус: …» from the room decoder; a removal strikes the
+    place; an unknown place is a dash, never «место не указано».
+- «Подробности: время, недели и примечания» is a closed `details` with a
+  second table («занятие · время · недели · примечание»), one row per edit in
+  the same order: time and parity (or «время не указано»), and the note line
+  from `_note_line()` (language expanded, week-specific conditions labelled
+  «Верхняя неделя: …»); a note edit shows old struck → new bold.
+- At most `_RICH_DIFF_MAX_ROWS_PER_DAY` (40) rows per day; the rest is named as
+  «Ещё N изменений этого дня не поместились». The global text/block budget
+  still trims per-kind record counts and reports omissions.
 - Before/after pairs are nested in a closed “Сравнить расписание” section,
-  with the short caption “Было → стало”. Thin dividers separate individual edits.
-  Teacher-only batch headings name the affected lesson count. Images remain ordered before then
+  with the short caption “Было → стало”. Images remain ordered before then
   after; no repeated swipe instructions. Legacy single images retain captions.
 - One footer links to the source and names the group; a count is included only
   for multiple changes. The notification explicitly shows the persisted detection timestamp in Moscow
@@ -281,9 +277,10 @@ matching parity and an unambiguous pair. Cross-day or ambiguous changes stay
 removed/added. Merged moves retain both before and after week variants; different
 durations/destinations must not collapse into one entry.
 
-The HTML fallback mirrors the grouped overview, using an expandable blockquote
-for detailed entries. It keeps whole day sections within 4096 characters and
-truncates old/new field values independently.
+The HTML fallback prints each table row as one line (cells joined with « · »,
+old values in `<s>`, new in `<b>`) and the details table inside an expandable
+blockquote. It keeps whole day sections within 4096 characters and truncates
+old/new field values independently.
 Rich output retains its text/block budget and explicitly reports omissions.
 Notification-only wording changes require no dashboard or screenshot version
 bump. They do not retroactively edit old Telegram posts.

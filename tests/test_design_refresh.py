@@ -13,7 +13,7 @@ def flatten(node):
     if isinstance(node, list):
         return "".join(flatten(x) for x in node)
     if isinstance(node, dict):
-        return "".join(flatten(v) for k, v in node.items() if k in {"text", "blocks", "summary", "rich_message"})
+        return "".join(flatten(v) for k, v in node.items() if k in {"text", "blocks", "summary", "rich_message", "cells"})
     return ""
 
 
@@ -27,12 +27,13 @@ def test_missing_teacher_is_information_added_without_fake_replacement():
         payload = build_changes_rich_message(diff, [], "https://example.test")
         validate_rich_payload(payload)
         text = flatten(payload)
-        assert "Указали преподавателя: Иванова Анна Игоревна" in text
+        assert "указали преподавателя" in text and "Иванова Анна Игоревна" in text
         assert "→" not in text and "сменили преподавателя" not in text
         assert "09:00–10:45" in text and "верхняя неделя" in text
-        assert text.count("Иностранный язык") == 1
+        assert text.count("Иностранный язык") == 2  # строка таблицы и подробности
         assert diff == original
-        assert "Указали преподавателя: <b>Иванова Анна Игоревна</b>" in changes_fallback_text(diff, "https://example.test")
+        fallback = changes_fallback_text(diff, "https://example.test")
+        assert "<b>Иванова Анна Игоревна</b>" in fallback and "→" not in fallback
 
 
 def test_language_expansion_consumes_full_word_and_is_idempotent():
@@ -43,16 +44,17 @@ def test_language_expansion_consumes_full_word_and_is_idempotent():
     assert _note_brief({"note": "немец. язык, консультация по согласованию"}) == "немецкий язык, консультация по согласованию"
 
 
-def test_teacher_only_card_keeps_conditions_without_repeating_unchanged_addresses():
+
+def test_teacher_only_row_keeps_week_conditions_and_places_per_week():
     common = {"day": "Вторник", "subject": "История", "time": "11:00 12:00",
               "teacher": "Смирнов", "fields": [["преподаватель", "", "Смирнов"]]}
     diff = {"changed": [{**common, "room": "1318", "location": "Антоново", "note": "по верхней неделе с 14.09"},
                         {**common, "room": "3207", "location": "Другой адрес", "note": "по нижней неделе с 21.09"}]}
     text = flatten(build_changes_rich_message(diff, [], "https://example.test"))
-    assert text.count("Указали преподавателя") == 1
+    assert text.count("указали преподавателя") == 1
     assert "обе недели" in text
     assert "Верхняя неделя: с 14.09" in text and "Нижняя неделя: с 21.09" in text
-    assert "1318" not in text and "Другой адрес" not in text
+    assert "Верхняя неделя: ауд. 1318, Антоново\nНижняя неделя: ауд. 3207, Другой адрес" in text
 
 
 def test_compact_week_badges_preserve_inclusive_exclusive_wording():

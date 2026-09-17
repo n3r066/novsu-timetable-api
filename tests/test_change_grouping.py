@@ -223,3 +223,22 @@ def test_time_less_lesson_does_not_break_day_grouping():
     assert "Проектный день" in blob and "История России" in blob
     text = changes_fallback_text(diff, "https://example.test", now=now)
     assert "Проектный день" in text
+
+
+def test_day_table_is_capped_and_names_the_rest():
+    """При переопубликовании всего расписания день не превращается в простыню:
+    не больше _RICH_DIFF_MAX_ROWS_PER_DAY строк, остальное названо числом."""
+    from format import _RICH_DIFF_MAX_ROWS_PER_DAY, build_changes_rich_message
+    from telegram_api import validate_rich_payload
+
+    cap = _RICH_DIFF_MAX_ROWS_PER_DAY
+    added = [{"day": "Среда", "time": f"{8 + index // 6}:00 {9 + index // 6}:00", "subject": f"Предмет {index}",
+              "room": str(100 + index), "teacher": f"Преподаватель {index}"} for index in range(cap + 5)]
+    rich = build_changes_rich_message({"added": added, "removed": [], "changed": [], "transition": None},
+                                      [], "https://example.test")
+    validate_rich_payload(rich)
+    day = next(b for b in rich["rich_message"]["blocks"] if b["type"] == "details")
+    table, note, details = day["blocks"]
+    assert len(table["cells"]) - 1 == cap
+    assert json.dumps(note, ensure_ascii=False).count("Ещё 5 изменений этого дня не поместились") == 1
+    assert len(details["blocks"][0]["cells"]) - 1 == cap

@@ -48,9 +48,32 @@ def day_sections(payload):
     return [block for block in payload["rich_message"]["blocks"] if block["type"] == "details"]
 
 
-def sentences(payload):
-    return [inner for day in day_sections(payload) for inner in day["blocks"]
-            if inner["type"] == "paragraph"]
+def main_rows(payload):
+    """Строки основных таблиц всех дней (без шапки): список ячеек."""
+    rows = []
+    for day in day_sections(payload):
+        for inner in day["blocks"]:
+            if inner["type"] == "table":
+                rows.extend(row for row in inner["cells"] if not any(cell.get("is_header") for cell in row))
+    return rows
+
+
+def main_cells(payload):
+    return [cell for row in main_rows(payload) for cell in row]
+
+
+def main_text(payload):
+    """Текст поста без содержимого свёрнутых «Подробностей»."""
+    parts = []
+    for day in day_sections(payload):
+        parts.append(text(day["summary"]))
+        for inner in day["blocks"]:
+            if inner["type"] == "details":
+                continue
+            parts.append(text(inner.get("text")) if inner["type"] != "table"
+                         else "\n".join(text(cell["text"]) for row in inner["cells"] for cell in row))
+    return "\n".join(parts)
+
 
 
 def test_reported_single_rename_is_action_first_without_repeated_chrome():
@@ -59,27 +82,28 @@ def test_reported_single_rename_is_action_first_without_repeated_chrome():
     blocks = payload["rich_message"]["blocks"]
     assert blocks[0]["type"] == "details"
     assert blocks[0]["summary"] == "Понедельник (переименовали пару)"
+    # День — таблица правок и свёрнутые подробности, без абзацев-прозы.
+    assert [inner["type"] for inner in blocks[0]["blocks"]] == ["table", "details"]
+    what, lesson, where = main_rows(payload)[0]
+    assert text(what["text"]) == "~\n09:00–10:45"
     # Название печатаем один раз: старое — префикс нового, поэтому показан
     # только подсвеченный добавленный хвост, а не два длинных названия.
-    assert blocks[0]["blocks"][0] == {"type": "paragraph", "text": [
-        "Пару ", "«",
-        {"type": "bold", "text": OLD_NAME},
-        " ",
-        {"type": "marked", "text": "(второй иностранный язык)"},
-        "»", " (", {"type": "italic", "text": "09:00–10:45"}, " · ", "верхняя неделя", ")",
-        " дополнили в названии", ", ауд. 1318 прежняя", ".",
-    ]}
-    main = visible(payload)
+    assert lesson["text"][:4] == [
+        {"type": "bold", "text": OLD_NAME}, " ",
+        {"type": "marked", "text": "(второй иностранный язык)"}, "\n",
+    ]
+    assert {"type": "italic", "text": "верхняя неделя"} in lesson["text"]
+    assert {"type": "italic", "text": "Барышева Ангелина Алексеевна"} in lesson["text"]
+    assert text(where["text"]) == "ауд. 1318, Антоново"
+    main = main_text(payload)
     assert main.count(NEW_NAME) == 1
     assert "Раньше:" not in main
-    assert "немецкий язык" in main
+    assert "немецкий язык" in visible(payload)  # примечание — в подробностях
     for clutter in ("Поменяли расписание", "Коротко", "Что именно поменяли", "1 изменение",
-                    "кто ведёт", "где:", "Пояснения", "место не указано"):
-        assert clutter not in main
+                    "кто ведёт", "где:", "Пояснения", "место не указано", "Пару «", "дополнили"):
+        assert clutter not in visible(payload)
     assert not any(block["type"] in {"pullquote", "blockquote", "expandable_blockquote", "list"}
                    for block in blocks)
-    # Неизменённый преподаватель в пост не попадает.
-    assert "Барышева" not in main
     assert blocks[-1]["type"] == "footer"
 
 
@@ -97,6 +121,7 @@ def test_missing_time_does_not_create_empty_badge_or_invent_date():
     assert "Обнаружено на сайте 04.12.2026 в 00:00:00 МСК" in visible(after)
 
 
+
 def test_upper_lower_locations_are_separate_not_a_room_remote_slash():
     diff = rename_diff()
     other = {**diff["changed"][0], "room": "—", "location": None,
@@ -105,31 +130,34 @@ def test_upper_lower_locations_are_separate_not_a_room_remote_slash():
     original = copy.deepcopy(diff)
     payload = build_changes_rich_message(diff, [], "https://example.test")
     assert diff == original
-    main = visible(payload)
+    assert len(main_rows(payload)) == 1  # верх и низ одной пары — одна строка
+    main = main_text(payload)
     assert main.count(NEW_NAME) == 1
     assert "обе недели" in main
     assert "Верхняя неделя: ауд. 1318, Антоново\nНижняя неделя: ДОТ" in main
     assert "/ дистанционно" not in main and "ауд. —" not in main
 
 
-@pytest.mark.parametrize(("label", "old", "new", "brief", "sentence"), [
-    ("ауд.", "1318", "1331", "сменили аудиторию", "Аудитория: 1318 → 1331"),
-    ("преподаватель", "Петров", "Иванов", "сменили преподавателя", "Преподаватель: Петров → Иванов"),
-    ("формат", "in_person", "remote_or_hybrid", "изменили условия", "Формат: без ДОТ → с использованием ДОТ"),
-    ("ауд.", "1318", "", "сменили аудиторию", "Аудитория: 1318 → не указано"),
+
+@pytest.mark.parametrize(("label", "old", "new", "brief", "delta"), [
+    ("ауд.", "1318", "1331", "сменили аудиторию", "1318 → 1331"),
+    ("преподаватель", "Петров", "Иванов", "сменили преподавателя", "Петров → Иванов"),
+    ("формат", "in_person", "remote_or_hybrid", "изменили условия", "без ДОТ → с использованием ДОТ"),
+    ("ауд.", "1318", "", "сменили аудиторию", "1318 → не указано"),
 ])
-def test_change_kind_has_specific_summary_and_new_value_emphasis(label, old, new, brief, sentence):
+def test_change_kind_has_specific_summary_and_new_value_emphasis(label, old, new, brief, delta):
     diff = rename_diff()
     diff["changed"][0]["fields"] = [[label, old, new]]
     payload = build_changes_rich_message(diff, [], "https://example.test")
     validate_rich_payload(payload)
     days = day_sections(payload)
     assert [day["summary"] for day in days] == [f"Понедельник ({brief})"]
-    change = next(block for block in sentences(payload) if sentence in text(block))
-    styled = [run for run in change["text"] if isinstance(run, dict) and run.get("type") == "bold"]
+    cell = next(cell for cell in main_cells(payload) if delta in text(cell["text"]))
+    styled = [run for run in cell["text"] if isinstance(run, dict) and run.get("type") == "bold"]
     shown_new = {"in_person": "без ДОТ", "remote": "ДОТ",
                  "remote_or_hybrid": "с использованием ДОТ"}.get(new, new) if label == "формат" else new
     assert styled[-1] == {"type": "bold", "text": shown_new or "не указано"}
+    assert {"type": "strikethrough", "text": {"in_person": "без ДОТ"}.get(old, old)} in cell["text"]
     assert "remote_or_hybrid" not in visible(payload)
 
 
@@ -137,7 +165,7 @@ def test_room_change_to_another_building_says_so_and_same_building_stays_silent(
     diff = rename_diff()
     diff["changed"][0]["fields"] = [["ауд.", "1318", "3207"]]
     main = visible(build_changes_rich_message(diff, [], "https://example.test"))
-    assert "Другой корпус: корпус 3 — Б. Санкт-Петербургская, 41" in main
+    assert "другой корпус: корпус 3 — Б. Санкт-Петербургская, 41" in main
     diff["changed"][0]["fields"] = [["ауд.", "418", "415"]]
     main = visible(build_changes_rich_message(diff, [], "https://example.test"))
     assert "другой корпус" not in main
@@ -145,6 +173,7 @@ def test_room_change_to_another_building_says_so_and_same_building_stays_silent(
     # Нечитаемый номер — молчим, корпус не выдумываем.
     diff["changed"][0]["fields"] = [["ауд.", "Спортзал", "3207"]]
     assert "другой корпус" not in visible(build_changes_rich_message(diff, [], "https://example.test"))
+
 
 
 def test_multi_field_change_names_fields_and_flags_building_move():
@@ -157,11 +186,12 @@ def test_multi_field_change_names_fields_and_flags_building_move():
     days = day_sections(payload)
     assert [day["summary"] for day in days] == [
         "Понедельник (сменили преподавателя и аудиторию)"]
-    main = visible(payload)
-    assert "Преподаватель: Барышева Ангелина Алексеевна → " \
-           "Иванова Ольга Петровна\nАудитория: 1318 → 415" in main
+    _what, lesson, where = main_rows(payload)[0]
+    assert text(lesson["text"]).endswith("\nБарышева Ангелина Алексеевна → Иванова Ольга Петровна")
     # 1318 (старый корпус) → 415 (новый): здание другое, кампус тот же.
-    assert "Другой корпус: новый корпус — кампус Антоново" in main
+    assert text(where["text"]) == "1318 → 415\nдругой корпус: новый корпус — кампус Антоново"
+    assert {"type": "strikethrough", "text": "1318"} in where["text"]
+    assert {"type": "bold", "text": "415"} in where["text"]
 
 
 def test_dot_does_not_hide_physical_location_or_unknown_conditions():
@@ -183,6 +213,7 @@ def test_context_conditions_keep_week_specific_association():
     assert "Верхняя неделя: с 14.09\nНижняя неделя: с 21.09" in main
 
 
+
 def test_comment_edit_does_not_repeat_derived_location_and_mode_edits():
     diff = rename_diff()
     diff["changed"][0]["fields"] = [
@@ -191,9 +222,11 @@ def test_comment_edit_does_not_repeat_derived_location_and_mode_edits():
     ]
     payload = build_changes_rich_message(diff, [], "https://example.test")
     main = visible(payload)
-    assert "Условия: Антоново → с использованием ДОТ с 14.09" in main
+    assert "Антоново → с использованием ДОТ с 14.09" in main  # примечание — в подробностях
     assert "изменился формат" not in main and "сменилось место" not in main
     assert main.count("с 14.09") == 1
+    assert "без ДОТ →" not in main  # формат и место выведены из примечания, отдельно не повторяем
+
 
 
 def test_fallback_keeps_same_day_time_move_as_one_action_and_keeps_parity():
@@ -202,9 +235,11 @@ def test_fallback_keeps_same_day_time_move_as_one_action_and_keeps_parity():
     fallback = changes_fallback_text({"removed": [lesson], "added": [{**lesson, "time": "11:00 12:00"}]},
                                      "https://example.test?a=1&b=2")
     assert fallback.count("перенесли пару") == 1
-    assert "Перенесли: <s>09:00–10:45</s> → <b>11:00–12:45</b>" in fallback
+    assert "<s>09:00–10:45</s> → <b>11:00–12:45</b>" in fallback
+    assert "верхняя неделя" in fallback
     assert "убрали" not in fallback and "добавили" not in fallback
     assert len(fallback) <= 4096
+
 
 
 def test_new_field_values_are_used_in_sentence_and_fallback():
@@ -212,12 +247,13 @@ def test_new_field_values_are_used_in_sentence_and_fallback():
     diff["changed"][0]["subject"] = OLD_NAME
     diff["changed"][0]["fields"].append(["ауд.", "1318", "1331"])
     payload = build_changes_rich_message(diff, [], "https://example.test")
-    main = visible(payload)
-    assert "поменялось сразу несколько: название " in main
-    assert "аудитория 1318 → 1331" in main
+    _what, lesson, where = main_rows(payload)[0]
+    # Новое название взято из полей правки, а не из устаревшего контекста.
+    assert {"type": "marked", "text": "(второй иностранный язык)"} in lesson["text"]
+    assert text(where["text"]) == "1318 → 1331"
     fallback = changes_fallback_text(diff, "https://example.test")
-    assert f"<b>{NEW_NAME}</b>" in fallback
-    assert "аудитория <s>1318</s> → <b>1331</b>" in fallback
+    assert f"<b>{NEW_NAME}</b>" in fallback  # подробности печатают текущее название целиком
+    assert "<s>1318</s> → <b>1331</b>" in fallback
 
 
 def test_condition_on_only_one_variant_still_has_week_label():
@@ -236,7 +272,7 @@ def test_fallback_long_old_value_does_not_hide_new_value_or_clearing():
     fallback = changes_fallback_text(diff, "https://example.test")
     assert "→ <b>не указано</b>" in fallback
     assert "<s>&lt;&amp;&gt;" in fallback
-    assert "Условия:" in fallback
+    assert "<blockquote expandable><b>Подробности</b>" in fallback
     assert len(fallback) <= 4096
 
 
@@ -256,8 +292,9 @@ def test_unknown_place_is_not_announced():
     assert "место не указано" not in changes_fallback_text(diff, "https://example.test")
 
 
+
 def test_day_summary_lists_every_change_and_details_hold_the_sentences():
-    """Сводка дня называет обе правки, предложения ждут внутри раздела."""
+    """Сводка дня называет обе правки, таблица — строку на каждую, подробности свёрнуты."""
     diff = {"added": [_lesson(room="301")],
             "removed": [_lesson(subject="Психология", time="09:00 10:00", room="1306", note="")],
             "changed": []}
@@ -265,48 +302,55 @@ def test_day_summary_lists_every_change_and_details_hold_the_sentences():
     validate_rich_payload(payload)
     days = day_sections(payload)
     assert [day["summary"] for day in days] == ["Среда · добавили пару, убрали пару"]
-    summary = [text(block) for block in days[0]["blocks"] if block["type"] == "paragraph"]
-    assert summary == ["Добавили пару:\n• Проектная деятельность", "Убрали пару:\n• Психология"]
+    assert [inner["type"] for inner in days[0]["blocks"]] == ["table", "details"]
+    rows = [[text(cell["text"]) for cell in row] for row in main_rows(payload)]
+    assert rows == [
+        ["+\n17:00–18:45", "Проектная деятельность", "ауд. 301"],
+        ["−\n09:00–10:45", "Психология", "ауд. 1306"],
+    ]
+    _what, _lesson_cell, where = main_rows(payload)[1]
+    assert where["text"] == [{"type": "strikethrough", "text": "ауд. 1306"}]
     details = next(block for block in days[0]["blocks"] if str(block.get("summary", "")).startswith("Подробности"))
     assert not details.get("is_open")
-    sentences_text = [text(block) for block in details["blocks"] if block["type"] == "paragraph"]
-    assert sentences_text == [
-        "Проектная деятельность\n17:00–18:45\nДобавили пару\nауд. 301\nс 10.09",
-        "Психология\n09:00–10:45\nУбрали пару\nауд. 1306",
+    assert details["summary"] == "Подробности: время, недели и примечания"
+    detail_rows = [[text(cell["text"]) for cell in row] for row in details["blocks"][0]["cells"][1:]]
+    assert detail_rows == [
+        ["Проектная деятельность", "17:00–18:45", "с 10.09"],
+        ["Психология", "09:00–10:45", "—"],
     ]
+
 
 
 def test_time_comes_before_the_edit_and_old_value_is_cancelled():
     diff = rename_diff()
     diff["changed"][0]["fields"] = [["ауд.", "1318", "1331"]]
     payload = build_changes_rich_message(diff, [], "https://example.test")
-    sentence = next(block for block in sentences(payload)
-                    if "Аудитория:" in text(block))
-    line = text(sentence)
-    assert line.index("09:00–10:45") < line.index("1318 → 1331")
-    assert {"type": "strikethrough", "text": "1318"} in sentence["text"]
-    assert "У пары" not in line and "\nАудитория:" in line
-    assert {"type": "bold", "text": "1331"} in sentence["text"]
+    what, _lesson_cell, where = main_rows(payload)[0]
+    assert "09:00–10:45" in text(what["text"])  # время — в первой колонке, правка — в последней
+    assert {"type": "strikethrough", "text": "1318"} in where["text"]
+    assert {"type": "bold", "text": "1331"} in where["text"]
+    assert "У пары" not in visible(payload) and "Аудитория:" not in visible(payload)
+
 
 
 def test_placeholder_old_value_is_not_struck_through():
     diff = rename_diff()
     diff["changed"][0]["fields"] = [["ауд.", "", "1331"]]
     payload = build_changes_rich_message(diff, [], "https://example.test")
-    sentence = next(block for block in sentences(payload)
-                    if "Аудитория:" in text(block))
-    assert "Аудитория: 1331" in text(sentence)
-    assert {"type": "strikethrough", "text": "не указано"} not in sentence["text"]
-    assert {"type": "bold", "text": "1331"} in sentence["text"]
+    _what, _lesson_cell, where = main_rows(payload)[0]
+    assert where["text"] == [{"type": "bold", "text": "1331"}]
+    assert "не указано" not in visible(payload)
+
 
 
 def test_highlighted_rename_tail_does_not_add_a_placeholder_line():
     """Хвост подсвечен в названии — отдельной «обновили запись» быть не должно."""
     diff = rename_diff()
-    main = visible(build_changes_rich_message(diff, [], "https://example.test"))
-    assert "обновили на портале" not in main
+    payload = build_changes_rich_message(diff, [], "https://example.test")
+    assert "обновили на портале" not in visible(payload)
     assert "обновили на портале" not in changes_fallback_text(diff, "https://example.test")
-    assert main.count("(второй иностранный язык)") == 1
+    assert main_text(payload).count("(второй иностранный язык)") == 1
+
 
 
 def test_tail_highlight_normalizes_portal_whitespace_before_the_tail():
@@ -316,8 +360,8 @@ def test_tail_highlight_normalizes_portal_whitespace_before_the_tail():
     diff["changed"][0]["subject"] = noisy
     diff["changed"][0]["fields"] = [["предмет", OLD_NAME, noisy]]
     payload = build_changes_rich_message(diff, [], "https://example.test")
-    sentence = next(block for block in sentences(payload) if "дополнили в названии" in text(block))
-    joined = "".join(part if isinstance(part, str) else part["text"] for part in sentence["text"])
+    cell = next(cell for cell in main_cells(payload)
+                if {"type": "marked", "text": "(второй иностранный язык)"} in cell["text"])
+    joined = text(cell["text"])
     assert "\t" not in joined
-    assert NEW_NAME in joined
-    assert {"type": "marked", "text": "(второй иностранный язык)"} in sentence["text"]
+    assert joined.startswith(NEW_NAME)
