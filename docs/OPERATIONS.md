@@ -734,3 +734,67 @@ rich message rather than only local JSON.
   still differ from `/etc/systemd/system`; compare both before deployment.
 - The README is an overview. This runbook and named code functions carry the
   detailed operational contract.
+
+## 20. ОПД by Virtual Group (Thursday Section)
+
+The portal shows «Основы проектной деятельности» as one 14:00 slot for the whole
+group. The real lesson runs per **virtual group (ВГ)**: each student has their
+own dates, block (14:00–15:45 or 16:00–17:45), building, room and teacher. The
+department publishes two public Google files, configured in `config.py`
+(`OPD_SHEET_ID`, `OPD_DOC_ID`, overridable via `NOVSU_OPD_SHEET_ID` /
+`NOVSU_OPD_DOC_ID`):
+
+- the ВГ sheet (CSV export): `ВГ, Фамилия, Имя, Отчество, Группа, …`;
+- the ВГ timetable (Google Doc, **HTML export only**): teacher rows carry
+  `Имя (ауд. N, институт, адрес)`; date headers span two sub-columns each — the
+  left one is the 14:00 block, the right one the 16:00 block. The txt export
+  flattens those sub-columns and mixes up dates, so it must never be used.
+
+`opd.py` responsibilities:
+
+- `parse_doc_tables()` expands rowspan/colspan exactly like the department's
+  reference parser; paragraphs inside a cell are joined with newlines so
+  «101 ВГ» / «занятий не будет» stay separable.
+- `parse_sessions()` reads the «время проведения занятий» row for block
+  starts (falls back to sub-column order), tolerates a lost closing bracket in
+  the teacher cell, repairs a date typo in a repeated header from the first
+  header of the same table, and infers the year closest to today.
+- `build_data()` keeps only members of `DEFAULT_GROUP`; the cache never stores
+  the whole faculty list.
+- `load_opd()` serves `state/opd_cache.json`: refresh after `OPD_CACHE_TTL_S`
+  (6 h); on any failure the previous cache is kept and the next attempt waits
+  `OPD_RETRY_DELAY_S` (30 min). It never raises — the dashboard degrades to its
+  previous shape without the section.
+- `day_view()` builds the per-date view (alphabetical rows with status
+  `session` / `cancelled` / `free`); `late_ends()` returns the end of the last
+  block per date; `presentation_digest()` fingerprints the rows shown for the
+  dashboard week.
+
+Dashboard integration (`post.edit_dashboard_post` → `format`):
+
+- `resolve_dashboard_view(..., late_ends=...)` and `day_is_live(..., late_end=...)`
+  keep Thursday in focus until 17:45 when a group member has a 16:00 block, even
+  though the portal slot ends at 15:45.
+- `dashboard_presentation_fingerprint(fp, view, extra=digest)`: the extra digest
+  is empty without ОПД data, so the fingerprint of a plain dashboard is unchanged.
+- `_opd_section()` renders a collapsed `details` block right after the day
+  table: one table per building (largest first; rows ordered by block —
+  14:00 before 16:00 — then alphabetically: student + ВГ, block time with notes
+  such as «с 15:00», room + institute + teacher), then a «❌ Занятий не будет»
+  line, then source links. No intro paragraph and no data timestamp. The section is strictly about
+  the current week: virtual groups alternate weeks, members who are free today
+  are not listed and no next dates («далее DD.MM») are shown — notes exist only
+  for special cases (cancellation, shifted start). `day_view()` still carries
+  `next_date` per row for the CLI. The «Важно» block skips the ОПД slot: its
+  portal note is just the announcement URL, already linked from the section. The
+  ОПД row of the day table shows «по ВГ · см. раздел ОПД ниже» instead of
+  «место уточняется».
+- Days without a date in the document get no section; after the last document
+  date the section disappears by itself.
+
+Operations: `python3 opd.py [--date YYYY-MM-DD] [--refresh] [--json]` prints the
+view for a date. Run it as `novsu` (`systemd-run --uid=novsu ...`) or `chown`
+the cache afterwards, otherwise the service cannot refresh a root-owned cache.
+`NOVSU_OPD_ENABLED=0` disables the feature. Tests never reach the network: an
+autouse fixture in `tests/conftest.py` blocks `opd._download` and redirects the
+cache path to a temporary directory.

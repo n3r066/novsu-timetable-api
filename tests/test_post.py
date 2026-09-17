@@ -687,3 +687,54 @@ def test_dashboard_rollover_switches_to_next_week_on_sunday(monkeypatch, tmp_pat
     assert seen["target"] == dt.date(2026, 9, 7)
     assert seen["media"] == ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб"]
     assert seen["files"] == [f"site_screenshot_{index}" for index in range(1, 7)]
+
+
+def test_edit_dashboard_post_passes_opd_data_and_extends_fingerprint(monkeypatch, tmp_path):
+    import datetime as dt
+    import json as _json
+    import zoneinfo
+
+    import opd
+
+    fixtures = Path("tests/fixtures")
+    opd_data = opd.build_data(
+        (fixtures / "opd_members.csv").read_text(encoding="utf-8"),
+        (fixtures / "opd_doc.html").read_text(encoding="utf-8"),
+        group="6381", today=dt.date(2026, 9, 17), fetched_at="2026-09-17T10:00:00+03:00",
+    )
+    captured: list[dict] = []
+
+    def fake_builder(*args, **kwargs):
+        captured.append({"args": args, "kwargs": kwargs})
+        return {"rich_message": {"blocks": []}}
+
+    monkeypatch.setattr(post, "build_dashboard_rich_message", fake_builder)
+    monkeypatch.setattr(post, "edit_rich_message", lambda *a, **k: {"ok": True})
+    monkeypatch.setattr(post, "content_fingerprint", lambda data: "FP-1")
+    monkeypatch.setattr(post.opd_module, "load_opd", lambda **kwargs: opd_data)
+    data = {
+        "schedule": {"days": {"Четверг": [
+            {"number": 2, "subject": "(лек/пр.) Основы проектной деятельности", "time": "14:00 15:00",
+             "room": ".", "teacher": "—"},
+        ]}},
+        "weeks": [{"week": 3, "half": "top", "start": "14.09.2026", "end": "19.09.2026"}],
+    }
+    monkeypatch.setattr(post, "parse_all", lambda html: data)
+    state = tmp_path / "state"
+    monkeypatch.setattr(post.config, "STATE_DIR", state)
+
+    # 16:30 четверга: портальная пара ОПД кончилась в 15:45, но блок 16:00 ещё идёт.
+    now = dt.datetime(2026, 9, 17, 16, 30, tzinfo=zoneinfo.ZoneInfo("Europe/Moscow"))
+    result = post.edit_dashboard_post(1, None, html="html", fingerprint="FP-1", now=now, render_screens=False)
+    assert result.get("ok")
+    assert captured[-1]["kwargs"]["opd"] is opd_data
+    assert captured[-1]["args"][3] == dt.date(2026, 9, 17)  # четверг остаётся фокусом
+    with_opd = _json.loads((state / "last_dashboard_post.json").read_text(encoding="utf-8"))
+    assert with_opd["target_date"] == "2026-09-17"
+
+    # Без данных ОПД отпечаток другой: появление раздела перерисовывает закреп.
+    monkeypatch.setattr(post.opd_module, "load_opd", lambda **kwargs: None)
+    post.edit_dashboard_post(1, None, html="html", fingerprint="FP-1", now=now, render_screens=False)
+    assert captured[-1]["kwargs"]["opd"] is None
+    without = _json.loads((state / "last_dashboard_post.json").read_text(encoding="utf-8"))
+    assert without["presentation_fingerprint"] != with_opd["presentation_fingerprint"]

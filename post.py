@@ -53,6 +53,7 @@ from schedule_logic import (  # noqa: E402
 from screenshot import browser_session, screenshot_html, screenshot_schedule_day_crop_items  # noqa: E402
 from portal_parser import day_short, norm_text, render_schedule_day_chunk_htmls  # noqa: E402
 from telegram_api import edit_rich_message  # noqa: E402
+import opd as opd_module  # noqa: E402
 
 SCHEDULE_SCREEN_STYLE_VERSION = 7
 COMPARISON_SCREEN_STYLE_VERSION = 2
@@ -730,6 +731,20 @@ def diff_day_screens(
     return items
 
 
+def _view_dates(view: dict) -> list[dt.date]:
+    """Даты учебной недели закрепа (для отпечатка раздела ОПД)."""
+    week = view.get("week") or {}
+    try:
+        start = dt.datetime.strptime(str(week["start"]), "%d.%m.%Y").date()
+        end = dt.datetime.strptime(str(week["end"]), "%d.%m.%Y").date()
+    except (KeyError, TypeError, ValueError):
+        target = view.get("target_date")
+        return [target] if isinstance(target, dt.date) else []
+    if end < start:
+        return [start]
+    return [start + dt.timedelta(days=offset) for offset in range((end - start).days + 1)]
+
+
 def edit_dashboard_post(
     message_id: int,
     target_date: dt.date | None = None,
@@ -761,14 +776,20 @@ def edit_dashboard_post(
         now_msk = now.replace(tzinfo=tz_msk)
     else:
         now_msk = now.astimezone(tz_msk)
-    view = resolve_dashboard_view(schedule, weeks, now_msk)
+    # ОПД по виртуальным группам: кэш state/opd_cache.json, сеть — по TTL.
+    # Без данных закреп рисуется как раньше; блок 16:00 продлевает «живой» день.
+    opd_data = opd_module.load_opd(now=now_msk)
+    late_ends = opd_module.late_ends(opd_data)
+    view = resolve_dashboard_view(schedule, weeks, now_msk, late_ends=late_ends)
     if target_date is not None and target_date != now_msk.date():
         manual_now = dt.datetime.combine(target_date, dt.time.min, tzinfo=tz_msk)
-        view = resolve_dashboard_view(schedule, weeks, manual_now)
+        view = resolve_dashboard_view(schedule, weeks, manual_now, late_ends=late_ends)
     target_date = view["target_date"]
     current_date = now_msk.date()
     live_days = set(view["live_days"])
-    presentation_fp = dashboard_presentation_fingerprint(fp, view)
+    presentation_fp = dashboard_presentation_fingerprint(
+        fp, view, extra=opd_module.presentation_digest(opd_data, _view_dates(view)),
+    )
     previous_dashboard = _read_json(config.STATE_DIR / "last_dashboard_post.json")
     expects_screens = bool(schedule and live_days)
     screen_cache = _read_json(config.STATE_DIR / "dashboard_screens.json")
@@ -838,6 +859,7 @@ def edit_dashboard_post(
         current_date=current_date,
         now=now_msk,
         last_updated=last_updated,
+        opd=opd_data,
     )
     files = {f"site_screenshot_{index}": item["path"] for index, item in enumerate(shot_items, 1)}
     result = edit_rich_message(

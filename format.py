@@ -11,8 +11,16 @@ import zoneinfo
 from pathlib import Path
 
 import bells
+import opd as opd_module
 from locations import resolve_location
-from schedule_logic import day_is_live, day_view, find_week as find_schedule_week, week_view
+from schedule_logic import (
+    calendar_bounds,
+    day_is_live,
+    day_view,
+    find_week as find_schedule_week,
+    lesson_has_expired,
+    week_view,
+)
 
 WEEK_HALF_NAME = {"top": "верхняя", "bottom": "нижняя"}
 DAY_SHORT_TO_FULL = {
@@ -371,13 +379,26 @@ def _screenshot_block(day_label: str, media: str, is_today: bool, source_url: st
     return details(f"Скрин: {day_label}", _photo(media, caption))
 
 
-def _screenshot_photo(day_label: str, media: str, source_url: str) -> dict:
-    caption = [
-        {"type": "bold", "text": day_label},
-        " · прошедшие разовые занятия скрыты · ",
-        {"type": "url", "text": "полный оригинал", "url": source_url},
-    ]
+def _screenshot_photo(day_label: str, media: str, source_url: str, *, hidden_expired: bool = False) -> dict:
+    """Подпись к скрину дня. Про скрытые прошедшие разовые занятия говорим только
+    когда на этом дне скрин действительно что-то скрыл (см. _day_hides_expired)."""
+    caption: list[object] = [{"type": "bold", "text": day_label}]
+    caption.append(" · прошедшие разовые занятия скрыты · " if hidden_expired else " · ")
+    caption.append({"type": "url", "text": "полный оригинал", "url": source_url})
     return _photo(media, caption)
+
+
+def _day_hides_expired(schedule: dict | None, weeks: list[dict], day_date: dt.date) -> bool:
+    """Есть ли у дня строки, которые скрин закрепа опускает как окончательно
+    прошедшие. Тот же критерий, что у фильтра скриншотов: lesson_has_expired()
+    с границами всего учебного календаря."""
+    week = find_schedule_week(weeks, day_date)
+    if not week:
+        return False
+    bounds = calendar_bounds(weeks)
+    weekday = DAYS_ORDER[day_date.weekday()]
+    rows = ((schedule or {}).get("days") or {}).get(weekday) or []
+    return any(lesson_has_expired(lesson, day_date, week, bounds) for lesson in rows)
 
 
 def _dashboard_title(
@@ -432,16 +453,32 @@ def _dashboard_counts(days: list[dict]) -> tuple[int, int]:
     return len(lessons) - dot, dot
 
 
-def _dashboard_count_line(days: list[dict], *, dropped_past: bool = False) -> dict:
-    in_person, dot = _dashboard_counts(days)
+def _dashboard_count_line(
+    week_days: list[dict],
+    live_days: list[dict] | None = None,
+    *,
+    dropped_past: bool = False,
+) -> dict:
+    """«На неделе: 16 пар · 2 ДОТ»; когда прошедшие дни уже ушли из закрепа —
+    ещё и «осталось: 7 пар», чтобы недельный итог не пропадал к четвергу."""
+    in_person, dot = _dashboard_counts(week_days)
     total = in_person + dot
-    label = "Осталось" if dropped_past else "На неделе"
     parts: list[object] = [
-        {"type": "bold", "text": f"{label}: "},
+        {"type": "bold", "text": "На неделе: "},
         {"type": "bold", "text": f"{total} {_pairs_word(total)}"},
     ]
     if dot:
         parts += ["  ·  ", {"type": "marked", "text": {"type": "bold", "text": f"{dot} ДОТ"}}]
+    if dropped_past and live_days is not None:
+        left_in_person, left_dot = _dashboard_counts(live_days)
+        left = left_in_person + left_dot
+        parts += [
+            "  ·  ",
+            {"type": "bold", "text": "осталось: "},
+            {"type": "bold", "text": f"{left} {_pairs_word(left)}"},
+        ]
+        if left_dot:
+            parts += [f" ({left_dot} ДОТ)"]
     return _rich_paragraph(parts)
 
 
@@ -494,7 +531,11 @@ def _dashboard_note_display(lesson: dict) -> tuple[list[str], str]:
     return [], exceptional
 
 
-def _dashboard_lesson_table(lessons: list[dict]) -> dict:
+#: Портальная пара ОПД — общий слот на всю группу; реальное место в разделе по ВГ.
+_OPD_SUBJECT_RE = re.compile(r"проектн\w*\s+деятельност", re.I)
+
+
+def _dashboard_lesson_table(lessons: list[dict], *, opd_hint: bool = False) -> dict:
     table = _table([[
         ("№", "bold"), ("занятие", "bold"), ("место / время", "bold"),
     ]])
@@ -529,12 +570,20 @@ def _dashboard_lesson_table(lessons: list[dict]) -> dict:
             ]
         else:
             place = _lesson_place(lesson)
-            if place == "—":
-                place = str(lesson.get("location") or "место уточняется")
-            format_line = [{"type": "bold", "text": place}]
-            location = str(lesson.get("location") or "").strip()
-            if location and location.casefold() not in place.casefold():
-                format_line += ["\n", {"type": "italic", "text": location}]
+            if place == "—" and opd_hint and _OPD_SUBJECT_RE.search(subject):
+                # Слот ОПД без аудитории: кто куда идёт — в разделе по ВГ ниже.
+                format_line = [
+                    {"type": "bold", "text": "по ВГ"},
+                    "\n",
+                    {"type": "italic", "text": "см. раздел ОПД ниже"},
+                ]
+            else:
+                if place == "—":
+                    place = str(lesson.get("location") or "место уточняется")
+                format_line = [{"type": "bold", "text": place}]
+                location = str(lesson.get("location") or "").strip()
+                if location and location.casefold() not in place.casefold():
+                    format_line += ["\n", {"type": "italic", "text": location}]
         rows.append([
             _table_cell(index, "code", rowspan=2),
             _table_cell(subject_cell, "plain", rowspan=2),
@@ -544,23 +593,135 @@ def _dashboard_lesson_table(lessons: list[dict]) -> dict:
     return table
 
 
+def _opd_summary(view: dict) -> list[object]:
+    date = dt.date.fromisoformat(view["date"])
+    counts = view["counts"]
+    total = len(view["rows"])
+    return [
+        {"type": "marked", "text": {"type": "bold", "text": "ОПД · ПО ВИРТУАЛЬНЫМ ГРУППАМ"}},
+        f"  ·  {date.strftime('%d.%m')}  ·  идут {counts['session']} из {total}",
+    ]
+
+
+def _opd_table(rows: list[dict], building: str) -> dict:
+    """Таблица одного корпуса: сначала блок 14:00, потом 16:00, внутри блока —
+    по алфавиту. Колонка «куда» — аудитория и институт, преподаватель ниже."""
+    table = _table([[("студент", "bold"), ("время", "bold"), ("куда", "bold")]])
+    cells = table["cells"]
+    ordered = sorted(rows, key=lambda row: (str(row.get("block_start") or ""), row["student"].casefold()))
+    for row in ordered:
+        student_cell: list[object] = [
+            {"type": "bold", "text": row["student"]},
+            "\n",
+            {"type": "code", "text": f"ВГ {row['vg']}"},
+        ]
+        time_cell: list[object] = [{"type": "code", "text": f"{row['block_start']}–{row['block_end']}"}]
+        if row.get("note"):
+            time_cell += ["\n", {"type": "marked", "text": row["note"]}]
+        where = f"ауд. {row['room']}" if row.get("room") else "аудитория уточняется"
+        hint = opd_module.place_hint(row.get("place", ""), building)
+        where_cell: list[object] = [{"type": "bold", "text": where + (f" · {hint}" if hint else "")}]
+        if row.get("teacher_short"):
+            where_cell += ["\n", {"type": "italic", "text": row["teacher_short"]}]
+        cells.append([
+            _table_cell(student_cell, "plain"),
+            _table_cell(time_cell, "plain"),
+            _table_cell(where_cell, "plain"),
+        ])
+    return table
+
+
+def _opd_people_line(label: str, rows: list[dict]) -> dict:
+    names = ", ".join(f"{row['student']} (ВГ {row['vg']})" for row in rows)
+    return _rich_paragraph([{"type": "bold", "text": f"{label}: "}, names])
+
+
+_URL_ONLY_RE = re.compile(r"^\s*https?://\S+\s*$", re.I)
+
+
+def _opd_note_is_redundant(lesson: dict, exceptional: str, opd_view: dict | None) -> bool:
+    """«Важно» для слота ОПД не нужно: ссылка на объявление кафедры уже есть в
+    разделе по ВГ, а голый URL без раздела читателю ничего не говорит.
+    Настоящую текстовую пометку портала без раздела по ВГ оставляем."""
+    if not _OPD_SUBJECT_RE.search(str(lesson.get("subject") or "")):
+        return False
+    return bool(opd_view) or bool(_URL_ONLY_RE.match(exceptional))
+
+
+def _opd_sources(view: dict) -> dict:
+    sources = view.get("sources") or {}
+    parts: list[object] = [{"type": "italic", "text": "Источники: "}]
+    links = [
+        ("таблица ВГ", sources.get("sheet")),
+        ("расписание ВГ", sources.get("doc")),
+        ("объявление кафедры", sources.get("announcement")),
+    ]
+    first = True
+    for text, url in links:
+        if not url:
+            continue
+        if not first:
+            parts.append(" · ")
+        parts.append({"type": "url", "text": text, "url": str(url)})
+        first = False
+    return _rich_paragraph(parts)
+
+
+def _opd_section(view: dict) -> dict:
+    """Сворачиваемый раздел «ОПД по виртуальным группам» для дня закрепа.
+
+    Только про этот день и без пояснений: кто идёт — таблицами по корпусам
+    (внутри сначала 14:00, потом 16:00, далее по алфавиту), у кого занятие
+    отменено, ссылки на источники. Кого нет в таблицах, у того ОПД на этой неделе нет;
+    чужие даты и штампы времени в закреп не попадают.
+    """
+    rows = view["rows"]
+    going = [row for row in rows if row["status"] == "session"]
+    cancelled = [row for row in rows if row["status"] == "cancelled"]
+    blocks: list[dict] = []
+    if going:
+        # По корпусам (крупные первыми), внутри корпуса — сначала 14:00, потом 16:00.
+        by_building: dict[str, list[dict]] = {}
+        for row in going:
+            by_building.setdefault(row.get("building") or "адрес уточняется", []).append(row)
+        ordered = sorted(by_building.items(), key=lambda item: (-len(item[1]), item[0]))
+        for building, people in ordered:
+            blocks.append(_rich_paragraph([
+                {"type": "bold", "text": f"📍 {building}"},
+                f"  ·  {len(people)} чел.",
+            ]))
+            blocks.append(_opd_table(people, building))
+    else:
+        blocks.append(_paragraph(
+            "У группы в этот день ОПД нет: все её виртуальные группы занимаются в другие четверги."
+        ))
+    if cancelled:
+        blocks.append(_opd_people_line("❌ Занятий не будет", cancelled))
+    blocks.append(_opd_sources(view))
+    return _details(_opd_summary(view), *blocks)
+
+
 def _dashboard_day_section(
     day: dict,
     *,
     screenshot_media: str | None = None,
     source_url: str = "",
+    opd_view: dict | None = None,
+    hidden_expired: bool = False,
 ) -> dict:
     lessons = day.get("lessons") or []
     blocks: list[dict] = []
     if not lessons:
         blocks.append(_paragraph("Пар нет."))
     else:
-        blocks.append(_dashboard_lesson_table(lessons))
+        blocks.append(_dashboard_lesson_table(lessons, opd_hint=bool(opd_view)))
+    if opd_view:
+        blocks.append(_opd_section(opd_view))
     notes = [
         (item.get("subject") or "—", exceptional)
         for item in lessons
         for _, exceptional in [_dashboard_note_display(item)]
-        if exceptional
+        if exceptional and not _opd_note_is_redundant(item, exceptional, opd_view)
     ]
     if notes:
         blocks.append(_details(
@@ -570,7 +731,7 @@ def _dashboard_day_section(
     if screenshot_media:
         blocks.append(_details(
             "Скрин с портала · " + dt.date.fromisoformat(day["date"]).strftime("%d.%m"),
-            _screenshot_photo(day["day"], screenshot_media, source_url),
+            _screenshot_photo(day["day"], screenshot_media, source_url, hidden_expired=hidden_expired),
         ))
     return _details(_dashboard_day_summary(day), *blocks)
 
@@ -1255,6 +1416,13 @@ def _time_legend() -> dict:
     ])
 
 
+def _day_date(day: dict) -> dt.date | None:
+    try:
+        return dt.date.fromisoformat(str(day.get("date") or ""))
+    except ValueError:
+        return None
+
+
 def build_dashboard_rich_message(
     schedule: dict | None,
     weeks: list[dict],
@@ -1266,8 +1434,14 @@ def build_dashboard_rich_message(
     current_date: dt.date | None = None,
     now: dt.datetime | None = None,
     last_updated: str = "",
+    opd: dict | None = None,
 ) -> dict:
-    """Build pinned dashboard: diary + current week, date-aware."""
+    """Build pinned dashboard: diary + current week, date-aware.
+
+    ``opd`` — данные виртуальных групп ОПД (``opd.load_opd``): для дней с датой
+    из документа добавляется сворачиваемый раздел, а блок 16:00 держит день в
+    закрепе после конца портальной пары.
+    """
     target_week = find_schedule_week(weeks, target_date)
     # Сервер живёт в UTC, поэтому «сегодня» берём именно по Москве: иначе
     # между 00:00 и 03:00 Мск вчерашний день оставался бы в посте. В варианте
@@ -1297,16 +1471,23 @@ def build_dashboard_rich_message(
                 day_media[day_label] = item["media"]
         # Прошедшие дни из закрепа исчезают, а сегодняшний доживает до конца
         # своей последней пары: в пятницу после пар читатель видит только сб.
+        late_ends = opd_module.late_ends(opd)
         lesson_days = [day for day in week["days"] if day["lessons"]]
-        live_days = [day for day in lesson_days if day_is_live(day, now_msk)]
+        live_days = [
+            day for day in lesson_days
+            if day_is_live(day, now_msk, late_end=late_ends.get(_day_date(day)))
+        ]
         dropped_past = len(live_days) < len(lesson_days)
         if live_days:
-            blocks.append(_dashboard_count_line(live_days, dropped_past=dropped_past))
+            blocks.append(_dashboard_count_line(lesson_days, live_days, dropped_past=dropped_past))
         for day in live_days:
+            day_date = _day_date(day)
             blocks.append(_dashboard_day_section(
                 day,
                 screenshot_media=day_media.get(day["day"]),
                 source_url=source_url,
+                opd_view=opd_module.day_view(opd, day_date) if (opd and day_date) else None,
+                hidden_expired=bool(day_date) and _day_hides_expired(schedule, weeks, day_date),
             ))
         if not live_days:
             blocks.append(_paragraph(

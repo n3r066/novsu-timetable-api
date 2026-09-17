@@ -636,3 +636,34 @@ def test_visible_week_days_hides_today_after_last_pair():
         weeks, friday, friday,
         schedule=schedule, now=dt.datetime(2026, 9, 4, 15, 46),
     ) == ["Суббота"]
+
+
+def test_resolve_dashboard_view_late_end_keeps_today_in_focus():
+    import datetime as _dt
+    import zoneinfo as _zoneinfo
+
+    from schedule_logic import dashboard_presentation_fingerprint, resolve_dashboard_view
+
+    schedule = {"days": {
+        "Четверг": [{"number": 2, "subject": "(лек/пр.) Основы проектной деятельности", "time": "14:00 15:00",
+                     "room": ".", "teacher": "—"}],
+        "Пятница": [{"number": 1, "subject": "Пара", "time": "11:00 12:00", "room": "1", "teacher": "x"}],
+    }}
+    weeks = [{"week": 3, "half": "top", "start": "14.09.2026", "end": "19.09.2026"}]
+    now = _dt.datetime(2026, 9, 17, 16, 30, tzinfo=_zoneinfo.ZoneInfo("Europe/Moscow"))
+
+    plain = resolve_dashboard_view(schedule, weeks, now)
+    assert plain["target_date"] == _dt.date(2026, 9, 18)
+    assert "Четверг" not in plain["live_days"]
+
+    late = resolve_dashboard_view(schedule, weeks, now, late_ends={_dt.date(2026, 9, 17): _dt.time(17, 45)})
+    assert late["target_date"] == _dt.date(2026, 9, 17)
+    assert "Четверг" in late["live_days"] and "Пятница" in late["live_days"]
+
+    ended = resolve_dashboard_view(
+        schedule, weeks, now.replace(hour=17, minute=50), late_ends={_dt.date(2026, 9, 17): _dt.time(17, 45)},
+    )
+    assert ended["target_date"] == _dt.date(2026, 9, 18)
+
+    assert dashboard_presentation_fingerprint("fp", late) == dashboard_presentation_fingerprint("fp", late, extra="")
+    assert dashboard_presentation_fingerprint("fp", late) != dashboard_presentation_fingerprint("fp", late, extra="opd-1")

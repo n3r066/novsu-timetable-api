@@ -36,3 +36,14 @@ def _production_state_untouched():
         if path.suffix == ".html" and b"portal.novsu.ru" not in text and b"novsu" not in text.lower():
             pytest.fail(f"test suite overwrote production file {path.relative_to(_ROOT)}")
 
+
+@pytest.fixture(autouse=True)
+def _opd_offline(monkeypatch, tmp_path):
+    """Тесты не ходят в Google за файлами ОПД и не трогают state/opd_cache.json."""
+    import opd
+
+    def _blocked(url: str) -> str:
+        raise RuntimeError(f"network disabled in tests: {url}")
+
+    monkeypatch.setattr(opd, "_download", _blocked)
+    monkeypatch.setattr(opd, "_cache_path", lambda: tmp_path / "opd_cache.json")

@@ -7,7 +7,7 @@ import json
 import re
 import zoneinfo
 
-DASHBOARD_PRESENTATION_VERSION = 11
+DASHBOARD_PRESENTATION_VERSION = 18
 from typing import Any
 
 import bells
@@ -144,6 +144,7 @@ def visible_week_days(
     *,
     schedule: dict | None = None,
     now: dt.datetime | None = None,
+    late_ends: dict[dt.date, dt.time] | None = None,
 ) -> list[str]:
     """Дни учебной недели фокуса, которые ещё видны в закрепе.
 
@@ -173,7 +174,7 @@ def visible_week_days(
         # Сегодня: вариант 2 — после конца последней пары день тоже уезжает.
         if schedule is not None and now is not None:
             _, lessons = lessons_for_date(schedule, weeks, day_date)
-            end = day_last_pair_end(lessons)
+            end = _merge_end(day_last_pair_end(lessons), (late_ends or {}).get(day_date))
             if end is not None and now.time() >= end:
                 continue
         live.append(DAY_BY_INDEX[day_date.weekday()])
@@ -184,8 +185,14 @@ def resolve_dashboard_view(
     schedule: dict | None,
     weeks: list[dict],
     now: dt.datetime | None = None,
+    *,
+    late_ends: dict[dt.date, dt.time] | None = None,
 ) -> dict:
-    """Resolve the next useful dashboard date and its still-live lesson days."""
+    """Resolve the next useful dashboard date and its still-live lesson days.
+
+    ``late_ends`` — концы занятий вне сетки портала по датам (блок ОПД 16:00):
+    сегодняшний день остаётся фокусом, пока такой блок не закончился.
+    """
     tz = zoneinfo.ZoneInfo("Europe/Moscow")
     if now is None:
         current = dt.datetime.now(tz)
@@ -206,7 +213,7 @@ def resolve_dashboard_view(
             if cursor != current.date():
                 target_date = cursor
                 break
-            end = day_last_pair_end(lessons)
+            end = _merge_end(day_last_pair_end(lessons), (late_ends or {}).get(cursor))
             if end is None or current.time() < end:
                 target_date = cursor
                 break
@@ -221,12 +228,18 @@ def resolve_dashboard_view(
         current.date(),
         schedule=schedule,
         now=current,
+        late_ends=late_ends,
     )
     return {"target_date": target_date, "week": week, "live_days": live_days}
 
 
-def dashboard_presentation_fingerprint(content_fingerprint: str, view: dict) -> str:
-    """Hash only values whose change requires editing the pinned post."""
+def dashboard_presentation_fingerprint(content_fingerprint: str, view: dict, extra: str = "") -> str:
+    """Hash only values whose change requires editing the pinned post.
+
+    ``extra`` — отпечаток данных вне портала, которые тоже рисуются в закрепе
+    (раздел ОПД по ВГ). Пустая строка не меняет отпечаток: без таких данных
+    закреп не перерисовывается зря.
+    """
     week = view.get("week") or {}
     payload = {
         "version": DASHBOARD_PRESENTATION_VERSION,
@@ -235,6 +248,8 @@ def dashboard_presentation_fingerprint(content_fingerprint: str, view: dict) -> 
         "week": {key: week.get(key) for key in ("week", "half", "start", "end")},
         "live_days": list(view.get("live_days") or []),
     }
+    if extra:
+        payload["extra"] = extra
     raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
@@ -858,10 +873,21 @@ def day_last_pair_end(lessons: list[dict]) -> dt.time | None:
     return max(ends) if ends else None
 
 
-def day_is_live(day: dict, now: dt.datetime) -> bool:
+def _merge_end(end: dt.time | None, late_end: dt.time | None) -> dt.time | None:
+    """Конец дня с учётом занятий вне сетки портала (ОПД по ВГ до 17:45)."""
+    if late_end is None:
+        return end
+    if end is None:
+        return late_end
+    return max(end, late_end)
+
+
+def day_is_live(day: dict, now: dt.datetime, *, late_end: dt.time | None = None) -> bool:
     """День ещё виден: прошедшие скрыты, сегодня — пока идёт последняя пара.
 
     ``now`` — локальное московское время (naive) или осведомлённое о зоне.
+    ``late_end`` — конец занятий, которых нет в сетке портала (блок ОПД 16:00):
+    пока он не прошёл, день остаётся в закрепе.
     """
     try:
         when = dt.date.fromisoformat(str(day.get("date") or ""))
@@ -871,7 +897,7 @@ def day_is_live(day: dict, now: dt.datetime) -> bool:
         return False
     if when > now.date():
         return True
-    end = day_last_pair_end(day.get("lessons") or [])
+    end = _merge_end(day_last_pair_end(day.get("lessons") or []), late_end)
     if end is None:
         return True  # без читаемых пар день не скрываем: иначе пустой пост
     return now.time() < end

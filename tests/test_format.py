@@ -242,7 +242,9 @@ def test_dashboard_rich_message_has_week_section():
     assert "Среда" not in blob  # diary removed; 0-lesson day hidden from week view
     assert "полный оригинал" in blob
     assert "Скрин с портала · 03.09" in blob
-    assert "прошедшие разовые занятия скрыты" in blob
+    # В этой фикстуре на четверг нет прошедших разовых пар, значит и фразы о скрытых нет.
+    assert "прошедшие разовые занятия скрыты" not in blob
+    assert "полный оригинал" in blob
     assert '"text": "полный оригинал"' in blob
     assert '"type": "photo"' in blob
     assert '"header"' not in blob
@@ -1273,9 +1275,9 @@ def test_dashboard_drops_past_days_after_midnight_msk():
     ]
     assert "Четверг" not in json.dumps(rm, ensure_ascii=False)
     blob = json.dumps(rm, ensure_ascii=False)
-    # Подпись раздела не обещает полное расписание, если часть дней уже прошла.
-    assert "Осталось:" in blob
-    assert "На неделе:" not in blob
+    # Недельный итог остаётся, а к нему добавляется, сколько ещё впереди.
+    assert '"На неделе: "' in blob
+    assert '"осталось: "' in blob and '"2 пары"' in blob
 
 
 def test_dashboard_says_week_is_over_when_every_day_is_past():
@@ -1338,3 +1340,184 @@ def test_dashboard_today_disappears_after_last_pair():
     assert [s for s in _dashboard_day_summaries(after) if "Скрин" not in s] == [
         "СУББОТА · 05.09  ·  1 пара",
     ]
+
+
+# --- ОПД по виртуальным группам в закрепе -----------------------------------
+
+_OPD_SCHEDULE = {"days": {"Четверг": [
+    {"number": 1, "subject": "(пр.) География туризма\nИГУМ, Антоново", "time": "9:00 10:00",
+     "room": "418", "teacher": "Ефимов Олег Николаевич", "note": "ИГУМ, Антоново", "location": "ИГУМ, Антоново"},
+    {"number": 2, "subject": "(лек/пр.) Основы проектной деятельности с 10.09.", "time": "14:00 15:00",
+     "room": ".", "teacher": "—", "note": "https://portal.novsu.ru/study/newUniversity/i.1531736/?id=1651915"},
+]}}
+_OPD_WEEKS = [{"week": 3, "half": "top", "start": "14.09.2026", "end": "19.09.2026"}]
+
+
+def _opd_fixture() -> dict:
+    import opd
+
+    fixtures = Path("tests/fixtures")
+    return opd.build_data(
+        (fixtures / "opd_members.csv").read_text(encoding="utf-8"),
+        (fixtures / "opd_doc.html").read_text(encoding="utf-8"),
+        group="6381",
+        today=dt.date(2026, 9, 17),
+        fetched_at="2026-09-17T10:00:00+03:00",
+    )
+
+
+def test_dashboard_thursday_has_opd_section_by_buildings():
+    import json
+
+    rm = build_dashboard_rich_message(
+        _OPD_SCHEDULE, _OPD_WEEKS, "https://example.test", dt.date(2026, 9, 17),
+        current_date=dt.date(2026, 9, 14), opd=_opd_fixture(),
+    )
+    validate_rich_payload(rm)
+    blob = json.dumps(rm, ensure_ascii=False)
+    assert "ОПД · ПО ВИРТУАЛЬНЫМ ГРУППАМ" in blob
+    assert "идут 6 из 10" in blob
+    # По корпусам, внутри корпуса сначала 14:00, потом 16:00.
+    for building in ("📍 Антоново", "📍 ул. Псковская, 3", "📍 ул. Советской Армии, 7"):
+        assert building in blob
+    assert "🕑" not in blob
+    assert "Жукова К. А." in blob and "ВГ 118" in blob and '"16:00–17:45"' in blob and '"14:00–15:45"' in blob
+    assert blob.index("Елисеев А. Д.") < blob.index("Жукова К. А.")  # 14:00 раньше 16:00 в Антоново
+    assert "ауд. 402 · ИЭ" in blob and "Трезорова О. Ю." in blob
+    assert "ауд. 106хк · ХТИ" in blob and "рядом с" not in blob
+    assert '"время"' in blob
+    # Метка и список лежат в разных фрагментах rich-текста.
+    assert '"❌ Занятий не будет: "' in blob
+    assert "Алексеева А. П. (ВГ 101), Борисов Г. О. (ВГ 102)" in blob
+    # Только про эту неделю: ни чужих дат, ни списка тех, кто идёт в другой четверг.
+    assert "Волкова М. И." not in blob and "Кузнецов Н. Р." not in blob
+    assert "Идут 24.09" not in blob and "далее" not in blob and "остальные" not in blob
+    # Без пояснений и штампов: только таблицы, отмены и источники.
+    assert "Занятие идёт по виртуальным группам" not in blob
+    assert "Данные из документов" not in blob
+    # Ссылка на объявление у слота ОПД не рождает «Важно · 1».
+    assert "Важно" not in blob
+    assert '"text": "с 15:00"' in blob
+    assert "см. раздел ОПД ниже" in blob  # слот ОПД в таблице дня ведёт к разделу
+    assert "место уточняется" not in blob
+    assert "docs.google.com/document/" in blob and "docs.google.com/spreadsheets/" in blob
+
+
+def test_dashboard_without_opd_data_is_unchanged():
+    import json
+
+    rm = build_dashboard_rich_message(
+        _OPD_SCHEDULE, _OPD_WEEKS, "https://example.test", dt.date(2026, 9, 17),
+        current_date=dt.date(2026, 9, 14),
+    )
+    validate_rich_payload(rm)
+    blob = json.dumps(rm, ensure_ascii=False)
+    assert "ОПД · ПО" not in blob and "см. раздел ОПД" not in blob
+    assert "место уточняется" in blob
+    assert "Важно" not in blob  # голый URL объявления не показываем и без раздела
+
+
+def test_dashboard_opd_real_portal_note_survives_without_opd_data():
+    import json
+
+    schedule = {"days": {"Четверг": [
+        {"number": 2, "subject": "(лек/пр.) Основы проектной деятельности", "time": "14:00 15:00",
+         "room": ".", "teacher": "—", "note": "занятие переносится, см. объявление кафедры"},
+    ]}}
+    rm = build_dashboard_rich_message(
+        schedule, _OPD_WEEKS, "https://example.test", dt.date(2026, 9, 17), current_date=dt.date(2026, 9, 14),
+    )
+    assert "Важно · 1" in json.dumps(rm, ensure_ascii=False)
+
+
+def test_dashboard_opd_second_block_keeps_thursday_live():
+    import json
+    import zoneinfo
+
+    msk = zoneinfo.ZoneInfo("Europe/Moscow")
+
+    def _blob(now: dt.datetime, **kwargs) -> str:
+        return json.dumps(build_dashboard_rich_message(
+            _OPD_SCHEDULE, _OPD_WEEKS, "https://example.test", dt.date(2026, 9, 17), now=now, **kwargs,
+        ), ensure_ascii=False)
+
+    during_second_block = dt.datetime(2026, 9, 17, 16, 30, tzinfo=msk)
+    assert "ЧЕТВЕРГ · 17.09" in _blob(during_second_block, opd=_opd_fixture())
+    assert "ЧЕТВЕРГ · 17.09" not in _blob(during_second_block)  # портальная пара кончилась в 15:45
+    after_second_block = dt.datetime(2026, 9, 17, 17, 50, tzinfo=msk)
+    assert "ЧЕТВЕРГ · 17.09" not in _blob(after_second_block, opd=_opd_fixture())
+
+
+def test_dashboard_opd_section_absent_on_days_outside_document():
+    import json
+
+    weeks = [{"week": 12, "half": "top", "start": "16.11.2026", "end": "21.11.2026"}]
+    rm = build_dashboard_rich_message(
+        _OPD_SCHEDULE, weeks, "https://example.test", dt.date(2026, 11, 19),
+        current_date=dt.date(2026, 11, 16), opd=_opd_fixture(),
+    )
+    blob = json.dumps(rm, ensure_ascii=False)
+    assert "ОПД · ПО" not in blob and "место уточняется" in blob
+
+
+def test_screenshot_caption_mentions_hidden_rows_only_when_day_has_expired_lesson():
+    import json
+
+    weeks = [
+        {"week": 1, "half": "top", "start": "01.09.2026", "end": "05.09.2026"},
+        {"week": 2, "half": "bottom", "start": "07.09.2026", "end": "12.09.2026"},
+        {"week": 3, "half": "top", "start": "14.09.2026", "end": "19.09.2026"},
+    ]
+    schedule = {"days": {
+        "Четверг": [
+            {"number": 1, "subject": "(пр.) География туризма", "time": "9:00 10:00", "room": "418",
+             "teacher": "Ефимов Олег Николаевич", "note": "ИГУМ, Антоново", "location": "ИГУМ, Антоново"},
+            {"number": 3, "subject": "(пр.) География туризма", "time": "17:00 18:00", "room": "418",
+             "teacher": "Ефимов Олег Николаевич", "note": "только 03.09. Антоново"},
+        ],
+        "Пятница": [
+            {"number": 3, "subject": "(лек./пр.) Культурно-исторические центры", "time": "11:00 12:00",
+             "room": "1310", "teacher": "Иванов Иван Иванович", "note": ""},
+        ],
+    }}
+    screenshots = [
+        {"label": "Чт", "media": "attach://site_screenshot_1"},
+        {"label": "Пт", "media": "attach://site_screenshot_2"},
+    ]
+    rm = build_dashboard_rich_message(
+        schedule, weeks, "https://example.test", dt.date(2026, 9, 17),
+        screenshot_media=screenshots, current_date=dt.date(2026, 9, 14),
+    )
+    validate_rich_payload(rm)
+    captions = {}
+    def walk(blocks):
+        for block in blocks:
+            if block.get("type") == "photo":
+                text = block["caption"]["text"]
+                captions[text[0]["text"]] = "".join(t if isinstance(t, str) else t["text"] for t in text)
+            walk(block.get("blocks") or [])
+    walk(rm["rich_message"]["blocks"])
+    # Четверг: разовая пара «только 03.09» уже прошла и на скрине скрыта.
+    assert "прошедшие разовые занятия скрыты" in captions["Четверг"]
+    # Пятница: скрывать нечего — подпись без этой фразы.
+    assert "прошедшие разовые занятия скрыты" not in captions["Пятница"]
+    assert captions["Пятница"] == "Пятница · полный оригинал"
+
+
+def test_opd_building_table_orders_by_time_before_alphabet():
+    import json
+
+    from format import _opd_section
+
+    row = {"status": "session", "room": "1", "place": "ИЭ, Антоново", "building": "Антоново",
+           "teacher": "Иванов Иван Иванович", "teacher_short": "Иванов И. И.", "note": ""}
+    view = {
+        "date": "2026-09-17", "group": "6381", "fetched_at": "", "sources": {},
+        "counts": {"session": 2, "cancelled": 0, "free": 0},
+        "rows": [
+            {**row, "student": "Антонов А. А.", "vg": "106", "block_start": "16:00", "block_end": "17:45"},
+            {**row, "student": "Яковлев Я. Я.", "vg": "105", "block_start": "14:00", "block_end": "15:45"},
+        ],
+    }
+    blob = json.dumps(_opd_section(view), ensure_ascii=False)
+    assert blob.index("Яковлев Я. Я.") < blob.index("Антонов А. А.")

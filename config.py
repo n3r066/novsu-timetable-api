@@ -267,3 +267,24 @@ CHROMIUM_BIN = os.environ.get("NOVSU_CHROMIUM_BIN") or next(
 # Chrome требует записываемый HOME (crashpad, профиль). Держим его внутри state/,
 # потому что только state/ доступен на запись сервису с ProtectSystem=strict.
 BROWSER_HOME = STATE_DIR / ".chrome-home"
+
+# --- ОПД («Основы проектной деятельности»): виртуальные группы 1 курса ---
+# Два открытых Google-файла кафедры: таблица ВГ (ФИО → номер ВГ → группа) и
+# расписание ВГ (ВГ → даты, блок 14:00/16:00, аудитория, преподаватель).
+# Раздел в закрепе выключается NOVSU_OPD_ENABLED=0.
+OPD_ENABLED = os.environ.get("NOVSU_OPD_ENABLED", "1").strip() not in ("0", "false", "False", "")
+OPD_SHEET_ID = os.environ.get("NOVSU_OPD_SHEET_ID", "1j-bUhR7bM8y1zL-5emm86sD9V9aErs6Ek8oE9DSn9rA")
+OPD_DOC_ID = os.environ.get("NOVSU_OPD_DOC_ID", "1SjO4xHcz-I34hYb4RHUTYsVXdiz96iUcZAas_J3fXFQ")
+OPD_SHEET_CSV_URL = f"https://docs.google.com/spreadsheets/d/{OPD_SHEET_ID}/export?format=csv"
+OPD_SHEET_VIEW_URL = f"https://docs.google.com/spreadsheets/d/{OPD_SHEET_ID}/"
+# Только HTML-экспорт: в txt подколонки 14:00/16:00 склеиваются (см. opd.py).
+OPD_DOC_HTML_URL = f"https://docs.google.com/document/d/{OPD_DOC_ID}/export?format=html"
+OPD_DOC_VIEW_URL = f"https://docs.google.com/document/d/{OPD_DOC_ID}/"
+OPD_ANNOUNCEMENT_URL = os.environ.get(
+    "NOVSU_OPD_ANNOUNCEMENT_URL",
+    "https://portal.novsu.ru/study/newUniversity/i.1531736/?id=1651915",
+)
+# Кэш state/opd_cache.json: обновление раз в 6 часов, после отказа Google —
+# повтор не раньше чем через 30 минут, а не каждый трёхминутный цикл.
+OPD_CACHE_TTL_S = max(0.0, float(os.environ.get("NOVSU_OPD_CACHE_TTL", str(6 * 3600))))
+OPD_RETRY_DELAY_S = max(0.0, float(os.environ.get("NOVSU_OPD_RETRY_DELAY", str(30 * 60))))
