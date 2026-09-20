@@ -406,6 +406,7 @@ def _dashboard_title(
     target_date: dt.date,
     target_week: dict | None,
     last_updated: str,
+    schedule_changed: str = "",
 ) -> dict:
     parts: list[object] = [
         {"type": "bold", "text": f"Расписание · группа {group_name}"},
@@ -439,6 +440,8 @@ def _dashboard_title(
         parts += ["\n", target_date.strftime("%d.%m.%Y")]
     if last_updated:
         parts += ["\n", {"type": "italic", "text": f"Обновлено: {last_updated} МСК"}]
+    if schedule_changed and schedule_changed != last_updated:
+        parts += ["\n", {"type": "italic", "text": f"Расписание: {schedule_changed} МСК"}]
     return _pullquote(parts)
 
 
@@ -1460,6 +1463,7 @@ def build_dashboard_rich_message(
     current_date: dt.date | None = None,
     now: dt.datetime | None = None,
     last_updated: str = "",
+    schedule_changed: str = "",
     opd: dict | None = None,
 ) -> dict:
     """Build pinned dashboard: diary + current week, date-aware.
@@ -1481,7 +1485,7 @@ def build_dashboard_rich_message(
         now_msk = dt.datetime.now(zoneinfo.ZoneInfo("Europe/Moscow"))
     current_date = current_date or now_msk.date()
 
-    blocks: list[dict] = [_dashboard_title(group_name, target_date, target_week, last_updated)]
+    blocks: list[dict] = [_dashboard_title(group_name, target_date, target_week, last_updated, schedule_changed)]
 
     if target_week:
         week = week_view(schedule, weeks, target_week, group=group_name, source_url=source_url)

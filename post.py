@@ -827,9 +827,14 @@ def edit_dashboard_post(
         {"label": item["label"], "media": f"attach://site_screenshot_{index}"}
         for index, item in enumerate(shot_items, 1)
     ]
-    # Читаем дату последнего изменения из monitor_state.json
+    # «Обновлено» в закрепе — это время фактического редактирования поста,
+    # а не время изменения расписания на портале. При ролловере (новая
+    # неделя, новые дни) пост обновляется, и дата в заголовке должна это
+    # отражать. Время последнего изменения самого расписания показываем
+    # отдельно, если оно отличается от времени поста.
+    last_updated = now_msk.strftime("%d.%m.%Y %H:%M")
+    schedule_changed = ""
     monitor_state_path = config.STATE_DIR / "monitor_state.json"
-    last_updated = ""
     if monitor_state_path.exists():
         try:
             monitor_data = json.loads(monitor_state_path.read_text(encoding="utf-8"))
@@ -839,11 +844,10 @@ def edit_dashboard_post(
             event = monitor_data.get("last_change_event") or monitor_data.get("event", {})
             ts = event.get("ts", "")
             if ts:
-                # Формат: 2026-08-27T15:45:25+00:00 -> 27.08.2026 15:45
                 try:
                     dt_obj = dt.datetime.fromisoformat(ts.replace("Z", "+00:00"))
                     dt_obj = dt_obj.astimezone(zoneinfo.ZoneInfo("Europe/Moscow"))
-                    last_updated = dt_obj.strftime("%d.%m.%Y %H:%M")
+                    schedule_changed = dt_obj.strftime("%d.%m.%Y %H:%M")
                 except ValueError:
                     pass
         except Exception:
@@ -859,6 +863,7 @@ def edit_dashboard_post(
         current_date=current_date,
         now=now_msk,
         last_updated=last_updated,
+        schedule_changed=schedule_changed,
         opd=opd_data,
     )
     files = {f"site_screenshot_{index}": item["path"] for index, item in enumerate(shot_items, 1)}
