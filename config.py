@@ -143,6 +143,15 @@ def _optional_int(name: str) -> int | None:
 TG_CHANNEL_ID = _optional_int("TG_CHANNEL_ID")
 TG_DM_TARGET = _optional_int("TG_DM_TARGET")
 
+# Чат группы для эфемерных команд group_bot (Bot API id, например -100...).
+TG_GROUP_CHAT_ID = _optional_int("NOVSU_GROUP_CHAT_ID")
+
+# Через сколько секунд group_bot удаляет свой ответ и команду (эфемерность).
+try:
+    GROUP_BOT_TTL_S = float(os.environ.get("NOVSU_GROUP_BOT_TTL", "90"))
+except ValueError:
+    GROUP_BOT_TTL_S = 90.0
+
 # Только полные Chromium UA: портал отсекает короткие python-UA.
 _FALLBACK_UA_POOL = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "

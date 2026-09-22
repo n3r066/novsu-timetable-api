@@ -407,6 +407,7 @@ def _dashboard_title(
     target_week: dict | None,
     last_updated: str,
     schedule_changed: str = "",
+    sleep_note: str = "",
 ) -> dict:
     parts: list[object] = [
         {"type": "bold", "text": f"Расписание · группа {group_name}"},
@@ -442,6 +443,8 @@ def _dashboard_title(
         parts += ["\n", {"type": "italic", "text": f"Обновлено: {last_updated} МСК"}]
     if schedule_changed and schedule_changed != last_updated:
         parts += ["\n", {"type": "italic", "text": f"Расписание: {schedule_changed} МСК"}]
+    if sleep_note:
+        parts += ["\n", {"type": "marked", "text": sleep_note}]
     return _pullquote(parts)
 
 
@@ -623,9 +626,52 @@ def _opd_person_summary(row: dict, building: str) -> list[object]:
     return parts
 
 
+def _opd_group_sort_key(group: object) -> tuple:
+    """Учебные группы: числовые по значению, затем текстовые, пустые в конец.
+
+    «02» и «2» — разные подписи и никогда не сливаются: сортировка по точной
+    строке, а не по одному числу.
+    """
+    label = str(group or "").strip()
+    if label.isdigit():
+        return (0, int(label), label)
+    if label:
+        return (1, label)
+    return (2, "")
+
+
+def _opd_mates_table(people: list[dict]) -> dict:
+    """Таблица «ФИО · Группа»: одногруппники идут подряд по алфавиту, их номер
+    группы — одна объединённая ячейка (rowspan); пустые группы не сливаются."""
+    ordered = sorted(
+        people,
+        key=lambda mate: (_opd_group_sort_key(mate.get("group")), str(mate.get("student") or "")),
+    )
+    cells = [[
+        _table_cell("ФИО", "bold", is_header=True),
+        _table_cell("Группа", "bold", is_header=True),
+    ]]
+    index = 0
+    while index < len(ordered):
+        label = str(ordered[index].get("group") or "").strip()
+        end = index + 1
+        if label:
+            while end < len(ordered) and str(ordered[end].get("group") or "").strip() == label:
+                end += 1
+        run = ordered[index:end]
+        cells.append([
+            _table_cell(run[0]["student"], "plain"),
+            _table_cell(run[0].get("group"), "plain", rowspan=len(run) if len(run) > 1 else None),
+        ])
+        cells.extend([[_table_cell(extra["student"], "plain")] for extra in run[1:]])
+        index = end
+    return {"type": "table", "cells": cells, "is_bordered": True, "is_striped": True}
+
+
 def _opd_mates_blocks(row: dict) -> list[dict]:
-    """Состав виртуальной группы студента: одногруппники по ВГ из других групп,
-    сгруппированные по институту (крупные первыми), с корпусом института."""
+    """Состав ВГ: раскрытый раздел «Вместе в ВГ N», внутри — раскрытый раздел на
+    каждый институт с таблицей «ФИО · Группа»; крупные институты первыми,
+    каждый одногруппник занимает отдельную строку."""
     mates = row.get("mates") or []
     if not mates:
         return [_paragraph("Состав виртуальной группы в таблице кафедры пока не найден.")]
@@ -633,10 +679,7 @@ def _opd_mates_blocks(row: dict) -> list[dict]:
     for mate in mates:
         by_institute.setdefault(str(mate.get("institute") or ""), []).append(mate)
     ordered = sorted(by_institute.items(), key=lambda item: (item[0] == "", -len(item[1]), item[0]))
-    blocks: list[dict] = [_rich_paragraph([
-        {"type": "bold", "text": f"Вместе в ВГ {row['vg']}"},
-        f"  ·  {len(mates)} чел. из других групп",
-    ])]
+    sections: list[dict] = []
     for short, people in ordered:
         title = short or "институт не определён"
         full = opd_module.INSTITUTE_NAMES.get(short)
@@ -645,9 +688,8 @@ def _opd_mates_blocks(row: dict) -> list[dict]:
             title += f" · {full}"
         if building:
             title += f" · {building}"
-        names = ", ".join(f"{person['student']} ({person['group']})" for person in people)
-        blocks.append(_rich_paragraph([{"type": "bold", "text": title + ": "}, names]))
-    return blocks
+        sections.append(_details_open(title, _opd_mates_table(people)))
+    return [_details_open(f"Вместе в ВГ {row['vg']}  ·  {len(mates)} чел. из других групп", *sections)]
 
 
 def _opd_building_section(building: str, people: list[dict]) -> dict:
@@ -1465,6 +1507,7 @@ def build_dashboard_rich_message(
     last_updated: str = "",
     schedule_changed: str = "",
     opd: dict | None = None,
+    sleep_note: str = "",
 ) -> dict:
     """Build pinned dashboard: diary + current week, date-aware.
 
@@ -1485,7 +1528,7 @@ def build_dashboard_rich_message(
         now_msk = dt.datetime.now(zoneinfo.ZoneInfo("Europe/Moscow"))
     current_date = current_date or now_msk.date()
 
-    blocks: list[dict] = [_dashboard_title(group_name, target_date, target_week, last_updated, schedule_changed)]
+    blocks: list[dict] = [_dashboard_title(group_name, target_date, target_week, last_updated, schedule_changed, sleep_note)]
 
     if target_week:
         week = week_view(schedule, weeks, target_week, group=group_name, source_url=source_url)
@@ -3205,19 +3248,17 @@ def _day_details_table(entries: list[tuple[str, dict, dict | None]]) -> dict:
 
 
 def _day_change_blocks(entries: list[tuple[str, dict, dict | None]]) -> list[dict]:
-    """Тело раздела дня: таблица правок и свёрнутые подробности таблицей.
+    """Тело раздела дня: таблица правок.
 
     Основная таблица: знак и время, занятие с преподавателем, где. Старые
-    значения зачёркнуты, новые жирным. В «Подробностях» — время, недели и
-    примечания каждой пары. Больше _RICH_DIFF_MAX_ROWS_PER_DAY строк не
-    печатаем: при переопубликовании всего расписания пост остался бы читаемым.
+    значения зачёркнуты, новые жирным. Больше _RICH_DIFF_MAX_ROWS_PER_DAY строк
+    не печатаем: при переопубликовании всего расписания пост остался бы читаемым.
     """
     shown = entries[:_RICH_DIFF_MAX_ROWS_PER_DAY]
     blocks: list[dict] = [_day_change_table(shown)]
     hidden = len(entries) - len(shown)
     if hidden > 0:
         blocks.append(_paragraph(f"Ещё {hidden} {_changes_word(hidden)} этого дня не поместились — смотри портал."))
-    blocks.append(_details("Подробности: время, недели и примечания", _day_details_table(shown)))
     return blocks
 
 
@@ -3295,9 +3336,8 @@ def build_changes_rich_message(
         blocks: list[dict] = []
         if now is not None:
             blocks.append(_heading(
-                _as_msk(now).strftime("Обнаружено на сайте %d.%m.%Y в %H:%M:%S МСК"), 3,
+                _as_msk(now).strftime("Поменяли расписание в %H:%M"), 3,
             ))
-            blocks.append(_rich_paragraph([{"type": "italic", "text": "Точное время правки портал не сообщает."}]))
         if transition == "published":
             blocks.append(_heading("Расписание опубликовано на портале", 3))
         elif transition == "vanished":
@@ -3316,11 +3356,6 @@ def build_changes_rich_message(
                 ))
         if not (added or removed or changed or transition):
             blocks.append(_paragraph("Содержимое страницы изменилось, но состав пар прежний."))
-        footer: list[object] = [f"Группа {_truncate_rich_text(group_name, 80)} · "]
-        if total > 1:
-            footer.append(f"{total} {_changes_word(total)} · ")
-        footer.append({"type": "url", "text": "На портале", "url": source_url})
-        blocks.append({"type": "footer", "text": footer})
         return {"rich_message": {"blocks": blocks}}
 
     payload = assemble()
@@ -3382,11 +3417,12 @@ def changes_fallback_text(
     diff: dict, source_url: str, *, group_name: str = "6381", now: dt.datetime | None = None,
 ) -> str:
     """Build one valid plain-HTML fallback of at most 4096 characters."""
-    header = f"<b>Изменения · группа {_escape_truncated(group_name, 160)}</b>"
-    lines = [header]
     if now is not None:
-        lines.append(_html.escape(_as_msk(now).strftime("Обнаружено на сайте %d.%m.%Y в %H:%M:%S МСК")))
-        lines.append("Точное время правки портал не сообщает.")
+        ts = _html.escape(_as_msk(now).strftime("%H:%M"))
+        header = f"<b>Поменяли расписание в {ts}</b>"
+    else:
+        header = "<b>Поменяли расписание</b>"
+    lines = [header]
     transition = diff.get("transition")
     if transition == "published":
         lines.append("Расписание опубликовано на портале")
@@ -3404,21 +3440,13 @@ def changes_fallback_text(
                 chunk.append(_runs_to_html(block.get("text")))
             elif block.get("type") == "table":
                 chunk.extend(_table_rows_html(block))
-            elif block.get("type") == "details":
-                body = "\n".join(
-                    "\n".join(_table_rows_html(part)) if part.get("type") == "table"
-                    else _runs_to_html(part.get("text"))
-                    for part in block["blocks"] if part.get("type") in {"paragraph", "table"}
-                )
-                chunk.append("<blockquote expandable><b>Подробности</b>\n" + body + "</blockquote>")
         day_chunks.append("\n".join(chunk))
 
-    source_line = f'<a href="{_escape_truncated(source_url, 700)}">открыть на портале</a>'
     shown = 0
     for chunk in day_chunks:
         remaining = len(day_chunks) - shown - 1
         omission = f"… Ещё {remaining + 1} дней не поместились." if remaining >= 0 else ""
-        tail = [omission, source_line] if omission else [source_line]
+        tail = [omission] if omission else []
         candidate = "\n".join([*lines, chunk, *tail])
         if len(candidate) > 4096:
             break
@@ -3426,7 +3454,6 @@ def changes_fallback_text(
         shown += 1
     if shown < len(day_chunks):
         lines.append(f"… Ещё {len(day_chunks) - shown} дней не поместились.")
-    lines.append(source_line)
     text = "\n".join(lines)
     if len(text) > 4096:
         # Dynamic pieces above are individually bounded, so only a future
@@ -3468,7 +3495,7 @@ def build_changes_html(
         title_lines.append("Расписание пропало с портала (заглушка)")
     elif total:
         title_lines.append(f"{total} {_changes_word(total)}")
-    title_lines.append(_html.escape(now.strftime("%d.%m.%Y %H:%M МСК")))
+    title_lines.append(_html.escape(now.strftime("%d.%m.%Y в %H:%M")))
     if week:
         half = WEEK_HALF_NAME.get(week.get("half"), week.get("half", ""))
         title_lines.append(_html.escape(

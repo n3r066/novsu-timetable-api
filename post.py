@@ -759,9 +759,21 @@ def edit_dashboard_post(
     отпечаток распарсенного расписания (content_fingerprint); если он совпал
     с прошлым рендером, скриншоты берутся из кеша и chromium не гоняется —
     скрины обновляются только при реальном изменении расписания."""
+    sleepy = False
     if data is None:
         if html is None:
-            html = fetch_html()
+            try:
+                html = fetch_html()
+            except Exception as exc:  # noqa: BLE001 - ролловер не должен
+                #  умирать вместе с порталом: если порталь лёг ровно
+                # в полночь, закреп всё равно переключаем по сохранённой
+                # копии, а в заголовке честно пишем, что данные из кеша.
+                cached = config.STATE_DIR / "6381.html"
+                if not cached.exists():
+                    raise
+                html = cached.read_text(encoding="utf-8")
+                sleepy = True
+                print(f"[dashboard] fetch failed, cached html used: {exc}", file=sys.stderr)
         data = parse_all(html)
     if html is None:
         raise ValueError("html is required for dashboard screenshots")
@@ -788,7 +800,9 @@ def edit_dashboard_post(
     current_date = now_msk.date()
     live_days = set(view["live_days"])
     presentation_fp = dashboard_presentation_fingerprint(
-        fp, view, extra=opd_module.presentation_digest(opd_data, _view_dates(view)),
+        fp, view,
+        extra=opd_module.presentation_digest(opd_data, _view_dates(view))
+        + ("|sleepy" if sleepy else ""),
     )
     previous_dashboard = _read_json(config.STATE_DIR / "last_dashboard_post.json")
     expects_screens = bool(schedule and live_days)
@@ -865,6 +879,7 @@ def edit_dashboard_post(
         last_updated=last_updated,
         schedule_changed=schedule_changed,
         opd=opd_data,
+        sleep_note="😴 Сайт в спячке — сохранённое расписание" if sleepy else "",
     )
     files = {f"site_screenshot_{index}": item["path"] for index, item in enumerate(shot_items, 1)}
     result = edit_rich_message(
@@ -882,6 +897,7 @@ def edit_dashboard_post(
             "presentation_fingerprint": presentation_fp,
             "target_date": target_date.isoformat(),
             "screens_complete": render_screens or not expects_screens,
+            "sleepy": sleepy,
             "ts": dt.datetime.now(tz_msk).isoformat(timespec="seconds"),
         })
     return result

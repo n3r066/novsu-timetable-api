@@ -147,8 +147,8 @@ def test_changes_rich_message_structure():
     assert [day["summary"] for day in days] == [
         "Вторник (добавили пару)", "Среда (сменили аудиторию)", "Четверг (убрали пару)",
     ]
-    # Внутри дня — таблица правок и свёрнутые подробности таблицей.
-    assert all([inner["type"] for inner in day["blocks"]] == ["table", "details"] for day in days)
+    # Внутри дня — только таблица правок.
+    assert all([inner["type"] for inner in day["blocks"]] == ["table"] for day in days)
     rows = _main_rows(rm)
     assert [_plain(row[0]) for row in rows] == ["+\n09:00–09:45 · 10:30–11:15", "~\n11:00–11:45 · 12:30–13:15", "−\n15:00–16:45"]
     where = rows[1][2]
@@ -164,14 +164,13 @@ def test_changes_rich_message_structure():
     assert not any(node.get("type") in {
         "pullquote", "blockquote", "expandable_blockquote", "list",
     } for node in _rich_nodes(rm))
-    for obsolete in ("Поменяли расписание", "Коротко", "Что именно поменяли", "Как это читать",
+    for obsolete in ("Коротко", "Что именно поменяли", "Как это читать",
                      "Сводка дня", "Пояснения", "1. ", "Убрано:", "на скрине ниже", "портал НовГУ",
                      "Добавили пару", "Убрали пару", "Аудитория:"):
         assert obsolete not in _plain(rm)
-    assert blocks[-1]["type"] == "footer"
-    assert _plain(blocks[-1]) == "Группа 6381 · 3 изменения · На портале"
-    assert "Группа" not in _plain(blocks[:-1])
-    assert "изменения" not in _plain(blocks[:-1])
+    assert not any(b.get("type") == "footer" for b in blocks)
+    assert "Группа" not in _plain(blocks)
+    assert "3 изменения" not in _plain(blocks)
 
 
 def test_changes_rich_message_hides_empty_sections():
@@ -199,7 +198,7 @@ def test_changes_fallback_text_is_valid_and_bounded():
     assert len(text) <= 4096
     assert "<script>" not in text
     assert "&lt;script&gt;" in text
-    assert "открыть на портале" in text
+    assert "открыть на портале" not in text
     assert [line for line in text.splitlines() if line.startswith("<b>") and "(" in line] == [
         "<b>Вторник (добавили пару)</b>",
         "<b>Среда (сменили аудиторию)</b>",
@@ -219,10 +218,10 @@ def test_changes_fallback_text_stamps_detection_time_when_given():
     text = changes_fallback_text(
         _sample_diff(), "https://example.test", now=dt.datetime(2026, 9, 2, 12, 0),
     )
-    assert "Обнаружено на сайте 02.09.2026 в 12:00:00 МСК" in text
-    # Без now штампа нет — поведение обратно совместимо.
+    assert "Поменяли расписание в 12:00" in text
+    # Без now штампа времени нет — поведение обратно совместимо.
     plain = changes_fallback_text(_sample_diff(), "https://example.test")
-    assert "Обнаружено на сайте" not in plain
+    assert "Поменяли расписание в " not in plain
 
 
 def test_dashboard_rich_message_has_week_section():
@@ -382,13 +381,13 @@ def test_large_rich_diff_is_chunked_and_within_documented_limits():
     assert "×" not in days[0]["summary"]
     for action in ("изменили условия", "добавили пары", "убрали пары"):
         assert days[0]["summary"].count(action) == 1
-    detail = next(b for b in days[0]["blocks"] if str(b.get("summary", "")).startswith("Подробности"))
-    shown = len(detail["blocks"][0]["cells"]) - 1
-    assert 3 <= shown < 900
-    assert shown == len(_main_rows(payload))  # подробности — построчно к основной таблице
+    assert not any(str(b.get("summary", "")).startswith("Подробности") for b in days[0]["blocks"])
+    main = len(_main_rows(payload))
+    assert 3 <= main < 900
     text = _plain(payload)
-    assert f"ещё {900 - shown} не поместились" in text  # общий лимит поста режет записи
-    assert text.count("старое ") > 1 and text.count("→") > 1  # правки примечаний видны построчно
+    omitted = 900 - 3 * min(300, 120)  # raw_total - kind-limited entries
+    assert f"ещё {omitted} не поместились" in text  # общий лимит поста режет записи
+    assert text.count("старое ") == 0  # примечания больше не выводятся
     assert not any(block.get("type") in {"blockquote", "expandable_blockquote"}
                    for block in _walk_rich_blocks(blocks))
     assert "не поместились" in text
@@ -420,7 +419,7 @@ def test_changes_fallback_handles_one_huge_entity_heavy_line_atomically():
     text = changes_fallback_text(diff, "https://example.test?a=1&b=2")
     assert len(text) <= 4096
     assert text.count("<b>") == text.count("</b>")
-    assert text.count("<a ") == text.count("</a>") == 1
+    assert text.count("<a ") == text.count("</a>") == 0
     assert not __import__("re").search(r"&(?:#(?:x[0-9A-Fa-f]*)?|[A-Za-z]*)$", text)
     assert "<script>" not in text
 
@@ -781,20 +780,16 @@ def test_changes_post_comparison_removals_show_old_not_new(versions, count, high
     assert "В новом расписании этого занятия нет." not in text
     assert text.count("(пр.) Старый") == 0  # префикс вида выносится в контекст
     assert len(_main_rows(rm)) == count
-    # Пропавшая пара: строка со знаком «−», время и место зачёркнуты;
-    # время повторяется в подробностях.
-    assert text.count("15:00–16:45") == 2 * count
+    # Пропавшая пара: строка со знаком «−», время и место зачёркнуты.
+    assert text.count("15:00–16:45") == count
     assert text.count("ауд. 202") == count
     struck = [node for node in _rich_nodes(rm) if node.get("type") == "strikethrough"]
     assert [node["text"] for node in struck] == ["15:00–16:45", "ауд. 202"] * count
     assert "Убрано:" not in text
     assert "В новом расписании её уже нет" not in text
     assert "В новом расписании их уже нет" not in text
-    footer = rm["rich_message"]["blocks"][-1]
-    assert footer["type"] == "footer"
-    assert _plain(footer) == (
-        "Группа 6381 · 2 изменения · На портале" if count == 2 else "Группа 6381 · На портале"
-    )
+    assert not any(b.get("type") == "footer" for b in rm["rich_message"]["blocks"])
+    assert "Группа 6381" not in _plain(rm)
     assert "на скрине ниже" not in text
     assert "Их не подсвечиваем" not in text
     days = [block for block in rm["rich_message"]["blocks"] if block.get("type") == "details"]
@@ -1093,8 +1088,8 @@ def test_moved_pair_is_one_entry_not_two_rows():
     assert "убрали" not in text.casefold() and "добавили" not in text.casefold()
     assert "1. " not in text and "1 изменение" not in text
     assert "Пояснения" not in text and "Портал не пишет «перенос»" not in text
-    assert blocks[-1]["type"] == "footer"
-    assert _plain(blocks[-1]) == "Группа 6381 · На портале"
+    assert not any(b.get("type") == "footer" for b in blocks)
+    assert "Группа 6381" not in _plain(rm)
     fallback = changes_fallback_text(diff, "https://example.test")
     assert fallback.count("<b>Четверг (перенесли пару)</b>") == 1
     assert "<s>11:00–12:45</s> → <b>17:00–18:45</b>" in fallback
@@ -1117,7 +1112,7 @@ def test_real_removal_stays_removal():
     blocks = rm["rich_message"]["blocks"]
     days = [block for block in blocks if block.get("type") == "details"]
     assert [day["summary"] for day in days] == ["Пятница (убрали пару)"]
-    assert [inner["type"] for inner in days[0]["blocks"]] == ["table", "details"]
+    assert [inner["type"] for inner in days[0]["blocks"]] == ["table"]
     what, lesson_cell, where = _main_rows(rm)[0]
     assert _plain(what) == "−\n09:00–10:45"
     assert {"type": "strikethrough", "text": "09:00–10:45"} in what["text"]
@@ -1173,12 +1168,12 @@ def test_rename_on_both_weeks_is_one_entry():
     # Разные недели — разные места: показываем построчно, без слэша.
     assert _plain(where) == "Верхняя неделя: ауд. 1318, Антоново\nНижняя неделя: ДОТ"
     text = _plain(rm)
-    assert "немецкий язык" in text and "немец. яз" not in text
+    assert "немец. яз" not in text  # примечания больше не выводятся
     assert "Раньше:" not in text
     assert "1 изменение" not in text and "1. " not in text
     assert not any(node.get("type") in {"list", "blockquote", "pullquote"} for node in _rich_nodes(rm))
-    assert blocks[-1]["type"] == "footer"
-    assert _plain(blocks[-1]) == "Группа 6381 · На портале"
+    assert not any(b.get("type") == "footer" for b in blocks)
+    assert "Группа 6381" not in _plain(rm)
     fallback = changes_fallback_text(diff, "https://example.test")
     assert fallback.count("<b>Понедельник (переименовали пару)</b>") == 1
     assert "<s>Иностранные языки в сфере профессиональной коммуникации</s>" in fallback
@@ -1415,12 +1410,24 @@ def test_dashboard_thursday_has_opd_section_by_buildings():
     assert len(people) == 2 and "Елисеев А. Д." in summaries[0] and "Жукова К. А." in summaries[1]
     assert "ВГ 118" in summaries[1] and '"16:00–17:00"' in summaries[1] and '"14:00–15:00"' in summaries[0]
     assert "ауд. 402 · ИЭ" in summaries[1] and "Трезорова О. Ю." in summaries[1]
-    # Состав ВГ студента: по институтам (крупные первыми), с корпусом института.
-    zhukova = json.dumps(people[1]["blocks"], ensure_ascii=False)
+    # Состав ВГ студента: раскрытый «Вместе в ВГ», внутри раскрытые институты
+    # (крупные первыми) с таблицами «ФИО · Группа» и корпусом института.
+    zhukova_blocks = people[1]["blocks"]
+    zhukova = json.dumps(zhukova_blocks, ensure_ascii=False)
     assert "Вместе в ВГ 118" in zhukova and "2 чел. из других групп" in zhukova
-    assert "ИЭ · Институт экономики · Антоново: " in zhukova and "Орлова В. П. (6001)" in zhukova
-    assert "ПТИ · Политехнический институт · Б. Санкт-Петербургская, 41: " in zhukova
-    assert "Морозов И. И. (6311)" in zhukova
+    assert "ИЭ · Институт экономики · Антоново" in zhukova
+    assert "ПТИ · Политехнический институт · Б. Санкт-Петербургская, 41" in zhukova
+    together = zhukova_blocks[0]
+    assert together["type"] == "details" and together.get("is_open") is True
+    institutes = together["blocks"]
+    assert [block.get("type") for block in institutes] == ["details", "details"]
+    assert all(block.get("is_open") is True for block in institutes)
+    mate_tables = [block["blocks"][0] for block in institutes]
+    assert all(table.get("type") == "table" for table in mate_tables)
+    for table, student, group in zip(mate_tables, ("Орлова В. П.", "Морозов И. И."), ("6001", "6311")):
+        assert len(table["cells"]) == 2  # header plus one mate
+        assert student in json.dumps(table["cells"][1][0], ensure_ascii=False)
+        assert group in json.dumps(table["cells"][1][1], ensure_ascii=False)
     assert zhukova.index("Орлова") < zhukova.index("Морозов")
     # У Григорьева (ВГ 105) одногруппников по ВГ в таблице нет.
     sovarmii = _find_details(rm["rich_message"]["blocks"], "📍 ул. Советской Армии, 7")

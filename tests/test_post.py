@@ -738,3 +738,82 @@ def test_edit_dashboard_post_passes_opd_data_and_extends_fingerprint(monkeypatch
     assert captured[-1]["kwargs"]["opd"] is None
     without = _json.loads((state / "last_dashboard_post.json").read_text(encoding="utf-8"))
     assert without["presentation_fingerprint"] != with_opd["presentation_fingerprint"]
+
+
+def test_dashboard_uses_cached_html_when_fetch_fails(monkeypatch, tmp_path):
+    """Порталь лёг на ролловере: закреп рисуется из кеша с пометкой о спячке."""
+    import json
+
+    captured = {}
+
+    def fake_build(*args, **kwargs):
+        captured.update(kwargs)
+        return {"rich_message": {"blocks": []}}
+
+    monkeypatch.setattr(post, "build_dashboard_rich_message", fake_build)
+    monkeypatch.setattr(post, "edit_rich_message", lambda *a, **k: {"ok": True})
+    monkeypatch.setattr(post, "content_fingerprint", lambda data: "FP-SLEEPY")
+    monkeypatch.setattr(post, "parse_all", lambda html: {
+        "schedule": {"days": {"Среда": [{"subject": "Пара", "time": "09:00"}]}},
+        "weeks": [{"week": 1, "half": "top", "start": "31.08.2026", "end": "05.09.2026"}],
+    })
+    monkeypatch.setattr(post, "_dashboard_screens", lambda *a, **k: [])
+    monkeypatch.setattr(post, "fetch_html", lambda: (_ for _ in ()).throw(RuntimeError("portal down")))
+
+    monkeypatch.setattr(post.config, "STATE_DIR", tmp_path)
+    (tmp_path / "6381.html").write_text("<cached html>", encoding="utf-8")
+
+    import datetime as dt
+    result = post.edit_dashboard_post(1, dt.date(2026, 9, 2))
+    assert result["ok"] is True
+    assert "спячке" in captured.get("sleep_note", "")
+    state = json.loads((tmp_path / "last_dashboard_post.json").read_text(encoding="utf-8"))
+    assert state.get("sleepy") is True
+
+
+def test_dashboard_raises_when_fetch_fails_without_cache(monkeypatch, tmp_path):
+    monkeypatch.setattr(post, "fetch_html", lambda: (_ for _ in ()).throw(RuntimeError("portal down")))
+    monkeypatch.setattr(post.config, "STATE_DIR", tmp_path)
+
+    import datetime as dt
+    try:
+        post.edit_dashboard_post(1, dt.date(2026, 9, 2))
+    except RuntimeError as exc:
+        assert "portal down" in str(exc)
+    else:
+        raise AssertionError("без кеша ролловер обязан упасть, а не рисовать пустоту")
+
+
+def test_dashboard_recovers_from_sleepy_when_portal_wakes_up(monkeypatch, tmp_path):
+    """После восстановления портала закреп перерисовывается без пометки спячки."""
+    import json
+
+    captured = {}
+    edits = []
+
+    def fake_build(*args, **kwargs):
+        captured.update(kwargs)
+        return {"rich_message": {"blocks": []}}
+
+    monkeypatch.setattr(post, "build_dashboard_rich_message", fake_build)
+    monkeypatch.setattr(post, "edit_rich_message", lambda *a, **k: edits.append(1) or {"ok": True})
+    monkeypatch.setattr(post, "content_fingerprint", lambda data: "FP-1")
+    data = {
+        "schedule": {"days": {"Среда": [{"subject": "Пара", "time": "09:00"}]}},
+        "weeks": [{"week": 1, "half": "top", "start": "31.08.2026", "end": "05.09.2026"}],
+    }
+    monkeypatch.setattr(post, "parse_all", lambda html: data)
+    monkeypatch.setattr(post, "_dashboard_screens", lambda *a, **k: [])
+    monkeypatch.setattr(post.config, "STATE_DIR", tmp_path)
+    (tmp_path / "6381.html").write_text("<cached html>", encoding="utf-8")
+    monkeypatch.setattr(post, "fetch_html",
+                        lambda: (_ for _ in ()).throw(RuntimeError("portal down")))
+
+    import datetime as dt
+    day = dt.date(2026, 9, 2)
+    post.edit_dashboard_post(1, day)  # fetch упал -> sleepy
+    assert "спячке" in captured.get("sleep_note", "")
+    monkeypatch.setattr(post, "fetch_html", lambda: "<fresh html>")
+    post.edit_dashboard_post(1, day)  # портал жив -> обычный заголовок
+    assert captured.get("sleep_note") == ""
+    assert len(edits) == 2, "переход спячка -> норма обязан дать реальную правку закрепа"

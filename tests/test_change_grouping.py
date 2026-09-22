@@ -238,7 +238,6 @@ def test_day_table_is_capped_and_names_the_rest():
                                       [], "https://example.test")
     validate_rich_payload(rich)
     day = next(b for b in rich["rich_message"]["blocks"] if b["type"] == "details")
-    table, note, details = day["blocks"]
+    table, note = day["blocks"]
     assert len(table["cells"]) - 1 == cap
     assert json.dumps(note, ensure_ascii=False).count("Ещё 5 изменений этого дня не поместились") == 1
-    assert len(details["blocks"][0]["cells"]) - 1 == cap

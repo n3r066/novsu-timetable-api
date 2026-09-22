@@ -30,7 +30,7 @@ def test_missing_teacher_is_information_added_without_fake_replacement():
         assert "указали преподавателя" in text and "Иванова Анна Игоревна" in text
         assert "→" not in text and "сменили преподавателя" not in text
         assert "09:00–10:45" in text and "верхняя неделя" in text
-        assert text.count("Иностранный язык") == 2  # строка таблицы и подробности
+        assert text.count("Иностранный язык") == 1  # только строка таблицы
         assert diff == original
         fallback = changes_fallback_text(diff, "https://example.test")
         assert "<b>Иванова Анна Игоревна</b>" in fallback and "→" not in fallback
@@ -53,7 +53,7 @@ def test_teacher_only_row_keeps_week_conditions_and_places_per_week():
     text = flatten(build_changes_rich_message(diff, [], "https://example.test"))
     assert text.count("указали преподавателя") == 1
     assert "обе недели" in text
-    assert "Верхняя неделя: с 14.09" in text and "Нижняя неделя: с 21.09" in text
+    assert "с 14.09" not in text and "с 21.09" not in text  # примечания не выводятся
     assert "Верхняя неделя: ауд. 1318, Антоново\nНижняя неделя: ауд. 3207, Другой адрес" in text
 
 

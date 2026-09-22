@@ -228,6 +228,11 @@ Versioned policy lives in `knowledge/schedule_notes.json`. It is intentionally
 not a "seen once" runtime cache: identical snapshots must render identically on
 all machines.
 
+The dashboard header distinguishes «Обновлено» (the render time of this post
+edit, Moscow time) from «Расписание» (the persisted last detected semantic
+change, when different). A week/day rollover updates the first timestamp, not
+the second. The exact time of the portal author's edit is not available.
+
 When dashboard rich presentation changes, increment
 `DASHBOARD_PRESENTATION_VERSION` in `schedule_logic.py`. This forces one edit
 even if the portal content did not change.
@@ -787,7 +792,15 @@ Dashboard integration (`post.edit_dashboard_post` → `format`):
   institute, teacher), and inside that the student's virtual-group mates from
   other academic groups grouped by institute (short name from the portal index
   `<th>` headings, full name and home building from `opd.INSTITUTE_NAMES` /
-  `INSTITUTE_BUILDINGS`; the portal publishes no specialty). Then a «❌ Занятий
+  `INSTITUTE_BUILDINGS`; the portal publishes no specialty). The mates live in an
+  expanded `details` («Вместе в ВГ N · M чел. из других групп») holding one
+  expanded `details` per institute, each with a rich table with «ФИО» and
+  «Группа» columns, one person per row.
+  Within each institute, classmates are sorted by academic group, then name;
+  a shared group-number cell spans their rows when several people belong to that
+  same academic group. Unknown group numbers stay separate. No participants or
+  duplicate names are removed. This applies to every student's section,
+  including ВГ 116. Then a «❌ Занятий
   не будет» line, then source links. No intro paragraph and no data timestamp. The section is strictly about
   the current week: virtual groups alternate weeks, members who are free today
   are not listed and no next dates («далее DD.MM») are shown — notes exist only
@@ -798,10 +811,38 @@ Dashboard integration (`post.edit_dashboard_post` → `format`):
   «место уточняется».
 - Days without a date in the document get no section; after the last document
   date the section disappears by itself.
+- `knowledge/schedule_notes.json` may contain `opd_display_exclusions`, scoped by
+  academic group, exact date and full student name. These hide only the requested
+  students from the day view and its counts (including the «❌ Занятий не
+  будет» line), late end and presentation digest; source membership, sessions
+  and runtime cache are not edited. The current user-requested exception is for
+  group 6381 on 2026-09-24, ВГ 103, 104 and 111 (Бондаренко); the teacher
+  sections of ВГ 103/104 disappear with those students. Other dates, groups,
+  namesakes and other students of those teachers remain unchanged.
 
 Operations: `python3 opd.py [--date YYYY-MM-DD] [--refresh] [--json]` prints the
-view for a date. Run it as `novsu` (`systemd-run --uid=novsu ...`) or `chown`
-the cache afterwards, otherwise the service cannot refresh a root-owned cache.
-`NOVSU_OPD_ENABLED=0` disables the feature. Tests never reach the network: an
-autouse fixture in `tests/conftest.py` blocks `opd._download` and redirects the
-cache path to a temporary directory.
+view for a date.
+
+## 20.1 Tracked Extra Post: Full Schedule + OPD For a Non-6381 Person
+
+`knowledge/schedule_notes.json` may contain `opd_tracked_posts`: one post per
+person outside group 6381 (currently Яковлева Екатерина Сергеевна, ПИ,
+6701-до, ВГ 105 — message 187). `extra_posts.py` renders the post as the
+person's full portal timetable for her academic group (`portal_group` ref in
+the spec, same dashboard renderer, no screenshots) merged with her OPD: the
+header lines «ОПД · ВГ N» and «Даты» list all upcoming department dates
+(cancelled ones marked «занятий не будет», past ones dropped), and on
+Thursdays the usual OPD section shows her row and her VG roster. The person
+is a synthetic single member of `_person_opd`, everyone else in her VG
+becomes "mates", so the standard rendering path is reused unchanged.
+
+`monitor.run_once` calls `extra_posts.sync(opd_module.load_opd())` after the
+dashboard work. Sync fetches the person's group page every cycle, re-renders
+and compares the fingerprint in `state/extra_posts.json`; it edits the
+message only when the portal timetable, the department cache or the day
+itself changes. «Обновлено» stamps the last edit, «Расписание» moves only
+when the portal content fingerprint moves. No channel notifications about
+these edits, the post is never pinned; the first sync sends it and stores
+`message_id`. Per-post failures alert `_dm` only after 3 consecutive cycles
+and never break the main cycle. The monitor owns the post afterwards: do not
+edit or resend it by hand — change the spec in `schedule_notes.json` instead.

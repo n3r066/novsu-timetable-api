@@ -7,7 +7,7 @@ import json
 import re
 import zoneinfo
 
-DASHBOARD_PRESENTATION_VERSION = 18
+DASHBOARD_PRESENTATION_VERSION = 20
 from typing import Any
 
 import bells

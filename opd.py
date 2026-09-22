@@ -45,6 +45,32 @@ DEFAULT_BLOCKS = (("14:00", "15:00"), ("16:00", "17:00"))
 CACHE_FILE = "opd_cache.json"
 CACHE_VERSION = 2
 
+
+def _load_display_exclusions() -> list[dict]:
+    """Date-scoped display policy; department membership and cache stay intact."""
+    path = Path(__file__).with_name("knowledge") / "schedule_notes.json"
+    try:
+        policy = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    rows = policy.get("opd_display_exclusions", []) if isinstance(policy, dict) else []
+    return [row for row in rows if isinstance(row, dict)] if isinstance(rows, list) else []
+
+
+_DISPLAY_EXCLUSIONS = _load_display_exclusions()
+
+
+def _member_visible(opd: dict, member: dict, date: dt.date) -> bool:
+    name = " ".join(str(member.get(key) or "").strip() for key in
+                    ("last_name", "first_name", "patronymic")).strip().casefold()
+    for rule in _DISPLAY_EXCLUSIONS:
+        if str(rule.get("group")) != str(opd.get("group")) or rule.get("date") != date.isoformat():
+            continue
+        names = {str(value).strip().casefold() for value in rule.get("students", [])}
+        if name in names:
+            return False
+    return True
+
 #: Индекс портала подписывает блоки групп короткими именами институтов в <th>.
 INSTITUTE_NAMES = {
     "ИЭ": "Институт экономики",
@@ -720,6 +746,8 @@ def day_view(opd: dict | None, date: dt.date) -> dict | None:
         key=lambda member: (member["last_name"].casefold(), member["first_name"].casefold()),
     )
     for member in members:
+        if not _member_visible(opd, member, date):
+            continue
         items = by_vg.get(member["vg"], [])
         active = sorted((s for s in items if not s.get("cancelled")), key=lambda s: s["block_start"])
         if active:
@@ -775,6 +803,11 @@ def late_ends(opd: dict | None) -> dict[dt.date, dt.time]:
             date = dt.date.fromisoformat(session["date"])
             end = dt.time.fromisoformat(session["block_end"])
         except (KeyError, ValueError):
+            continue
+        if not any(
+            str(member["vg"]) == str(session.get("vg")) and _member_visible(opd, member, date)
+            for member in opd["members"]
+        ):
             continue
         if date not in ends or end > ends[date]:
             ends[date] = end

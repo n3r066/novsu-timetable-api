@@ -109,7 +109,7 @@ def test_post_changes_falls_back_to_plain_html(monkeypatch):
     assert result["ok"] is True
     assert calls["method"] == "sendMessage"
     assert calls["fields"]["parse_mode"] == "HTML"
-    assert "Изменения · группа" in calls["fields"]["text"]
+    assert "Поменяли расписание" in calls["fields"]["text"]
     assert "добавили пары (2 пары)" in calls["fields"]["text"]
 
 
@@ -550,3 +550,54 @@ def test_dm_is_silenced_for_manual_runs_but_loud_in_production(monkeypatch, caps
     monkeypatch.delenv("NOVSU_DM_SILENT", raising=False)
     monitor._dm("аварийный алерт")
     assert len(sent) == 1
+
+
+def test_pending_media_drops_terminal_error_and_processes_next(monkeypatch, tmp_path):
+    """Мёртвый пост не должен душить очередь: задача снимается одним алертом,
+    следующая в очереди обрабатывается в том же цикле."""
+    before = tmp_path / "before.png"
+    after = tmp_path / "after.png"
+    before.write_bytes(b"png")
+    after.write_bytes(b"png")
+    monkeypatch.setattr(monitor.config, "STATE_DIR", tmp_path)
+    monkeypatch.setattr(monitor.timetable_api, "load_snapshot_html", lambda snapshot_id, **kwargs: f"html-{snapshot_id}")
+    monkeypatch.setattr(monitor, "comparison_day_screens", lambda old, new, diff: [
+        {"label": "Вт", "before_path": str(before), "after_path": str(after)},
+    ])
+
+    def fake_edit(rich, **kwargs):
+        if kwargs.get("message_id") == 19:
+            return {"ok": False, "description": "Bad Request: message to edit not found"}
+        return {"ok": True}
+
+    monkeypatch.setattr(monitor, "edit_rich_message", fake_edit)
+    dms = []
+    monkeypatch.setattr(monitor, "_dm", lambda text: dms.append(text))
+    monitor._queue_media_enhancement({"ok": True, "_rich": True, "result": {"message_id": 19}}, _tuesday_diff(), [], 1, 2)
+    monitor._queue_media_enhancement({"ok": True, "_rich": True, "result": {"message_id": 20}}, _tuesday_diff(), [], 1, 2)
+    assert monitor._try_pending_media() is True
+    assert not (tmp_path / "pending_media.json").exists(), "обе задачи должны уйти из очереди"
+    assert len(dms) == 1, f"алерт ровно один: {dms}"
+    assert "19" in dms[0] and "снята" in dms[0]
+
+
+def test_pending_media_transient_error_still_blocks_head(monkeypatch, tmp_path):
+    """Transient-ошибка (сеть) по-прежнему оставляет задачу в голове очереди."""
+    before = tmp_path / "before.png"
+    after = tmp_path / "after.png"
+    before.write_bytes(b"png")
+    after.write_bytes(b"png")
+    monkeypatch.setattr(monitor.config, "STATE_DIR", tmp_path)
+    monkeypatch.setattr(monitor.timetable_api, "load_snapshot_html", lambda snapshot_id, **kwargs: f"html-{snapshot_id}")
+    monkeypatch.setattr(monitor, "comparison_day_screens", lambda old, new, diff: [
+        {"label": "Вт", "before_path": str(before), "after_path": str(after)},
+    ])
+    monkeypatch.setattr(monitor, "edit_rich_message",
+                        lambda rich, **kwargs: {"ok": False, "description": "connection timeout"})
+    dms = []
+    monkeypatch.setattr(monitor, "_dm", lambda text: dms.append(text))
+    monitor._queue_media_enhancement({"ok": True, "_rich": True, "result": {"message_id": 19}}, _tuesday_diff(), [], 1, 2)
+    assert monitor._try_pending_media() is False
+    state = json.loads((tmp_path / "pending_media.json").read_text(encoding="utf-8"))
+    assert [item["message_id"] for item in state["items"]] == [19]
+    assert dms == [], "transient-ошибка алертов не требует"

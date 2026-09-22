@@ -41,6 +41,8 @@ import zoneinfo
 import bells  # noqa: E402
 import api as timetable_api  # noqa: E402
 import config  # noqa: E402
+import extra_posts  # noqa: E402
+import opd as opd_module  # noqa: E402
 from fetch import content_fingerprint, fetch_html, hash_html, is_stub, save_html  # noqa: E402
 from format import build_changes_rich_message, changes_fallback_text, pick_day_screens  # noqa: E402
 from parse import parse_all  # noqa: E402
@@ -437,50 +439,80 @@ def _queue_media_enhancement(
     _write_json_atomic(path, {"items": items})
 
 
+# Ошибки редактирования, при которых повторять бессмысленно: пост удалили,
+# его нельзя редактировать или чат недоступен. Без классификации одна такая
+# задача в голове очереди вечно блокировала скрины всех следующих постов.
+_TERMINAL_MEDIA_ERRORS = (
+    "message to edit not found",
+    "message can't be edited",
+    "message identifier is not specified",
+    "chat not found",
+    "bot was blocked",
+)
+
+
 def _try_pending_media() -> bool | None:
     path = config.STATE_DIR / "pending_media.json"
     state = _read_json(path)
     items = state.get("items") if isinstance(state.get("items"), list) else []
-    pending = items[0] if items else {}
-    if not pending.get("message_id") or pending.get("diff") is None:
+    if not items or not items[0].get("message_id") or items[0].get("diff") is None:
         return None
-    db_path = config.STATE_DIR / "timetable.sqlite3"
-    old_id, new_id = pending.get("old_snapshot_id"), pending.get("new_snapshot_id")
-    old_html = timetable_api.load_snapshot_html(int(old_id), db_path=db_path) if old_id else None
-    new_html = timetable_api.load_snapshot_html(int(new_id), db_path=db_path) if new_id else None
-    try:
-        screenshot_media, files = _comparison_screen_media(pending["diff"], old_html, new_html)
-        if not files:
+    progressed = False
+    while items:
+        pending = items[0]
+        db_path = config.STATE_DIR / "timetable.sqlite3"
+        old_id, new_id = pending.get("old_snapshot_id"), pending.get("new_snapshot_id")
+        old_html = timetable_api.load_snapshot_html(int(old_id), db_path=db_path) if old_id else None
+        new_html = timetable_api.load_snapshot_html(int(new_id), db_path=db_path) if new_id else None
+        try:
+            screenshot_media, files = _comparison_screen_media(pending["diff"], old_html, new_html)
+            if not files:
+                items.pop(0)
+                progressed = True
+                continue
+            change_time = None
+            raw_change_time = pending.get("change_time")
+            if isinstance(raw_change_time, str) and raw_change_time:
+                try:
+                    change_time = dt.datetime.fromisoformat(raw_change_time)
+                except ValueError:
+                    change_time = None
+            rich = build_changes_rich_message(
+                pending["diff"], pending.get("weeks") or [], config.GROUP_URL,
+                group_name="6381", screenshot_media=screenshot_media, now=change_time,
+            )
+            result = edit_rich_message(
+                rich,
+                token=config.TG_BOT_TOKEN,
+                chat_id=config.TG_CHANNEL_ID,
+                message_id=int(pending["message_id"]),
+                files=files,
+                timeout=120,
+            )
+        except Exception as exc:  # noqa: BLE001
+            result = {"ok": False, "error": str(exc)}
+        if result.get("ok") or "not modified" in str(result.get("description", "")):
             items.pop(0)
-            _write_json_atomic(path, {"items": items}) if items else _unlink(path)
-            return True
-        change_time = None
-        raw_change_time = pending.get("change_time")
-        if isinstance(raw_change_time, str) and raw_change_time:
-            try:
-                change_time = dt.datetime.fromisoformat(raw_change_time)
-            except ValueError:
-                change_time = None
-        rich = build_changes_rich_message(
-            pending["diff"], pending.get("weeks") or [], config.GROUP_URL,
-            group_name="6381", screenshot_media=screenshot_media, now=change_time,
-        )
-        result = edit_rich_message(
-            rich,
-            token=config.TG_BOT_TOKEN,
-            chat_id=config.TG_CHANNEL_ID,
-            message_id=int(pending["message_id"]),
-            files=files,
-            timeout=120,
-        )
-    except Exception as exc:  # noqa: BLE001
-        result = {"ok": False, "error": str(exc)}
-    if result.get("ok") or "not modified" in str(result.get("description", "")):
-        items.pop(0)
-        _write_json_atomic(path, {"items": items}) if items else _unlink(path)
-        return True
-    print(f"[pending media] enhancement failed: {result}", file=sys.stderr)
-    return False
+            progressed = True
+            continue
+        failure_text = str(result.get("description", "") or result.get("error", "")).casefold()
+        if any(marker in failure_text for marker in _TERMINAL_MEDIA_ERRORS):
+            # Мёртвый пост не должен душить очередь: снимаем задачу одним
+            # алертом и идём к следующей, transient-ошибки ретраим как раньше.
+            items.pop(0)
+            progressed = True
+            _dm(
+                "pending media: пост "
+                f"<code>{_escape_code(int(pending.get('message_id')))}</code> недоступен, "
+                "задача снята, скрины не добавлены: "
+                f"<code>{_escape_code(failure_text, 200)}</code>"
+            )
+            print(f"[pending media] terminal error, task dropped: {failure_text}", file=sys.stderr)
+            continue
+        print(f"[pending media] enhancement failed: {result}", file=sys.stderr)
+        break
+    _write_json_atomic(path, {"items": items}) if items else _unlink(path)
+    return progressed if progressed else False
 
 
 def _read_json(path: Path) -> dict:
@@ -923,7 +955,13 @@ def _run_once_locked(update_post_id: int | None = None, post_date: dt.date | Non
 def run_once(update_post_id: int | None = None, post_date: dt.date | None = None) -> dict:
     """Run one serialized monitor cycle with atomic state updates."""
     with _state_lock():
-        return _run_once_locked(update_post_id=update_post_id, post_date=post_date)
+        result = _run_once_locked(update_post_id=update_post_id, post_date=post_date)
+        try:
+            extra_posts.sync(opd_module.load_opd())
+        except Exception as exc:  # noqa: BLE001
+            print(f"[extra posts] {exc}", file=sys.stderr)
+            _dm(f"extra_posts.sync failed: <code>{_escape_code(exc)}</code>")
+        return result
 
 
 def schedule_daily(hour: int = 9, minute: int = 0, update_post_id: int | None = None, post_date: dt.date | None = None):

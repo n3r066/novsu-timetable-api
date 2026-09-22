@@ -36,8 +36,8 @@ def rows(section):
     return [[plain(cell["text"]) for cell in row] for row in table["cells"][1:]]
 
 
-def details(section):
-    return next(b for b in section["blocks"] if str(b.get("summary", "")).startswith("Подробности"))
+def has_details(section):
+    return any(str(b.get("summary", "")).startswith("Подробности") for b in section["blocks"])
 
 
 
@@ -56,10 +56,7 @@ def test_each_occurrence_is_a_row_and_details_keep_week_and_time():
     text = overview(section)
     assert text.count("Ефимов Олег Николаевич") == 2 and "→" not in text
     assert "верхняя неделя" in table[1][1] and "нижняя неделя" in table[2][1]
-    full = plain(details(section))
-    assert "16:00–17:45" in full and "17:00–18:45" in full
-    assert "верхняя неделя" in full and "нижняя неделя" in full
-    assert not details(section).get("is_open")
+    assert not has_details(section)  # подробности убраны
 
 
 
@@ -87,7 +84,6 @@ def test_room_deltas_are_shown_per_row_with_time():
     table = rows(section)
     assert [row[2] for row in table] == ["301 → 302", "301 → 302", "303 → 302"]
     assert table[0][0] == "~\n09:00–10:45"
-    assert "09:00–10:45" in plain(details(section))
 
 
 
@@ -98,9 +94,9 @@ def test_unknown_notes_are_preserved_in_closed_details_without_dominating_overvi
     ]})
     assert section["summary"] == "Понедельник · изменили условия (2 пары)"
     assert "История" in overview(section) and "Физика" in overview(section)
-    assert "консультация" not in overview(section)  # примечания только в подробностях
-    assert "ранняя запись → только 25.09; консультация по согласованию" in plain(details(section))
-    assert "старый адрес → уточнить место у деканата" in plain(details(section))
+    assert "консультация" not in overview(section)  # примечания не выводятся
+    assert "ранняя запись" not in plain(section)  # примечания не выводятся
+    assert "уточнить место" not in plain(section)  # примечания не выводятся
 
 
 
@@ -123,10 +119,8 @@ def test_html_fallback_has_the_same_rows_and_expandable_details():
         lesson("История <&>", "11:00", note="только 26.09", fields=[["преподаватель", "", "Петров"]]),
     ]}
     html = changes_fallback_text(diff, "https://example.test")
-    visible, hidden = html.split("<blockquote expandable>", 1)
-    assert "указали преподавателей (2 пары)" in visible
-    assert visible.count("История &lt;&amp;&gt;") == 2 and visible.count("<b>Петров</b>") == 2
-    assert "25.09" not in visible and "26.09" not in visible
-    assert "только 25.09" in hidden and "только 26.09" in hidden
-    assert "09:00–10:45" in hidden and "11:00–11:45" in hidden
-    assert "</blockquote>" in hidden and len(html) <= 4096
+    assert "указали преподавателей (2 пары)" in html
+    assert html.count("История &lt;&amp;&gt;") == 2 and html.count("<b>Петров</b>") == 2
+    assert "25.09" not in html and "26.09" not in html  # примечания не выводятся
+    assert "<blockquote expandable>" not in html  # подробности убраны
+    assert len(html) <= 4096

@@ -82,8 +82,8 @@ def test_reported_single_rename_is_action_first_without_repeated_chrome():
     blocks = payload["rich_message"]["blocks"]
     assert blocks[0]["type"] == "details"
     assert blocks[0]["summary"] == "Понедельник (переименовали пару)"
-    # День — таблица правок и свёрнутые подробности, без абзацев-прозы.
-    assert [inner["type"] for inner in blocks[0]["blocks"]] == ["table", "details"]
+    # День — только таблица правок, без абзацев-прозы.
+    assert [inner["type"] for inner in blocks[0]["blocks"]] == ["table"]
     what, lesson, where = main_rows(payload)[0]
     assert text(what["text"]) == "~\n09:00–10:45"
     # Название печатаем один раз: старое — префикс нового, поэтому показан
@@ -98,13 +98,14 @@ def test_reported_single_rename_is_action_first_without_repeated_chrome():
     main = main_text(payload)
     assert main.count(NEW_NAME) == 1
     assert "Раньше:" not in main
-    assert "немецкий язык" in visible(payload)  # примечание — в подробностях
+    assert "немец. яз" not in visible(payload)  # примечания больше не выводятся
     for clutter in ("Поменяли расписание", "Коротко", "Что именно поменяли", "1 изменение",
                     "кто ведёт", "где:", "Пояснения", "место не указано", "Пару «", "дополнили"):
         assert clutter not in visible(payload)
     assert not any(block["type"] in {"pullquote", "blockquote", "expandable_blockquote", "list"}
                    for block in blocks)
-    assert blocks[-1]["type"] == "footer"
+    assert not any(b.get("type") == "footer" for b in blocks)
+    assert "Группа" not in visible(payload)
 
 
 def test_missing_time_does_not_create_empty_badge_or_invent_date():
@@ -117,8 +118,8 @@ def test_missing_time_does_not_create_empty_badge_or_invent_date():
     # неделю правки. Время обнаружения при этом своё у каждого поста.
     assert "—" not in visible(before)
     assert "Неделя 20" not in visible(after)
-    assert "Обнаружено на сайте 04.09.2026 в 00:00:00 МСК" in visible(before)
-    assert "Обнаружено на сайте 04.12.2026 в 00:00:00 МСК" in visible(after)
+    assert "Поменяли расписание в 00:00" in visible(before)
+    assert "Поменяли расписание в 00:00" in visible(after)
 
 
 
@@ -202,7 +203,7 @@ def test_dot_does_not_hide_physical_location_or_unknown_conditions():
     main = visible(payload)
     assert "ауд. 1318" in main
     assert "ДОТ" in main
-    assert "консультация по согласованию с кафедрой" in main
+    assert "консультация по согласованию с кафедрой" not in main  # примечания не выводятся
 
 
 def test_context_conditions_keep_week_specific_association():
@@ -210,7 +211,8 @@ def test_context_conditions_keep_week_specific_association():
     diff["changed"][0]["note"] = "по верхней неделе с 14.09"
     diff["changed"].append({**diff["changed"][0], "note": "по нижней неделе с 21.09"})
     main = visible(build_changes_rich_message(diff, [], "https://example.test"))
-    assert "Верхняя неделя: с 14.09\nНижняя неделя: с 21.09" in main
+    assert "ауд. 1318" in main
+    assert "с 14.09" not in main  # примечания не выводятся
 
 
 
@@ -222,10 +224,10 @@ def test_comment_edit_does_not_repeat_derived_location_and_mode_edits():
     ]
     payload = build_changes_rich_message(diff, [], "https://example.test")
     main = visible(payload)
-    assert "Антоново → с использованием ДОТ с 14.09" in main  # примечание — в подробностях
+    assert "ауд. 1318, ДОТ" in main  # место и формат выведены в ячейку «где»
+    assert "с 14.09" not in main  # примечание больше не выводится
     assert "изменился формат" not in main and "сменилось место" not in main
-    assert main.count("с 14.09") == 1
-    assert "без ДОТ →" not in main  # формат и место выведены из примечания, отдельно не повторяем
+    assert "без ДОТ →" not in main
 
 
 
@@ -252,7 +254,8 @@ def test_new_field_values_are_used_in_sentence_and_fallback():
     assert {"type": "marked", "text": "(второй иностранный язык)"} in lesson["text"]
     assert text(where["text"]) == "1318 → 1331"
     fallback = changes_fallback_text(diff, "https://example.test")
-    assert f"<b>{NEW_NAME}</b>" in fallback  # подробности печатают текущее название целиком
+    assert "<b>Иностранные языки в сфере профессиональной коммуникации</b>" in fallback
+    assert "(второй иностранный язык)" in fallback  # хвост переименования
     assert "<s>1318</s> → <b>1331</b>" in fallback
 
 
@@ -261,18 +264,18 @@ def test_condition_on_only_one_variant_still_has_week_label():
     diff["changed"][0]["note"] = "по верхней неделе с 14.09"
     diff["changed"].append({**diff["changed"][0], "note": "по нижней неделе"})
     main = visible(build_changes_rich_message(diff, [], "https://example.test"))
-    assert "Верхняя неделя: с 14.09" in main
-    assert "\nс 14.09\n" not in main
-    assert "Верхняя неделя: с 14.09" in changes_fallback_text(diff, "https://example.test")
+    assert "ауд. 1318" in main  # место показано
+    assert "с 14.09" not in main  # примечания не выводятся
+    assert "с 14.09" not in changes_fallback_text(diff, "https://example.test")
 
 
 def test_fallback_long_old_value_does_not_hide_new_value_or_clearing():
     diff = rename_diff()
     diff["changed"][0]["fields"] = [["примечание", "<&>" * 800, ""]]
     fallback = changes_fallback_text(diff, "https://example.test")
-    assert "→ <b>не указано</b>" in fallback
-    assert "<s>&lt;&amp;&gt;" in fallback
-    assert "<blockquote expandable><b>Подробности</b>" in fallback
+    assert "→ <b>не указано</b>" not in fallback  # примечания больше не выводятся
+    assert "&lt;&amp;&gt;" not in fallback
+    assert "<blockquote expandable><b>Подробности</b>" not in fallback
     assert len(fallback) <= 4096
 
 
@@ -288,13 +291,14 @@ def test_unknown_place_is_not_announced():
     diff = {"added": [_lesson()], "removed": [], "changed": []}
     main = visible(build_changes_rich_message(diff, [], "https://example.test"))
     assert "место не указано" not in main
-    assert "с 10.09" in main and "17:00–18:45" in main
+    assert "17:00–18:45" in main  # время показано
+    assert "с 10.09" not in main  # примечания не выводятся
     assert "место не указано" not in changes_fallback_text(diff, "https://example.test")
 
 
 
 def test_day_summary_lists_every_change_and_details_hold_the_sentences():
-    """Сводка дня называет обе правки, таблица — строку на каждую, подробности свёрнуты."""
+    """Сводка дня называет обе правки, таблица — строку на каждую."""
     diff = {"added": [_lesson(room="301")],
             "removed": [_lesson(subject="Психология", time="09:00 10:00", room="1306", note="")],
             "changed": []}
@@ -302,7 +306,7 @@ def test_day_summary_lists_every_change_and_details_hold_the_sentences():
     validate_rich_payload(payload)
     days = day_sections(payload)
     assert [day["summary"] for day in days] == ["Среда · добавили пару, убрали пару"]
-    assert [inner["type"] for inner in days[0]["blocks"]] == ["table", "details"]
+    assert [inner["type"] for inner in days[0]["blocks"]] == ["table"]
     rows = [[text(cell["text"]) for cell in row] for row in main_rows(payload)]
     assert rows == [
         ["+\n17:00–18:45", "Проектная деятельность", "ауд. 301"],
@@ -310,14 +314,8 @@ def test_day_summary_lists_every_change_and_details_hold_the_sentences():
     ]
     _what, _lesson_cell, where = main_rows(payload)[1]
     assert where["text"] == [{"type": "strikethrough", "text": "ауд. 1306"}]
-    details = next(block for block in days[0]["blocks"] if str(block.get("summary", "")).startswith("Подробности"))
-    assert not details.get("is_open")
-    assert details["summary"] == "Подробности: время, недели и примечания"
-    detail_rows = [[text(cell["text"]) for cell in row] for row in details["blocks"][0]["cells"][1:]]
-    assert detail_rows == [
-        ["Проектная деятельность", "17:00–18:45", "с 10.09"],
-        ["Психология", "09:00–10:45", "—"],
-    ]
+    assert not any(str(block.get("summary", "")).startswith("Подробности")
+                   for block in days[0]["blocks"])
 
 
 
