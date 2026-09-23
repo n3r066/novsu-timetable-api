@@ -6,15 +6,18 @@ NOVSU_GROUP_CHAT_ID процесс даже не стартует — в ЛС н
   /timetable, /расписание  -> вся текущая неделя
   /today, /сегодня         -> сегодня
   /tomorrow, /завтра       -> завтра
-Аргументы: today|tomorrow|сегодня|завтра|вся|неделя|пн..вс.
+  /opd, /опд               -> списки ОПД по виртуальным группам
+Аргументы: today|tomorrow|сегодня|завтра|вся|неделя|пн..вс;
+/opd без аргумента берёт ближайшую дату с ОПД (обычно следующий четверг).
 
 Ответ на день — тот же развёрнутый раздел, что в закрепе канала
 (sendRichMessage): таблица пар, ОПД-раздел и сворачиваемый скрин с портала.
 Скрин берётся готовым из кеша закрепа state/dashboard_screens.json —
 рендер ноль, парсинг ноль. Если дня нет в расписании или rich-отправка
-не прошла — ответ деградирует до текстовой вырезки. /timetable — текст.
-Данные — те же state/last_parsed.json, что рисуют закреп: материал один,
-ничего не рендерится и сервер не нагружается.
+не прошла — ответ деградирует до текстовой вырезки. /timetable — пост
+недели 1 в 1 из закрепа. /opd — только ОПД-кусок из раздела дня.
+Данные — те же state/last_parsed.json и state/opd_cache.json, что рисуют
+закреп: материал один, ничего не рендерится и сервер не нагружается.
 
 Дата всегда по Москве (сервер в UTC — иначе после полуночи МСК бот путает
 день).
@@ -58,6 +61,7 @@ from format import (
     DAY_SHORT_TO_FULL,
     _dashboard_day_section,
     _day_hides_expired,
+    _opd_section,
     build_dashboard_rich_message,
 )
 from telegram_api import call as api_call
@@ -77,6 +81,7 @@ EPHEMERAL_COMMANDS = (
     {"command": "timetable", "description": "Расписание недели — видно только тебе"},
     {"command": "today", "description": "Пары на сегодня — видно только тебе"},
     {"command": "tomorrow", "description": "Пары на завтра — видно только тебе"},
+    {"command": "opd", "description": "Списки ОПД по ВГ — видно только тебе"},
 )
 
 DAY_NAMES = ["Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота", "Воскресенье"]
@@ -101,6 +106,8 @@ COMMANDS = {
     "сегодня": "сегодня",
     "tomorrow": "завтра",
     "завтра": "завтра",
+    "opd": "",
+    "опд": "",
 }
 
 _TYPE_RE = re.compile(r"^\(([^)]*)\)\s*")
@@ -403,6 +410,91 @@ def build_day_answer(data: dict, target: dt.date, today: dt.date | None = None) 
     return {"rich": rich, "files": files}
 
 
+#: Сколько дней вперёд /opd ищет ближайшую дату с ОПД.
+OPD_SCAN_DAYS = 14
+
+
+def build_opd_answer(
+    chat_id: int,
+    receiver: int | None,
+    args: str,
+    today: dt.date,
+    anchor: int | None = None,
+) -> dict:
+    """Списки ОПД — кусок из раздела дня канала, рендер ноль.
+
+    Без аргумента берётся ближайшая дата с ОПД (обычно следующий четверг);
+    с аргументом (``/opd завтра``, ``/opd чт``) — указанный день. rich-блок —
+    тот же _opd_section, что в закрепе; текст — компактный запасной ответ.
+    """
+    base = {
+        "kind": "reply",
+        "chat_id": chat_id,
+        "receiver_user_id": receiver,
+        "command_message_id": anchor,
+    }
+    try:
+        opd_data = opd_module.load_opd(now=dt.datetime.now(MSK))
+    except Exception:  # noqa: BLE001 - ОПД не должен ронять ответ
+        opd_data = None
+    if not opd_data:
+        return {**base, "text": "ОПД пока не подгрузилось, попробуй через пару минут."}
+    target = resolve_target(args, today) if args else None
+    if target == "week":
+        target = None
+    if isinstance(target, dt.date):
+        date = target
+    else:
+        date = next(
+            (today + dt.timedelta(days=offset)
+             for offset in range(OPD_SCAN_DAYS)
+             if opd_module.day_view(opd_data, today + dt.timedelta(days=offset))),
+            None,
+        )
+    if date is None:
+        return {**base, "text": "Ближайшие две недели ОПД не найдено."}
+    view = opd_module.day_view(opd_data, date)
+    if view is None:
+        return {**base, "text": f"На {date.strftime('%d.%m')} ОПД нет."}
+    plan = {**base, "text": build_opd_text(view)}
+    plan["rich"] = {"rich_message": {"blocks": [_opd_section(view)]}}
+    return plan
+
+
+def build_opd_text(view: dict) -> str:
+    """Компактная текстовая деградация /opd: кто идёт, куда и во сколько."""
+    date = dt.date.fromisoformat(view["date"])
+    counts = view["counts"]
+    lines = [
+        f"<b>ОПД · ПО ВИРТУАЛЬНЫМ ГРУППАМ · {date.strftime('%d.%m')} · "
+        f"идут {counts['session']} из {len(view['rows'])}</b>",
+    ]
+    going = [row for row in view["rows"] if row["status"] == "session"]
+    cancelled = [row for row in view["rows"] if row["status"] == "cancelled"]
+    by_building: dict[str, list[dict]] = {}
+    for row in going:
+        by_building.setdefault(row.get("building") or "адрес уточняется", []).append(row)
+    for building in sorted(by_building, key=lambda b: (-len(by_building[b]), b)):
+        people = sorted(
+            by_building[building],
+            key=lambda row: (str(row.get("block_start") or ""), str(row.get("student") or "").casefold()),
+        )
+        lines.append("")
+        lines.append(f"<b>📍 {building}</b> · {len(people)} чел.")
+        for row in people:
+            place = f" · {row['place']}" if row.get("place") else ""
+            lines.append(
+                f"{row['block_start']}–{row['block_end']} · {row['student']} · "
+                f"ВГ {row['vg']} · ауд. {row['room']}{place} · "
+                f"{len(row.get('mates') or [])} чел. из других групп"
+            )
+    if cancelled:
+        lines.append("")
+        lines.append("<b>❌ Занятий не будет:</b> " + ", ".join(
+            f"{row['student']} (ВГ {row['vg']})" for row in cancelled))
+    return "\n".join(lines)
+
+
 def extract_command(text: object, bot_username: str = BOT_USERNAME) -> tuple[str, str] | None:
     """«/today@bot завтра» -> ("today", "завтра"); не команды -> None."""
     if not isinstance(text, str) or not text.startswith("/"):
@@ -465,17 +557,24 @@ def plan_response(
     if command not in COMMANDS:
         return {"kind": "ignore"}
     today = today or today_msk()
+    sender = message.get("from") or {}
+    receiver = sender.get("id")
+    # Ответ привязывается reply'ем к команде: иначе клиент паркует эфемерку
+    # над последним сообщением и она визуально «приходит раньше» команды.
+    anchor = message.get("message_id")
+    if command in ("opd", "опд"):
+        # Списки ОПД живут в кеше opd_cache.json — расписание тут не нужно.
+        return build_opd_answer(message["chat"]["id"], receiver, args, today, anchor)
     target = resolve_target(args or COMMANDS[command], today)
     if target is None:
         return {"kind": "ignore"}
-    sender = message.get("from") or {}
-    receiver = sender.get("id")
     data = _load_parsed()
     if data is None:
         return {
             "kind": "reply",
             "chat_id": message["chat"]["id"],
             "receiver_user_id": receiver,
+            "command_message_id": anchor,
             "text": "Расписание ещё не подгрузилось, попробуй через пару минут.",
         }
     if target == "week":
@@ -483,6 +582,7 @@ def plan_response(
             "kind": "reply",
             "chat_id": message["chat"]["id"],
             "receiver_user_id": receiver,
+            "command_message_id": anchor,
             "text": build_week_text(data, today),
         }
         # Пост 1 в 1 как в закрепе канала; текст — запасной ответ.
@@ -492,6 +592,7 @@ def plan_response(
         "kind": "reply",
         "chat_id": message["chat"]["id"],
         "receiver_user_id": receiver,
+        "command_message_id": anchor,
         "text": build_day_text(data, target),
     }
     # Раздел дня как в закрепе + готовый скрин; текст остаётся запасным
@@ -522,7 +623,14 @@ def _send_text(plan: dict) -> dict:
     receiver = plan.get("receiver_user_id")
     if receiver:
         payload["ephemeral_message_parameters"] = {"receiver_user_id": receiver}
+    anchor = plan.get("command_message_id")
+    if anchor:
+        payload["reply_to_message_id"] = anchor
     result = api_call(config.TG_BOT_TOKEN, "sendMessage", payload, timeout=30)
+    if not result.get("ok") and anchor and "repl" in str(result.get("description") or "").lower():
+        # Команда уже удалена/недоступна — эфемерка важнее привязки.
+        payload.pop("reply_to_message_id", None)
+        result = api_call(config.TG_BOT_TOKEN, "sendMessage", payload, timeout=30)
     if result.get("ok"):
         message = result.get("result") or {}
         if receiver and not message.get("ephemeral_message_id"):
@@ -549,14 +657,24 @@ def _send_rich(plan: dict) -> dict:
     receiver = plan.get("receiver_user_id")
     if receiver:
         extra["ephemeral_message_parameters"] = {"receiver_user_id": receiver}
-    result = telegram_api.send_rich_message(
-        plan["rich"],
-        token=config.TG_BOT_TOKEN,
-        chat_id=plan["chat_id"],
-        files=plan.get("files"),
-        timeout=60,
-        extra_payload=extra or None,
-    )
+    anchor = plan.get("command_message_id")
+    if anchor:
+        extra["reply_to_message_id"] = anchor
+    def _send(extra_payload: dict) -> dict:
+        return telegram_api.send_rich_message(
+            plan["rich"],
+            token=config.TG_BOT_TOKEN,
+            chat_id=plan["chat_id"],
+            files=plan.get("files"),
+            timeout=60,
+            extra_payload=extra_payload or None,
+        )
+
+    result = _send(extra)
+    if not result.get("ok") and anchor and "repl" in str(result.get("description") or "").lower():
+        # Команда уже удалена/недоступна — rich-ответ важнее привязки.
+        extra.pop("reply_to_message_id", None)
+        result = _send(extra)
     if result.get("ok"):
         message = result.get("result") or {}
         if receiver and not message.get("ephemeral_message_id"):

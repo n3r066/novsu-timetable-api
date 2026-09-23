@@ -244,7 +244,7 @@ def test_rich_failure_falls_back_to_ephemeral_text(monkeypatch, tmp_path):
     payload = attempts[0]
     assert payload["parse_mode"] == "HTML"
     assert payload["ephemeral_message_parameters"]["receiver_user_id"] == ME
-    assert "reply_to_message_id" not in payload
+    assert payload["reply_to_message_id"] == 100
     assert "<b>СРЕДА" in payload["text"]
 
 
@@ -357,4 +357,123 @@ def test_register_commands_chat_scope_ephemeral(monkeypatch, tmp_path):
     assert payload["scope"] == {"type": "chat", "chat_id": CHAT}
     for command in payload["commands"]:
         assert command["is_ephemeral"] is True
-    assert {c["command"] for c in payload["commands"]} == {"timetable", "today", "tomorrow"}
+    assert {c["command"] for c in payload["commands"]} == {"timetable", "today", "tomorrow", "opd"}
+
+
+FAKE_OPD_VIEW = {
+    "date": "2026-09-24",
+    "group": "6381",
+    "rows": [
+        {
+            "student": "Вересков В. Ю.", "last_name": "Вересков", "vg": "107",
+            "status": "session", "next_date": "2026-10-01",
+            "block_start": "14:00", "block_end": "15:00",
+            "room": "106хк", "place": "рядом с ХТИ, ул. Сов. Армии, 7",
+            "building": "ул. Советской Армии, 7",
+            "teacher": "Мисько Э. Р.", "teacher_short": "Мисько Э. Р.", "note": "",
+            "mates": [
+                {"student": "Абрамов А. А.", "group": "6281", "institute": "ИГУМ"},
+                {"student": "Борисов Б. Б.", "group": "6282", "institute": "ИГУМ"},
+            ],
+        },
+        {
+            "student": "Азизова А. А.", "last_name": "Азизова", "vg": "112",
+            "status": "cancelled", "next_date": "2026-10-08", "mates": [],
+        },
+        {
+            "student": "Гусев Г. Г.", "last_name": "Гусев", "vg": "103",
+            "status": "free", "next_date": "2026-10-01", "mates": [],
+        },
+    ],
+    "counts": {"session": 1, "cancelled": 1, "free": 1},
+    "fetched_at": "2026-09-22T20:00:00+03:00",
+    "sources": {"sheet": "https://example.com/sheet", "doc": "https://example.com/doc"},
+}
+
+
+def _opd_env(monkeypatch, view):
+    monkeypatch.setattr(group_bot.opd_module, "load_opd", lambda *a, **k: {"stub": True})
+    monkeypatch.setattr(
+        group_bot.opd_module, "day_view",
+        lambda opd, date: view if view and date == dt.date(2026, 9, 24) else None)
+
+
+def test_opd_auto_finds_next_opd_date_and_reuses_channel_block(monkeypatch, tmp_path):
+    _env(monkeypatch, tmp_path)
+    _opd_env(monkeypatch, FAKE_OPD_VIEW)
+    plan = group_bot.plan_response(_update("/opd"), allowed_chat=CHAT,
+                                   allowed_user=ME, today=WED)
+    assert plan["kind"] == "reply"
+    assert plan["receiver_user_id"] == ME
+    assert plan["command_message_id"] == 100
+    # rich-блок — ровно тот же _opd_section, что в разделе дня закрепа
+    assert plan["rich"]["rich_message"]["blocks"] == [group_bot._opd_section(FAKE_OPD_VIEW)]
+    assert plan.get("files") is None
+    text = plan["text"]
+    assert "ОПД · ПО ВИРТУАЛЬНЫМ ГРУППАМ · 24.09 · идут 1 из 3" in text
+    assert "Вересков В. Ю." in text and "ВГ 107" in text
+    assert "❌ Занятий не будет:</b> Азизова А. А. (ВГ 112)" in text
+
+
+def test_opd_send_anchors_reply_to_command(monkeypatch, tmp_path):
+    _env(monkeypatch, tmp_path)
+    _opd_env(monkeypatch, FAKE_OPD_VIEW)
+    rich_calls = []
+
+    def fake_send(rich_message, *, token, chat_id, files=None, timeout=30,
+                  disable_notification=None, extra_payload=None):
+        rich_calls.append({"rich": rich_message, "extra": extra_payload})
+        return {"ok": True, "result": {"message_id": 0, "ephemeral_message_id": 77}}
+
+    monkeypatch.setattr(group_bot.telegram_api, "send_rich_message", fake_send)
+    group_bot.process_update(_update("/opd"))
+    extra = rich_calls[0]["extra"]
+    assert extra["ephemeral_message_parameters"]["receiver_user_id"] == ME
+    assert extra["reply_to_message_id"] == 100
+
+
+def test_opd_explicit_date_without_opd_is_honest_text(monkeypatch, tmp_path):
+    _env(monkeypatch, tmp_path)
+    _opd_env(monkeypatch, FAKE_OPD_VIEW)
+    plan = group_bot.plan_response(_update("/opd пятница"), allowed_chat=CHAT,
+                                   allowed_user=ME, today=WED)
+    assert plan["text"] == "На 25.09 ОПД нет."
+    assert "rich" not in plan
+
+
+def test_opd_no_opd_found_in_scan(monkeypatch, tmp_path):
+    _env(monkeypatch, tmp_path)
+    _opd_env(monkeypatch, None)
+    plan = group_bot.plan_response(_update("/opd"), allowed_chat=CHAT,
+                                   allowed_user=ME, today=WED)
+    assert plan["text"] == "Ближайшие две недели ОПД не найдено."
+
+
+def test_opd_without_cached_data_is_stub(monkeypatch, tmp_path):
+    _env(monkeypatch, tmp_path)  # load_opd -> None
+    plan = group_bot.plan_response(_update("/опд"), allowed_chat=CHAT,
+                                   allowed_user=ME, today=WED)
+    assert "не подгрузилось" in plan["text"]
+
+
+def test_text_reply_retry_without_anchor_when_command_gone(monkeypatch, tmp_path):
+    _env(monkeypatch, tmp_path)
+    _screens(monkeypatch, tmp_path, "Ср")
+    monkeypatch.setattr(
+        group_bot.telegram_api, "send_rich_message",
+        lambda *a, **k: {"ok": False, "description": "Bad Request: rich message failed"})
+    attempts = []
+
+    def fake_call(token, method, payload, **kw):
+        attempts.append(dict(payload))
+        if "reply_to_message_id" in payload:
+            return {"ok": False, "error_code": 400,
+                    "description": "Bad Request: message to be replied not found"}
+        return {"ok": True, "result": {"message_id": 0, "ephemeral_message_id": 99}}
+
+    monkeypatch.setattr(group_bot, "api_call", fake_call)
+    group_bot.process_update(_update("/today"))
+    assert len(attempts) == 2, "первый send с reply падает — ретрай без привязки"
+    assert attempts[0]["reply_to_message_id"] == 100
+    assert "reply_to_message_id" not in attempts[1]
+    assert attempts[1]["ephemeral_message_parameters"]["receiver_user_id"] == ME
