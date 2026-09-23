@@ -192,6 +192,9 @@ The monitor must call dashboard editing on every unchanged cycle.
 
 Current user-facing rules:
 
+- show one header timestamp, `Расписание обновлено: … МСК`: prefer the
+  last semantic schedule change; use the post edit time only when that history
+  is unavailable. Do not add a separate timestamp for the post itself;
 - do not print `ОЧНО`; in-person is the ordinary case;
 - the third table column is `место / время`;
 - each lesson uses two stacked cells in that column: room/location (or `ДОТ`)
