@@ -415,12 +415,13 @@ def test_opd_auto_finds_next_opd_date_and_reuses_channel_block(monkeypatch, tmp_
     assert plan["receiver_user_id"] == ME
     assert plan["command_message_id"] == 100
     # rich: настоящий заголовок ОПД + свёрнутые корпуса без эмодзи и
-    # источников, в конце «Занятий не будет» заголовком + таблицей
+    # источников, в конце «Проектной не будет у:» заголовком + таблицей
     blocks = plan["rich"]["rich_message"]["blocks"]
     expected = group_bot._opd_section(
         FAKE_OPD_VIEW, sources=False, markers=False, open_mates=False,
         open_section=True)
-    expected += group_bot._opd_cancelled_table(FAKE_OPD_VIEW, markers=False)
+    expected += group_bot._opd_cancelled_table(
+        FAKE_OPD_VIEW, markers=False, title="Проектной не будет у:")
     assert blocks == expected
     # раздел ОПД в /opd — rich-заголовок, а не свёрнутый details
     assert blocks[0] == {"type": "heading", "size": 3,
@@ -432,7 +433,8 @@ def test_opd_auto_finds_next_opd_date_and_reuses_channel_block(monkeypatch, tmp_
     assert "is_open" not in mates[0] and "Вместе в ВГ 107" in json.dumps(
         mates[0], ensure_ascii=False)
     assert mates[0]["blocks"] and "is_open" in mates[0]["blocks"][0]
-    assert blocks[-2:] == fmt._opd_cancelled_table(FAKE_OPD_VIEW, markers=False)
+    assert blocks[-2:] == fmt._opd_cancelled_table(
+        FAKE_OPD_VIEW, markers=False, title="Проектной не будет у:")
     full_dump = json.dumps(blocks, ensure_ascii=False)
     assert "📍" not in full_dump and "❌" not in full_dump
     assert "Источники" not in full_dump and "example.com" not in full_dump
@@ -445,7 +447,8 @@ def test_opd_auto_finds_next_opd_date_and_reuses_channel_block(monkeypatch, tmp_
     assert header[0]["is_header"] and header[1]["is_header"]
     row = table["cells"][1]
     assert row[0]["text"] == ["Азизова А. А."] and row[1]["text"] == ["112"]
-    assert "Занятий не будет" in full_dump
+    assert blocks[-2]["text"] == "Проектной не будет у:"
+    assert "Занятий не будет" not in full_dump
     # канал (дефолт): раздел свёрнут, с маркерами и источниками; таблица
     # «Занятий не будет» — рядом, на уровне дня
     channel_blocks = group_bot._opd_section(FAKE_OPD_VIEW)
@@ -465,7 +468,7 @@ def test_opd_auto_finds_next_opd_date_and_reuses_channel_block(monkeypatch, tmp_
     assert "ОПД · ПО ВИРТУАЛЬНЫМ ГРУППАМ · 24.09 · идут 1 из 3" in text
     assert "Вересков В. Ю." in text and "ВГ 107" in text
     assert "📍" not in text and "❌" not in text
-    assert "<b>Занятий не будет:</b> Азизова А. А. (ВГ 112)" in text
+    assert "<b>Проектной не будет у:</b> Азизова А. А. (ВГ 112)" in text
 
 
 def test_opd_send_anchors_reply_to_command(monkeypatch, tmp_path):
