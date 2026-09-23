@@ -8,15 +8,28 @@ NOVSU_GROUP_CHAT_ID процесс даже не стартует — в ЛС н
   /tomorrow, /завтра       -> завтра
 Аргументы: today|tomorrow|сегодня|завтра|вся|неделя|пн..вс.
 
-Ответ — текст в разметке канала: шапка «СРЕДА · 23.09.2026 · 5 пар · 1 ДОТ»
-и пары как в основном посте: номер, время, тип, предмет, препод, место.
+Ответ на день — тот же развёрнутый раздел, что в закрепе канала
+(sendRichMessage): таблица пар, ОПД-раздел и сворачиваемый скрин с портала.
+Скрин берётся готовым из кеша закрепа state/dashboard_screens.json —
+рендер ноль, парсинг ноль. Если дня нет в расписании или rich-отправка
+не прошла — ответ деградирует до текстовой вырезки. /timetable — текст.
 Данные — те же state/last_parsed.json, что рисуют закреп: материал один,
 ничего не рендерится и сервер не нагружается.
 
 Дата всегда по Москве (сервер в UTC — иначе после полуночи МСК бот путает
-день). Эфемерность эмулируется: нативных эфемерных сообщений в Bot API нет
-(проверено 2026-09-22), поэтому через TTL бот-админ удаляет и свой ответ,
-и саму команду.
+день).
+
+Эфемерность нативная (Bot API 10.2+, формат 10.3): ответ уходит с
+ephemeral_message_parameters.receiver_user_id — его видит только автор
+команды, Telegram сам прячет его от остальных и сам удаляет со временем.
+Бот — админ группы, поэтому отвечать можно в любой момент: без
+15-секундного окна и без callback_query_id (это ограничение не-админов).
+Кирилличные псевдонимы (/сегодня) парсятся, но в меню не регистрируются
+(BotCommand допускает только латиницу) — при отправке такая команда
+остаётся видна группе, ответ всё равно эфемерный. Анонимный админ
+(from отсутствует) не имеет user_id для адресации — ему уходит обычный
+публичный ответ. Доставка эфемерного сообщения не гарантирована
+(офлайн-клиент может его не получить) — это куртиз, а не канал доставки.
 
 Запуск: python3 group_bot.py            # вечный поллинг
         python3 group_bot.py --once     # один батч (отладка)
@@ -30,7 +43,6 @@ import json
 import os
 import re
 import sys
-import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -38,15 +50,34 @@ from zoneinfo import ZoneInfo
 
 import config
 import bells
+import opd as opd_module
+import telegram_api
+from schedule_logic import find_week, resolve_dashboard_view, week_view
+from format import (
+    DAY_FULL_TO_SHORT,
+    DAY_SHORT_TO_FULL,
+    _dashboard_day_section,
+    _day_hides_expired,
+    build_dashboard_rich_message,
+)
 from telegram_api import call as api_call
 
 BOT_USERNAME = "novsutimetablebot"
 MSK = ZoneInfo("Europe/Moscow")
 STATE_FILE = config.STATE_DIR / "last_parsed.json"
 OFFSET_FILE = config.STATE_DIR / "group_bot_offset.json"
+#: Кеш готовых скринов дней недели, которыми живёт закреп канала.
+SCREENS_FILE = config.STATE_DIR / "dashboard_screens.json"
+DASHBOARD_POST_FILE = config.STATE_DIR / "last_dashboard_post.json"
+MONITOR_STATE_FILE = config.STATE_DIR / "monitor_state.json"
 
-#: Через сколько секунд после ответа удаляются и ответ, и команда.
-TTL_S = float(getattr(config, "GROUP_BOT_TTL_S", None) or 90)
+#: Команды, регистрируемые в меню группы как эфемерные (BotCommand — только
+#: латиница; is_ephemeral=true прячет саму команду от остальных участников).
+EPHEMERAL_COMMANDS = (
+    {"command": "timetable", "description": "Расписание недели — видно только тебе"},
+    {"command": "today", "description": "Пары на сегодня — видно только тебе"},
+    {"command": "tomorrow", "description": "Пары на завтра — видно только тебе"},
+)
 
 DAY_NAMES = ["Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота", "Воскресенье"]
 DAY_ALIASES = {
@@ -73,9 +104,6 @@ COMMANDS = {
 }
 
 _TYPE_RE = re.compile(r"^\(([^)]*)\)\s*")
-
-#: Фабрика таймеров самоудаления — в тестах подменяется на фейк.
-timer_factory = threading.Timer
 
 
 def today_msk(now: dt.datetime | None = None) -> dt.date:
@@ -220,6 +248,161 @@ def build_week_text(data: dict, target: dt.date, group_name: str = "6381") -> st
     return "\n\n".join(chunks)
 
 
+def _cached_day_screen(data: dict, target: dt.date, today: dt.date) -> Path | None:
+    """Готовый скрин дня из кеша закрепа — рендера ноль.
+
+    Скрин годится только для дня той же учебной недели, что сейчас в закрепе:
+    кеш подписан короткими именами дней, и «Пн» следующей недели — другой
+    файл. Иначе молча отдаём None и ответ уходит без картинки.
+    """
+    week_today = _week_block(data, today)
+    week_target = _week_block(data, target)
+    if not week_today or week_today != week_target:
+        return None
+    try:
+        cache = json.loads(SCREENS_FILE.read_text(encoding="utf-8"))
+        items = cache.get("items") or []
+    except (OSError, ValueError):
+        return None
+    short = DAY_FULL_TO_SHORT.get(DAY_NAMES[target.weekday()])
+    for item in items:
+        if item.get("label") == short:
+            path = Path(str(item.get("path") or ""))
+            return path if path.is_file() else None
+    return None
+
+
+
+def build_week_answer(data: dict, today: dt.date, now: dt.datetime | None = None) -> dict:
+    """Пост недели 1 в 1 как в закрепе канала: те же блоки, ОПД и скрины.
+
+    Рендер ноль: скрины только готовые из кеша закрепа
+    state/dashboard_screens.json, живые дни считаются той же логикой
+    (resolve_dashboard_view), что рисует пост. Без кеша пост уйдёт без
+    картинок — расписание то же.
+    """
+    if now is None:
+        now = _dashboard_now(today)
+    try:
+        opd_data = opd_module.load_opd(now=now)
+    except Exception:  # noqa: BLE001 - ОПД не должен ронять ответ
+        opd_data = None
+    late_ends = opd_module.late_ends(opd_data)
+    view = resolve_dashboard_view(
+        data.get("schedule"), data.get("weeks") or [], now, late_ends=late_ends)
+    live_days = set(view["live_days"])
+    items = [item for item in _screens_cache_items() if _item_day_live(item, live_days)]
+    screenshot_media = [
+        {"label": item["label"], "media": f"attach://site_screenshot_{index}"}
+        for index, item in enumerate(items, 1)
+    ]
+    files = {f"site_screenshot_{index}": Path(str(item["path"]))
+             for index, item in enumerate(items, 1)}
+    sleepy = False
+    try:
+        state = json.loads(DASHBOARD_POST_FILE.read_text(encoding="utf-8"))
+        sleepy = bool(state.get("sleepy"))
+    except (OSError, ValueError):
+        pass
+    rich = build_dashboard_rich_message(
+        data.get("schedule"),
+        data.get("weeks") or [],
+        config.GROUP_URL,
+        view["target_date"],
+        group_name="6381",
+        screenshot_media=screenshot_media,
+        current_date=now.date(),
+        now=now,
+        last_updated=_post_stamp(),
+        schedule_changed=_schedule_changed_stamp(),
+        opd=opd_data,
+        sleep_note="😴 Сайт в спячке — сохранённое расписание" if sleepy else "",
+    )
+    return {"rich": rich, "files": files or None}
+
+
+def _dashboard_now(today: dt.date) -> dt.datetime:
+    """«Сейчас» для копии закрепа: дата плана + реальное время МСК."""
+    return dt.datetime.combine(today, dt.datetime.now(MSK).timetz())
+
+
+def _screens_cache_items() -> list[dict]:
+    try:
+        cache = json.loads(SCREENS_FILE.read_text(encoding="utf-8"))
+        items = cache.get("items") or []
+    except (OSError, ValueError):
+        return []
+    return [item for item in items
+            if Path(str(item.get("path") or "")).is_file()]
+
+
+def _item_day_live(item: dict, live_days: set) -> bool:
+    label = str(item.get("label") or "")
+    day_name = DAY_SHORT_TO_FULL.get(label)
+    return day_name is None or day_name in live_days
+
+
+def _post_stamp() -> str:
+    """«Обновлено …» — фактическое время поста закрепа, не время ответа."""
+    try:
+        state = json.loads(DASHBOARD_POST_FILE.read_text(encoding="utf-8"))
+        ts = str(state.get("ts") or "")
+        if ts:
+            stamp = dt.datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone(MSK)
+            return stamp.strftime("%d.%m.%Y %H:%M")
+    except (OSError, ValueError):
+        pass
+    return dt.datetime.now(MSK).strftime("%d.%m.%Y %H:%M")
+
+
+def _schedule_changed_stamp() -> str:
+    try:
+        state = json.loads(MONITOR_STATE_FILE.read_text(encoding="utf-8"))
+        event = state.get("last_change_event") or state.get("event") or {}
+        ts = str(event.get("ts") or "")
+        if ts:
+            stamp = dt.datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone(MSK)
+            return stamp.strftime("%d.%m.%Y %H:%M")
+    except (OSError, ValueError):
+        pass
+    return ""
+
+
+def build_day_answer(data: dict, target: dt.date, today: dt.date | None = None) -> dict:
+    """Раздел дня ровно как в закрепе канала: rich-блок + готовый скрин.
+
+    Возвращает {"rich": ..., "files": ...} (files может быть None) или {},
+    если дня нет в расписании — тогда ответ деградирует до текстовой вырезки.
+    """
+    today = today or today_msk()
+    week = find_week(data.get("weeks") or [], target)
+    if not week:
+        return {}
+    view = week_view(data.get("schedule"), data.get("weeks"), week,
+                     group="6381", source_url=config.GROUP_URL)
+    day = next((d for d in view.get("days") or []
+                if d.get("date") == target.isoformat() and d.get("lessons")), None)
+    if day is None:
+        return {}
+    try:
+        opd_data = opd_module.load_opd(now=dt.datetime.now(MSK))
+    except Exception:  # noqa: BLE001 - ОПД не должен ронять ответ
+        opd_data = None
+    opd_view = opd_module.day_view(opd_data, target) if opd_data else None
+    screen = _cached_day_screen(data, target, today)
+    media = "attach://day_screenshot_1" if screen else None
+    block = _dashboard_day_section(
+        day,
+        screenshot_media=media,
+        source_url=config.GROUP_URL,
+        opd_view=opd_view,
+        hidden_expired=_day_hides_expired(data.get("schedule"), data.get("weeks") or [], target),
+    )
+    rich = {"rich_message": {"blocks": [block]}}
+    files = {"day_screenshot_1": screen} if screen else None
+    return {"rich": rich, "files": files}
+
+
 def extract_command(text: object, bot_username: str = BOT_USERNAME) -> tuple[str, str] | None:
     """«/today@bot завтра» -> ("today", "завтра"); не команды -> None."""
     if not isinstance(text, str) or not text.startswith("/"):
@@ -285,61 +468,110 @@ def plan_response(
     target = resolve_target(args or COMMANDS[command], today)
     if target is None:
         return {"kind": "ignore"}
+    sender = message.get("from") or {}
+    receiver = sender.get("id")
     data = _load_parsed()
     if data is None:
         return {
             "kind": "reply",
             "chat_id": message["chat"]["id"],
+            "receiver_user_id": receiver,
             "text": "Расписание ещё не подгрузилось, попробуй через пару минут.",
-            "command_message_id": message.get("message_id"),
         }
     if target == "week":
-        text = build_week_text(data, today)
-    else:
-        text = build_day_text(data, target)
-    return {
+        plan = {
+            "kind": "reply",
+            "chat_id": message["chat"]["id"],
+            "receiver_user_id": receiver,
+            "text": build_week_text(data, today),
+        }
+        # Пост 1 в 1 как в закрепе канала; текст — запасной ответ.
+        plan.update(build_week_answer(data, today))
+        return plan
+    plan = {
         "kind": "reply",
         "chat_id": message["chat"]["id"],
-        "text": text,
-        "command_message_id": message.get("message_id"),
+        "receiver_user_id": receiver,
+        "text": build_day_text(data, target),
     }
+    # Раздел дня как в закрепе + готовый скрин; текст остаётся запасным
+    # ответом, если rich-отправка вдруг не пройдёт.
+    plan.update(build_day_answer(data, target, today=today))
+    return plan
 
 
-def _delete_later(chat_id: int, *message_ids: int) -> None:
-    def _worker() -> None:
-        for message_id in message_ids:
-            if not message_id:
-                continue
-            try:
-                api_call(config.TG_BOT_TOKEN, "deleteMessage",
-                         {"chat_id": chat_id, "message_id": message_id}, timeout=15)
-            except Exception as exc:  # noqa: BLE001 - удаление лучшее из возможного
-                print(f"[group_bot] delete {message_id} failed: {exc}", file=sys.stderr)
-
-    timer_factory(TTL_S, _worker).start()
+def _delete_message(chat_id: int, message_id: int) -> bool:
+    try:
+        result = api_call(config.TG_BOT_TOKEN, "deleteMessage",
+                          {"chat_id": chat_id, "message_id": message_id}, timeout=15)
+    except Exception as exc:  # noqa: BLE001 - удаление лучшее из возможного
+        print(f"[group_bot] delete {message_id} failed: {exc}", file=sys.stderr)
+        return False
+    return bool(result.get("ok"))
 
 
-def _send_text(plan: dict) -> list[int]:
+def _send_text(plan: dict) -> dict:
+    """Отправить ответ. С receiver_user_id — как эфемерное сообщение,
+    видимое только автору команды; без него (анонимный админ) — публично."""
     payload: dict[str, Any] = {
         "chat_id": plan["chat_id"],
         "text": plan["text"],
         "parse_mode": "HTML",
         "disable_web_page_preview": True,
-        "reply_to_message_id": plan.get("command_message_id"),
     }
+    receiver = plan.get("receiver_user_id")
+    if receiver:
+        payload["ephemeral_message_parameters"] = {"receiver_user_id": receiver}
     result = api_call(config.TG_BOT_TOKEN, "sendMessage", payload, timeout=30)
-    if not result.get("ok") and plan.get("command_message_id"):
-        # Команда могла успеть удалиться/протухнуть — шлём без reply,
-        # иначе весь ответ теряется из-за одной ссылки на сообщение.
-        description = str(result.get("description", ""))
-        if "replied" in description or "reply" in description:
-            payload.pop("reply_to_message_id", None)
-            result = api_call(config.TG_BOT_TOKEN, "sendMessage", payload, timeout=30)
-    if not result.get("ok"):
-        print(f"[group_bot] send failed: {result}", file=sys.stderr)
-        return []
-    message_id = (result.get("result") or {}).get("message_id")
-    return [message_id] if message_id else []
+    if result.get("ok"):
+        message = result.get("result") or {}
+        if receiver and not message.get("ephemeral_message_id"):
+            # Страховка: параметры проигнорированы и ответ ушёл публично
+            # (message_id у эфемерных всегда 0). Мгновенно вытираем и орём.
+            leaked_id = message.get("message_id") or 0
+            deleted = bool(leaked_id) and _delete_message(plan["chat_id"], leaked_id)
+            print(
+                f"[group_bot] ephemeral ignored, public leak deleted={deleted}: {message}",
+                file=sys.stderr,
+            )
+            _alert("group_bot: эфемерность не сработала, публичный ответ "
+                   f"{'удалён' if deleted else 'НЕ удалён'} — проверь права бота")
+            return {"ok": False, "error": "ephemeral_ignored", "leak_deleted": deleted}
+        return result
+    print(f"[group_bot] send failed: {result}", file=sys.stderr)
+    _alert(f"group_bot: sendMessage failed: {result.get('description') or result}")
+    return result
+
+
+def _send_rich(plan: dict) -> dict:
+    """Отправить rich-раздел дня. Эфемерный, если есть адресат."""
+    extra: dict[str, Any] = {}
+    receiver = plan.get("receiver_user_id")
+    if receiver:
+        extra["ephemeral_message_parameters"] = {"receiver_user_id": receiver}
+    result = telegram_api.send_rich_message(
+        plan["rich"],
+        token=config.TG_BOT_TOKEN,
+        chat_id=plan["chat_id"],
+        files=plan.get("files"),
+        timeout=60,
+        extra_payload=extra or None,
+    )
+    if result.get("ok"):
+        message = result.get("result") or {}
+        if receiver and not message.get("ephemeral_message_id"):
+            leaked_id = message.get("message_id") or 0
+            deleted = bool(leaked_id) and _delete_message(plan["chat_id"], leaked_id)
+            print(
+                f"[group_bot] ephemeral ignored, public leak deleted={deleted}: {message}",
+                file=sys.stderr,
+            )
+            _alert("group_bot: эфемерность не сработала, публичный rich-ответ "
+                   f"{'удалён' if deleted else 'НЕ удалён'} — проверь права бота")
+            return {"ok": False, "error": "ephemeral_ignored", "leak_deleted": deleted}
+        return result
+    print(f"[group_bot] sendRichMessage failed: {result}", file=sys.stderr)
+    return result
 
 
 def process_update(update: dict) -> None:
@@ -350,11 +582,23 @@ def process_update(update: dict) -> None:
     )
     if plan.get("kind") != "reply":
         return
-    sent_ids = _send_text(plan)
-    if not sent_ids:
-        return
-    # Эфемерность: через TTL исчезают и ответ, и сама команда.
-    _delete_later(plan["chat_id"], *sent_ids, plan.get("command_message_id"))
+    if plan.get("rich"):
+        result = _send_rich(plan)
+        if result.get("ok"):
+            return
+        # Не ушло rich'ом — деградируем до текста, ответ терять нельзя.
+        print("[group_bot] falling back to plain text", file=sys.stderr)
+    _send_text(plan)
+
+
+def register_commands() -> dict:
+    """Зарегистрировать команды группы как эфемерные (setMyCommands, scope
+    chat). Идемпотентно; вызывается на старте, чтобы меню всегда было актуально."""
+    payload = {
+        "commands": [dict(command) | {"is_ephemeral": True} for command in EPHEMERAL_COMMANDS],
+        "scope": {"type": "chat", "chat_id": config.TG_GROUP_CHAT_ID},
+    }
+    return api_call(config.TG_BOT_TOKEN, "setMyCommands", payload, timeout=15)
 
 
 def _read_offset() -> int:
@@ -427,6 +671,14 @@ def main(argv: list[str] | None = None) -> int:
         # Fail-closed: без привязки к группе бот не должен отвечать в ЛС.
         print("[group_bot] NOVSU_GROUP_CHAT_ID не задан — старт отменён", file=sys.stderr)
         return 1
+    try:
+        registered = register_commands()
+        if not registered.get("ok"):
+            print(f"[group_bot] setMyCommands failed: {registered}", file=sys.stderr)
+            _alert("group_bot: не смог зарегистрировать эфемерные команды — "
+                   "они будут видны при отправке")
+    except Exception as exc:  # noqa: BLE001 - меню не должно валить бота
+        print(f"[group_bot] setMyCommands error: {exc}", file=sys.stderr)
     if "--once" in argv:
         poll_once(_read_offset())
         return 0

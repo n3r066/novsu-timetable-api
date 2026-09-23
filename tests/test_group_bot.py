@@ -1,4 +1,9 @@
-"""Тесты эфемерного группового бота (group_bot.py)."""
+"""Тесты эфемерного группового бота (group_bot.py).
+
+Эфемерность нативная (Bot API 10.3): ответ адресуется автору команды через
+ephemeral_message_parameters.receiver_user_id и не удаляется вручную.
+Дневной ответ — rich-раздел как в закрепе канала + готовый скрин из кеша.
+"""
 
 import datetime as dt
 import json
@@ -58,7 +63,19 @@ def _update(text, user=ME, chat=CHAT, ctype="supergroup", message_id=100, anonym
 def _env(monkeypatch, tmp_path):
     monkeypatch.setattr(group_bot, "STATE_FILE", tmp_path / "last_parsed.json")
     (tmp_path / "last_parsed.json").write_text(json.dumps(DATA), encoding="utf-8")
+    # скрины-кеш закрепа и ОПД не трогаем: нет сети, нет реальных стейтов
+    monkeypatch.setattr(group_bot, "SCREENS_FILE", tmp_path / "dashboard_screens.json")
+    monkeypatch.setattr(group_bot.opd_module, "load_opd", lambda *a, **k: None)
     return tmp_path
+
+
+def _screens(monkeypatch, tmp_path, *labels):
+    png = tmp_path / "day_screen.png"
+    png.write_bytes(b"\x89PNG fake")
+    (tmp_path / "dashboard_screens.json").write_text(
+        json.dumps({"items": [{"label": label, "path": str(png)} for label in labels]}),
+        encoding="utf-8")
+    return png
 
 
 def test_today_msk_uses_moscow_not_server_utc():
@@ -163,49 +180,181 @@ def test_main_refuses_to_start_without_group_chat_id(monkeypatch, tmp_path):
     _env(monkeypatch, tmp_path)
     monkeypatch.setattr(group_bot.config, "TG_GROUP_CHAT_ID", None)
     assert group_bot.main([]) == 1
-
-
-def test_process_update_sends_text_and_schedules_delete(monkeypatch, tmp_path):
+def test_process_update_sends_ephemeral_rich_day_section(monkeypatch, tmp_path):
     _env(monkeypatch, tmp_path)
-    calls = {"sent": [], "deleted": []}
-    monkeypatch.setattr(group_bot, "api_call", lambda token, method, payload, **kw: (
-        calls["sent"].append((method, payload)) if method == "sendMessage"
-        else calls["deleted"].append((method, payload))
-    ) or {"ok": True, "result": {"message_id": 501}})
-    timers = []
-    monkeypatch.setattr(group_bot, "timer_factory",
-                        lambda delay, worker: timers.append((delay, worker)) or
-                        type("T", (), {"start": lambda self: None})())
-    group_bot.process_update(_update("/today", message_id=777))
-    method, payload = calls["sent"][0]
-    assert method == "sendMessage"
+    png = _screens(monkeypatch, tmp_path, "Ср")
+    rich_calls = []
+
+    def fake_send(rich_message, *, token, chat_id, files=None, timeout=30,
+                  disable_notification=None, extra_payload=None):
+        rich_calls.append({
+            "rich": rich_message, "files": files, "chat_id": chat_id,
+            "extra": extra_payload,
+        })
+        return {"ok": True, "result": {"message_id": 0, "ephemeral_message_id": 9001}}
+
+    monkeypatch.setattr(group_bot.telegram_api, "send_rich_message", fake_send)
+    sent_text = []
+    monkeypatch.setattr(group_bot, "api_call", lambda *a, **k: sent_text.append(1) or {"ok": True})
+    group_bot.process_update(_update("/today"))
+    assert len(rich_calls) == 1 and not sent_text, "текстовая деградация не нужна"
+    call = rich_calls[0]
+    assert call["chat_id"] == CHAT
+    assert call["extra"]["ephemeral_message_parameters"]["receiver_user_id"] == ME
+    assert call["files"] == {"day_screenshot_1": png}
+    dumped = json.dumps(call["rich"], ensure_ascii=False)
+    assert "attach://day_screenshot_1" in dumped
+    assert "Среда" in dumped and "История России" in dumped
+
+
+def test_day_answer_without_screen_has_no_files(monkeypatch, tmp_path):
+    _env(monkeypatch, tmp_path)  # скрины-кеш не записан
+    plan = group_bot.plan_response(
+        _update("/today"), allowed_chat=CHAT, allowed_user=ME, today=WED)
+    assert plan["rich"] is not None
+    assert plan["files"] is None
+    assert "attach://" not in json.dumps(plan["rich"], ensure_ascii=False)
+
+
+def test_day_outside_cached_week_is_text_only(monkeypatch, tmp_path):
+    _env(monkeypatch, tmp_path)
+    _screens(monkeypatch, tmp_path, "Пн", "Ср")
+    plan = group_bot.plan_response(
+        _update("/today пн"), allowed_chat=CHAT, allowed_user=ME, today=WED)
+    # 28.09 — неделя вне расписания: rich-раздела нет, только текст
+    assert "rich" not in plan
+    assert plan["kind"] == "reply"
+
+
+def test_rich_failure_falls_back_to_ephemeral_text(monkeypatch, tmp_path):
+    _env(monkeypatch, tmp_path)
+    _screens(monkeypatch, tmp_path, "Ср")
+    monkeypatch.setattr(
+        group_bot.telegram_api, "send_rich_message",
+        lambda *a, **k: {"ok": False, "description": "Bad Request: rich message failed"})
+    attempts = []
+
+    def fake_call(token, method, payload, **kw):
+        attempts.append(dict(payload))
+        return {"ok": True, "result": {"message_id": 0, "ephemeral_message_id": 4242}}
+
+    monkeypatch.setattr(group_bot, "api_call", fake_call)
+    group_bot.process_update(_update("/today"))
+    assert len(attempts) == 1, "rich упал — один текстовый ответ"
+    payload = attempts[0]
     assert payload["parse_mode"] == "HTML"
-    assert payload["reply_to_message_id"] == 777
+    assert payload["ephemeral_message_parameters"]["receiver_user_id"] == ME
+    assert "reply_to_message_id" not in payload
     assert "<b>СРЕДА" in payload["text"]
-    assert len(timers) == 1
-    delay, worker = timers[0]
-    assert delay == group_bot.TTL_S
-    worker()
-    deleted_ids = {p["message_id"] for m, p in calls["deleted"] if m == "deleteMessage"}
-    assert deleted_ids == {501, 777}, "удаляются и ответ, и команда"
 
 
-def test_send_retries_without_reply_when_command_gone(monkeypatch, tmp_path):
+def test_week_command_is_ephemeral_rich_channel_copy(monkeypatch, tmp_path):
+    _env(monkeypatch, tmp_path)
+    _screens(monkeypatch, tmp_path, "Ср", "Чт")
+    # фиксированное «сейчас», чтобы живые дни не зависели от реального часа
+    monkeypatch.setattr(group_bot, "_dashboard_now",
+                        lambda d: dt.datetime(2026, 9, 23, 12, 0, tzinfo=group_bot.MSK))
+    rich_calls = []
+
+    def fake_send(rich_message, *, token, chat_id, files=None, timeout=30,
+                  disable_notification=None, extra_payload=None):
+        rich_calls.append({"rich": rich_message, "files": files, "extra": extra_payload})
+        return {"ok": True, "result": {"message_id": 0, "ephemeral_message_id": 8008}}
+
+    monkeypatch.setattr(group_bot.telegram_api, "send_rich_message", fake_send)
+    group_bot.process_update(_update("/timetable"))
+    assert len(rich_calls) == 1
+    call = rich_calls[0]
+    assert call["extra"]["ephemeral_message_parameters"]["receiver_user_id"] == ME
+    dumped = json.dumps(call["rich"], ensure_ascii=False)
+    assert "НЕДЕЛЯ 4" in dumped and "Среда" in dumped and "Четверг" in dumped
+    assert "attach://site_screenshot_1" in dumped
+    assert call["files"] == {"site_screenshot_1": tmp_path / "day_screen.png",
+                             "site_screenshot_2": tmp_path / "day_screen.png"}
+
+
+def test_week_text_fallback_is_ephemeral(monkeypatch, tmp_path):
+    _env(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        group_bot.telegram_api, "send_rich_message",
+        lambda *a, **k: {"ok": False, "description": "Bad Request"})
+    attempts = []
+
+    def fake_call(token, method, payload, **kw):
+        attempts.append(dict(payload))
+        return {"ok": True, "result": {"message_id": 0, "ephemeral_message_id": 7007}}
+
+    monkeypatch.setattr(group_bot, "api_call", fake_call)
+    group_bot.process_update(_update("/timetable"))
+    payload = attempts[0]
+    assert payload["ephemeral_message_parameters"]["receiver_user_id"] == ME
+    assert "НЕДЕЛЯ 4" in payload["text"]
+
+
+def test_anonymous_admin_gets_public_text(monkeypatch, tmp_path):
     _env(monkeypatch, tmp_path)
     attempts = []
 
     def fake_call(token, method, payload, **kw):
         attempts.append(dict(payload))
-        if "reply_to_message_id" in payload:
-            return {"ok": False, "description": "Bad Request: message to be replied not found"}
-        return {"ok": True, "result": {"message_id": 601}}
+        return {"ok": True, "result": {"message_id": 12}}
 
     monkeypatch.setattr(group_bot, "api_call", fake_call)
-    monkeypatch.setattr(group_bot, "timer_factory",
-                        lambda delay, worker: type("T", (), {"start": lambda self: None})())
     plan = group_bot.plan_response(
-        _update("/today", message_id=888), allowed_chat=CHAT, allowed_user=ME, today=WED)
-    sent = group_bot._send_text(plan)
-    assert sent == [601]
-    assert len(attempts) == 2
-    assert "reply_to_message_id" not in attempts[1]
+        _update("/timetable", anonymous=True), allowed_chat=CHAT, allowed_user=ME, today=WED)
+    assert plan["receiver_user_id"] is None
+    group_bot._send_text(plan)
+    assert "ephemeral_message_parameters" not in attempts[0]
+    assert "НЕДЕЛЯ 4" in attempts[0]["text"]
+
+
+def test_ephemeral_params_ignored_public_leak_is_deleted(monkeypatch, tmp_path):
+    _env(monkeypatch, tmp_path)
+    deleted = []
+
+    def fake_call(token, method, payload, **kw):
+        if method == "deleteMessage":
+            deleted.append(dict(payload))
+        return {"ok": True, "result": {"message_id": 555}}  # ушло публично
+
+    monkeypatch.setattr(group_bot, "api_call", fake_call)
+    alerts = []
+    monkeypatch.setattr(group_bot, "_alert", lambda text: alerts.append(text))
+    plan = group_bot.plan_response(
+        _update("/timetable"), allowed_chat=CHAT, allowed_user=ME, today=WED)
+    result = group_bot._send_text(plan)
+    assert result.get("error") == "ephemeral_ignored"
+    assert deleted == [{"chat_id": CHAT, "message_id": 555}]
+    assert alerts and "НЕ удалён" not in alerts[0]
+
+
+def test_send_failure_alerts_owner(monkeypatch, tmp_path):
+    _env(monkeypatch, tmp_path)
+    monkeypatch.setattr(group_bot, "api_call",
+                        lambda *a, **k: {"ok": False, "description": "Too Many Requests"})
+    alerts = []
+    monkeypatch.setattr(group_bot, "_alert", lambda text: alerts.append(text))
+    plan = group_bot.plan_response(
+        _update("/timetable"), allowed_chat=CHAT, allowed_user=ME, today=WED)
+    group_bot._send_text(plan)
+    assert alerts and "Too Many Requests" in alerts[0]
+
+
+def test_register_commands_chat_scope_ephemeral(monkeypatch, tmp_path):
+    _env(monkeypatch, tmp_path)
+    attempts = []
+
+    def fake_call(token, method, payload, **kw):
+        attempts.append((method, payload))
+        return {"ok": True}
+
+    monkeypatch.setattr(group_bot, "api_call", fake_call)
+    monkeypatch.setattr(group_bot.config, "TG_GROUP_CHAT_ID", CHAT)
+    result = group_bot.register_commands()
+    assert result["ok"]
+    method, payload = attempts[0]
+    assert method == "setMyCommands"
+    assert payload["scope"] == {"type": "chat", "chat_id": CHAT}
+    for command in payload["commands"]:
+        assert command["is_ephemeral"] is True
+    assert {c["command"] for c in payload["commands"]} == {"timetable", "today", "tomorrow"}

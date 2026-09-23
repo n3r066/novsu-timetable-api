@@ -297,11 +297,18 @@ def send_rich_message(
     files: dict[str, Path] | None = None,
     timeout: int = 30,
     disable_notification: bool | None = None,
+    extra_payload: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Отправить rich-сообщение. files — attach://-медиа (скриншоты и т. п.)."""
+    """Отправить rich-сообщение. files — attach://-медиа (скриншоты и т. п.).
+
+    extra_payload — дополнительные top-level параметры метода (например,
+    ephemeral_message_parameters для личного ответа в группе).
+    """
     payload = {"chat_id": chat_id, **rich_message}
     if disable_notification is not None:
         payload["disable_notification"] = disable_notification
+    if extra_payload:
+        payload.update(extra_payload)
     validate_rich_payload(payload)
     if files:
         return call_multipart(token, "sendRichMessage", payload, files, timeout=timeout)
