@@ -1,19 +1,21 @@
-"""Эфемерные команды расписания в групповом чате.
+"""Эфемерные команды расписания в групповом чате — текстовые вырезки дня.
 
 Поллинг getUpdates строго в одном выделенном супергрупповом чате (без
 NOVSU_GROUP_CHAT_ID процесс даже не стартует — в ЛС не отвечаем никогда).
 Команды:
-  /timetable, /расписание  -> вся неделя (альбом тех же скринов, что висят
-                            в закрепе канала; без рендера, файлы берутся
-                            из state/dashboard_screens.json)
-  /today, /сегодня         -> сегодня (текст)
-  /tomorrow, /завтра       -> завтра (текст)
+  /timetable, /расписание  -> вся текущая неделя
+  /today, /сегодня         -> сегодня
+  /tomorrow, /завтра       -> завтра
 Аргументы: today|tomorrow|сегодня|завтра|вся|неделя|пн..вс.
+
+Ответ — текст в разметке канала: шапка «СРЕДА · 23.09.2026 · 5 пар · 1 ДОТ»
+и пары как в основном посте: номер, время, тип, предмет, препод, место.
+Данные — те же state/last_parsed.json, что рисуют закреп: материал один,
+ничего не рендерится и сервер не нагружается.
 
 Дата всегда по Москве (сервер в UTC — иначе после полуночи МСК бот путает
 день). Эфемерность эмулируется: нативных эфемерных сообщений в Bot API нет
-(проверено 2026-09-22: методов ephemeral/auto-delete нет, лишние поля
-молча игнорируются), поэтому через TTL бот-админ удаляет и свой ответ,
+(проверено 2026-09-22), поэтому через TTL бот-админ удаляет и свой ответ,
 и саму команду.
 
 Запуск: python3 group_bot.py            # вечный поллинг
@@ -26,6 +28,7 @@ import datetime as dt
 import html
 import json
 import os
+import re
 import sys
 import threading
 import time
@@ -36,13 +39,11 @@ from zoneinfo import ZoneInfo
 import config
 import bells
 from telegram_api import call as api_call
-from telegram_api import call_multipart as api_multipart
 
 BOT_USERNAME = "novsutimetablebot"
 MSK = ZoneInfo("Europe/Moscow")
 STATE_FILE = config.STATE_DIR / "last_parsed.json"
 OFFSET_FILE = config.STATE_DIR / "group_bot_offset.json"
-SCREENS_INDEX = config.STATE_DIR / "dashboard_screens.json"
 
 #: Через сколько секунд после ответа удаляются и ответ, и команда.
 TTL_S = float(getattr(config, "GROUP_BOT_TTL_S", None) or 90)
@@ -71,6 +72,8 @@ COMMANDS = {
     "завтра": "завтра",
 }
 
+_TYPE_RE = re.compile(r"^\(([^)]*)\)\s*")
+
 #: Фабрика таймеров самоудаления — в тестах подменяется на фейк.
 timer_factory = threading.Timer
 
@@ -98,21 +101,86 @@ def _esc(value: object) -> str:
     return html.escape(str(value or ""), quote=False)
 
 
-def _lesson_line(lesson: dict) -> str:
+def _pairs_word(count: int) -> str:
+    if count % 10 == 1 and count % 100 != 11:
+        return "пара"
+    if count % 10 in (2, 3, 4) and count % 100 not in (12, 13, 14):
+        return "пары"
+    return "пар"
+
+
+def _lesson_parts(lesson: dict) -> tuple[str, str]:
+    """Тип занятия и чистое название: '(пр.) История' -> ('ПР.', 'История')."""
+    subject = str(lesson.get("subject_raw") or lesson.get("subject") or "").strip()
+    match = _TYPE_RE.match(subject)
+    if match:
+        kind = match.group(1).strip().rstrip(".").upper()
+        kind = f"{kind}." if kind else ""
+        subject = subject[match.end():].strip()
+        return kind, subject
+    return "", subject.split("\n", 1)[0].strip()
+
+
+def _lesson_lines(lesson: dict) -> list[str]:
+    """Две строки пары как в посте канала: заголовок + препод/место."""
+    kind, subject = _lesson_parts(lesson)
     time_label = bells.label(lesson.get("raw_time") or lesson.get("time") or "")
-    subject = str(lesson.get("subject") or "").split("\n", 1)[0].strip()
-    room = str(lesson.get("room") or "").strip().strip(".")
-    parts = []
+    number = lesson.get("number")
+    head_parts = []
+    if number:
+        head_parts.append(f"<b>{_esc(number)}.</b>")
     if time_label:
-        parts.append(f"<b>{_esc(time_label)}</b>")
-    parts.append(_esc(subject))
-    if room and room != "—":
-        parts.append(f"ауд. {_esc(room)}")
+        head_parts.append(f"<b>{_esc(time_label)}</b>")
+    if kind:
+        head_parts.append(f"<b>{_esc(kind)}</b>")
+    if subject:
+        head_parts.append(_esc(subject))
+    lines = [" ".join(head_parts)]
+    meta = []
+    teacher = str(lesson.get("teacher") or "").strip()
+    if teacher and teacher != "—":
+        meta.append(_esc(teacher))
+    if lesson.get("delivery_mode") in ("dot", "remote_or_hybrid"):
+        meta.append("ДОТ")
+    else:
+        room = str(lesson.get("room") or "").strip().strip(".")
+        if room and room != "—":
+            meta.append(f"ауд. {_esc(room)}")
+        location = str(lesson.get("location") or "").strip()
+        if location and location != "—":
+            meta.append(_esc(location))
+    if meta:
+        lines.append(" · ".join(meta))
+    return lines
+
+
+def day_caption(data: dict, target: dt.date) -> str:
+    """Шапка дня: «СРЕДА · 23.09.2026 · 3 пары · 1 ДОТ»."""
+    day_name = DAY_NAMES[target.weekday()].upper()
+    lessons = (data.get("schedule") or {}).get("days", {}).get(DAY_NAMES[target.weekday()]) or []
+    head = f"<b>{_esc(day_name)} · {target.strftime('%d.%m.%Y')}</b>"
+    if not lessons:
+        return f"{head} · пар нет"
+    parts = [head, f"{len(lessons)} {_pairs_word(len(lessons))}"]
+    dot_count = sum(1 for lesson in lessons if lesson.get("delivery_mode") in ("dot", "remote_or_hybrid"))
+    if dot_count:
+        parts.append(f"{dot_count} ДОТ")
     return " · ".join(parts)
 
 
+def build_day_text(data: dict, target: dt.date) -> str:
+    """Вырезка одного дня из поста канала."""
+    day_name = DAY_NAMES[target.weekday()]
+    lessons = (data.get("schedule") or {}).get("days", {}).get(day_name) or []
+    caption = day_caption(data, target)
+    if not lessons:
+        return f"{caption}\n\nПар нет 🎉"
+    blocks = ["\n".join(_lesson_lines(lesson)) for lesson in lessons]
+    return caption + "\n\n" + "\n\n".join(blocks)
+
+
 def _week_block(data: dict, target: dt.date) -> dict | None:
-    """Неделя из data["weeks"], в которую попадает target."""
+    """Неделя из data['weeks'], в которую попадает target."""
     for week in (data.get("weeks") or []):
         try:
             start = dt.datetime.strptime(week.get("start", ""), "%d.%m.%Y").date()
@@ -124,112 +192,32 @@ def _week_block(data: dict, target: dt.date) -> dict | None:
     return None
 
 
-def _week_title(data: dict, target: dt.date, group_name: str = "6381") -> str:
-    week = _week_block(data, target)
-    if not week:
-        return f"<b>Расписание · группа {_esc(group_name)}</b>"
-    half = {"top": "верхняя", "bottom": "нижняя"}.get(week.get("half", ""), "")
-    half = f" · {half}" if half else ""
-    return (
-        f"<b>Расписание · группа {_esc(group_name)}</b>\n"
-        f"Неделя {week.get('week')}{half} · "
-        f"{_esc(week.get('start'))}—{_esc(week.get('end'))}"
-    )
-
-
-def build_day_text(data: dict, target: dt.date, group_name: str = "6381") -> str:
-    """Компактный HTML одного дня; пустой день — честная заглушка."""
-    day_name = DAY_NAMES[target.weekday()]
-    lessons = (data.get("schedule") or {}).get("days", {}).get(day_name) or []
-    head = f"<b>{_esc(day_name)} · {target.strftime('%d.%m.%Y')}</b> · группа {_esc(group_name)}"
-    if not lessons:
-        return f"{head}\n\nПар нет 🎉"
-    lines = [_lesson_line(lesson) for lesson in lessons]
-    return head + "\n" + "\n".join(lines)
-
-
 def build_week_text(data: dict, target: dt.date, group_name: str = "6381") -> str:
-    """Неделя с Monday целевой даты; длина ограничена 3500."""
+    """Неделя с Monday целевой даты: шапка недели + вырезки всех дней."""
+    week = _week_block(data, target)
+    half = {"top": "верхняя", "bottom": "нижняя"}.get((week or {}).get("half", ""), "")
+    if week:
+        title = f"НЕДЕЛЯ {week.get('week')}{f' · {half}' if half else ''} · {_esc(week.get('start'))}—{_esc(week.get('end'))}"
+    else:
+        title = f"НЕДЕЛЯ · группа {_esc(group_name)}"
     days = (data.get("schedule") or {}).get("days", {})
     monday = target - dt.timedelta(days=target.weekday())
-    chunks = [_week_title(data, target, group_name)]
-    total = 0
+    chunks = [f"<b>{title}</b>"]
+    total = len(chunks[0])
     for offset in range(7):
         day = monday + dt.timedelta(days=offset)
         day_name = DAY_NAMES[offset]
-        lessons = days.get(day_name) or []
-        if not lessons:
+        if not days.get(day_name):
             continue
-        lines = [f"\n<b>{_esc(day_name)} · {day.strftime('%d.%m')}</b>"]
-        lines += [_lesson_line(lesson) for lesson in lessons]
-        block = "\n".join(lines)
+        block = build_day_text(data, day)
         if total + len(block) > 3500:
-            chunks.append("\n…дальше в закрепе канала")
+            chunks.append("\n\n…дальше в закрепе канала")
             break
         chunks.append(block)
         total += len(block)
     if len(chunks) == 1:
         return f"{chunks[0]}\n\nПар нет 🎉"
-    return "\n".join(chunks)
-
-
-def build_week_caption(data: dict, target: dt.date, group_name: str = "6381") -> str:
-    """Короткая подпись под альбомом скринов — подробности уже на картинках."""
-    return _week_title(data, target, group_name)
-
-
-SCREEN_LABELS = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
-
-
-def ready_screens(target: dt.date) -> list[tuple[str, str]]:
-    """Готовые скрины дней — те же файлы, что ушли в закреп канала.
-
-    Только читаем state/dashboard_screens.json и проверяем, что файлы на
-    месте и кеш относится к той же неделе, что и target — иначе чужие
-    скрины не подсовываем и падаем в текст. Ничего не рендерим: материалы
-    не дублируются и сервер не нагружается.
-    """
-    try:
-        index = json.loads(SCREENS_INDEX.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return []
-    raw_key = str(index.get("status_key") or "")
-    try:
-        cached_day = dt.datetime.strptime(raw_key.rsplit(":", 1)[-1], "%Y-%m-%d").date()
-    except (IndexError, ValueError):
-        return []
-    monday = lambda day: day - dt.timedelta(days=day.weekday())  # noqa: E731
-    if monday(cached_day) != monday(target):
-        return []
-    items = []
-    for item in index.get("items") or []:
-        label = str(item.get("label") or "")
-        path = str(item.get("path") or "")
-        if label and path and Path(path).is_file():
-            items.append((label, path))
-    return items
-
-
-def _pairs_word(count: int) -> str:
-    if count % 10 == 1 and count % 100 != 11:
-        return "пара"
-    if count % 10 in (2, 3, 4) and count % 100 not in (12, 13, 14):
-        return "пары"
-    return "пар"
-
-
-def day_caption(data: dict, target: dt.date) -> str:
-    """Заголовок дня в стиле канала: СРЕДА · 23.09.2026 · 3 пары · 1 ДОТ."""
-    day_name = DAY_NAMES[target.weekday()].upper()
-    lessons = (data.get("schedule") or {}).get("days", {}).get(DAY_NAMES[target.weekday()]) or []
-    head = f"<b>{_esc(day_name)} · {target.strftime('%d.%m.%Y')}</b>"
-    if not lessons:
-        return f"{head} · пар нет"
-    parts = [head, f"{len(lessons)} {_pairs_word(len(lessons))}"]
-    dot_count = sum(1 for lesson in lessons if str(lesson.get("room") or "").strip().upper() == "ДОТ")
-    if dot_count:
-        parts.append(f"{dot_count} ДОТ")
-    return " · ".join(parts)
+    return "\n\n".join(chunks)
 
 
 def extract_command(text: object, bot_username: str = BOT_USERNAME) -> tuple[str, str] | None:
@@ -283,7 +271,7 @@ def plan_response(
     allowed_user: int | None,
     today: dt.date | None = None,
 ) -> dict:
-    """Чистая логика: update -> план 'reply' | 'reply_media' | 'ignore'."""
+    """Чистая логика: update -> план 'reply' | 'ignore'."""
     message = update.get("message") or {}
     if not _is_allowed(update, allowed_chat, allowed_user):
         return {"kind": "ignore"}
@@ -305,32 +293,16 @@ def plan_response(
             "text": "Расписание ещё не подгрузилось, попробуй через пару минут.",
             "command_message_id": message.get("message_id"),
         }
-    base = {
+    if target == "week":
+        text = build_week_text(data, today)
+    else:
+        text = build_day_text(data, target)
+    return {
+        "kind": "reply",
         "chat_id": message["chat"]["id"],
+        "text": text,
         "command_message_id": message.get("message_id"),
     }
-    if target == "week":
-        screens = ready_screens(today)
-        if screens:
-            return {
-                "kind": "reply_media",
-                "caption": build_week_caption(data, today),
-                "screens": screens,
-                **base,
-            }
-        return {"kind": "reply", "text": build_week_text(data, today), **base}
-    screens = ready_screens(target)
-    if screens:
-        label = SCREEN_LABELS[target.weekday()]
-        day_screens = [screen for screen in screens if screen[0] == label]
-        if day_screens:
-            return {
-                "kind": "reply_media",
-                "caption": day_caption(data, target),
-                "screens": day_screens,
-                **base,
-            }
-    return {"kind": "reply", "text": build_day_text(data, target), **base}
 
 
 def _delete_later(chat_id: int, *message_ids: int) -> None:
@@ -348,48 +320,26 @@ def _delete_later(chat_id: int, *message_ids: int) -> None:
 
 
 def _send_text(plan: dict) -> list[int]:
-    result = api_call(
-        config.TG_BOT_TOKEN,
-        "sendMessage",
-        {
-            "chat_id": plan["chat_id"],
-            "text": plan["text"],
-            "parse_mode": "HTML",
-            "disable_web_page_preview": True,
-            "reply_to_message_id": plan.get("command_message_id"),
-        },
-        timeout=30,
-    )
+    payload: dict[str, Any] = {
+        "chat_id": plan["chat_id"],
+        "text": plan["text"],
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+        "reply_to_message_id": plan.get("command_message_id"),
+    }
+    result = api_call(config.TG_BOT_TOKEN, "sendMessage", payload, timeout=30)
+    if not result.get("ok") and plan.get("command_message_id"):
+        # Команда могла успеть удалиться/протухнуть — шлём без reply,
+        # иначе весь ответ теряется из-за одной ссылки на сообщение.
+        description = str(result.get("description", ""))
+        if "replied" in description or "reply" in description:
+            payload.pop("reply_to_message_id", None)
+            result = api_call(config.TG_BOT_TOKEN, "sendMessage", payload, timeout=30)
     if not result.get("ok"):
         print(f"[group_bot] send failed: {result}", file=sys.stderr)
         return []
     message_id = (result.get("result") or {}).get("message_id")
     return [message_id] if message_id else []
-
-
-def _send_album(plan: dict) -> list[int]:
-    """Альбом из готовых скринов закрепа; подпись — на первой картинке."""
-    files = {}
-    media = []
-    for idx, (_label, path) in enumerate(plan["screens"]):
-        field = f"p{idx}"
-        files[field] = Path(path)
-        item: dict[str, Any] = {"type": "photo", "media": f"attach://{field}"}
-        if idx == 0:
-            item["caption"] = plan.get("caption") or ""
-            item["parse_mode"] = "HTML"
-        media.append(item)
-    result = api_multipart(
-        config.TG_BOT_TOKEN,
-        "sendMediaGroup",
-        {"chat_id": plan["chat_id"], "media": media},
-        files,
-        timeout=60,
-    )
-    if not result.get("ok"):
-        print(f"[group_bot] album failed: {result}", file=sys.stderr)
-        return []
-    return [m.get("message_id") for m in (result.get("result") or []) if m.get("message_id")]
 
 
 def process_update(update: dict) -> None:
@@ -398,13 +348,9 @@ def process_update(update: dict) -> None:
         allowed_chat=getattr(config, "TG_GROUP_CHAT_ID", None),
         allowed_user=config.TG_DM_TARGET,
     )
-    kind = plan.get("kind")
-    if kind == "reply":
-        sent_ids = _send_text(plan)
-    elif kind == "reply_media":
-        sent_ids = _send_album(plan)
-    else:
+    if plan.get("kind") != "reply":
         return
+    sent_ids = _send_text(plan)
     if not sent_ids:
         return
     # Эфемерность: через TTL исчезают и ответ, и сама команда.
