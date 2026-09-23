@@ -1434,9 +1434,10 @@ def test_dashboard_thursday_has_opd_section_by_buildings():
     grigoriev = next(b for b in sovarmii["blocks"] if "Григорьев" in json.dumps(b["summary"], ensure_ascii=False))
     assert "пока не найден" in json.dumps(grigoriev["blocks"], ensure_ascii=False)
     assert "ауд. 106хк · ХТИ" in blob and "рядом с" not in blob
-    # Метка и список лежат в разных фрагментах rich-текста.
-    assert '"❌ Занятий не будет: "' in blob
-    assert "Алексеева А. П. (ВГ 101), Борисов Г. О. (ВГ 102)" in blob
+    # Отмены — таблицей: метка отдельным заголовком, ФИО и ВГ — ячейками.
+    assert '"text": "❌ Занятий не будет"' in blob
+    assert '"text": ["Алексеева А. П."]' in blob and '"text": ["101"]' in blob
+    assert '"text": ["Борисов Г. О."]' in blob and '"text": ["102"]' in blob
     # Только про эту неделю: ни чужих дат, ни списка тех, кто идёт в другой четверг.
     assert "Волкова М. И." not in blob and "Кузнецов Н. Р." not in blob
     assert "Идут 24.09" not in blob and "далее" not in blob and "остальные" not in blob

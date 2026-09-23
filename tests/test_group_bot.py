@@ -407,13 +407,17 @@ def test_opd_auto_finds_next_opd_date_and_reuses_channel_block(monkeypatch, tmp_
     assert plan["kind"] == "reply"
     assert plan["receiver_user_id"] == ME
     assert plan["command_message_id"] == 100
-    # rich: свёрнутый раздел без источников/эмодзи/отмен + строка «Занятий
-    # не будет» отдельным блоком после него
+    # rich: настоящий заголовок ОПД + свёрнутые корпуса без эмодзи и
+    # источников, в конце «Занятий не будет» заголовком + таблицей
     blocks = plan["rich"]["rich_message"]["blocks"]
-    assert len(blocks) == 2
-    assert blocks[0] == group_bot._opd_section(
-        FAKE_OPD_VIEW, sources=False, markers=False, cancelled=False,
-        open_mates=False)
+    expected = group_bot._opd_section(
+        FAKE_OPD_VIEW, sources=False, markers=False, open_mates=False,
+        open_section=True)
+    expected += group_bot._opd_cancelled_table(FAKE_OPD_VIEW, markers=False)
+    assert blocks == expected
+    # раздел ОПД в /opd — rich-заголовок, а не свёрнутый details
+    assert blocks[0] == {"type": "heading", "size": 3,
+                          "text": "ОПД · ПО ВИРТУАЛЬНЫМ ГРУППАМ  ·  24.09  ·  идут 1 из 3"}
     # составы ВГ свёрнуты по умолчанию: сам блок «Вместе в ВГ …» без is_open
     # (институты внутри остаются раскрытыми — один клик до полной таблицы)
     import format as fmt
@@ -421,22 +425,34 @@ def test_opd_auto_finds_next_opd_date_and_reuses_channel_block(monkeypatch, tmp_
     assert "is_open" not in mates[0] and "Вместе в ВГ 107" in json.dumps(
         mates[0], ensure_ascii=False)
     assert mates[0]["blocks"] and "is_open" in mates[0]["blocks"][0]
-    assert blocks[1] == group_bot._opd_cancelled_line(FAKE_OPD_VIEW, markers=False)
-    section_dump = json.dumps(blocks[0], ensure_ascii=False)
-    outside_dump = json.dumps(blocks[1], ensure_ascii=False)
-    assert "📍" not in section_dump and "❌" not in outside_dump
-    assert "Источники" not in section_dump and "example.com" not in section_dump
-    assert "Занятий не будет" not in section_dump
-    assert "Занятий не будет" in outside_dump
-    assert "Азизова А. А. (ВГ 112)" in outside_dump
-    # канал (дефолт) остаётся с маркерами, источниками и отменами внутри
-    channel_dump = json.dumps(
-        [group_bot._opd_section(FAKE_OPD_VIEW)], ensure_ascii=False)
+    assert blocks[-2:] == fmt._opd_cancelled_table(FAKE_OPD_VIEW, markers=False)
+    full_dump = json.dumps(blocks, ensure_ascii=False)
+    assert "📍" not in full_dump and "❌" not in full_dump
+    assert "Источники" not in full_dump and "example.com" not in full_dump
+    # корпуса — свёрнутые details; отмены — rich-заголовок + таблица ФИО/ВГ
+    assert blocks[1]["type"] == "details" and "is_open" not in blocks[1]
+    assert blocks[-2]["type"] == "heading"
+    table = blocks[-1]
+    assert table["type"] == "table" and table["is_bordered"]
+    header = table["cells"][0]
+    assert header[0]["is_header"] and header[1]["is_header"]
+    row = table["cells"][1]
+    assert row[0]["text"] == ["Азизова А. А."] and row[1]["text"] == ["112"]
+    assert "Занятий не будет" in full_dump
+    # канал (дефолт): раздел свёрнут, с маркерами и источниками; таблица
+    # «Занятий не будет» — рядом, на уровне дня
+    channel_blocks = group_bot._opd_section(FAKE_OPD_VIEW)
+    channel_blocks += group_bot._opd_cancelled_table(FAKE_OPD_VIEW)
+    channel_dump = json.dumps(channel_blocks, ensure_ascii=False)
     assert "📍" in channel_dump and "❌" in channel_dump
     assert "example.com" in channel_dump
     assert "Занятий не будет" in channel_dump
-    # а в канале составы ВГ по-прежнему раскрыты
+    # а в канале составы ВГ по-прежнему раскрыты, раздел ОПД — свёрнут
+    # details одним блоком
     assert '"is_open"' in channel_dump
+    channel_section = group_bot._opd_section(FAKE_OPD_VIEW)
+    assert len(channel_section) == 1 and channel_section[0]["type"] == "details"
+    assert "is_open" not in channel_section[0]
     assert plan.get("files") is None
     text = plan["text"]
     assert "ОПД · ПО ВИРТУАЛЬНЫМ ГРУППАМ · 24.09 · идут 1 из 3" in text
@@ -484,6 +500,81 @@ def test_opd_without_cached_data_is_stub(monkeypatch, tmp_path):
     plan = group_bot.plan_response(_update("/опд"), allowed_chat=CHAT,
                                    allowed_user=ME, today=WED)
     assert "не подгрузилось" in plan["text"]
+
+
+
+
+def test_opd_split_rich_chunks_oversized_payload():
+    # три больших details: суммарно за лимитом — режем на куски, каждый влезает
+    big = {"type": "details", "summary": [{"type": "bold", "text": "x" * 200}],
+           "blocks": [{"type": "paragraph", "text": [{"type": "plain", "text": "y" * 20000}]}]}
+    rich = {"rich_message": {"blocks": [
+        {"type": "heading", "size": 3, "text": "ОПД"}, big, big, big,
+        {"type": "heading", "size": 3, "text": "Занятий не будет"},
+    ]}}
+    assert group_bot._rich_size(rich) > group_bot._EPHEMERAL_RICH_MAX_BYTES
+    chunks = group_bot._split_rich(rich)
+    assert len(chunks) >= 2
+    for chunk in chunks:
+        assert group_bot._rich_size(chunk) <= group_bot._EPHEMERAL_RICH_MAX_BYTES
+    flat = [b for chunk in chunks for b in chunk["rich_message"]["blocks"]]
+    assert flat == rich["rich_message"]["blocks"]
+    # маленькое сообщение не режется
+    small = {"rich_message": {"blocks": [{"type": "paragraph", "text": [{"type": "plain", "text": "ok"}]}]}}
+    assert group_bot._split_rich(small) == []
+
+
+def test_opd_oversized_answer_sends_two_ephemerals(monkeypatch, tmp_path):
+    _env(monkeypatch, tmp_path)
+    view = {
+        "date": "2026-09-24", "group": "6381", "fetched_at": "", "sources": {},
+        "counts": {"session": 4, "cancelled": 0, "free": 0},
+        "rows": [
+            {"status": "session", "student": f"А{n} А. А.", "vg": f"10{n}", "room": "106",
+             "place": "ХТИ", "building": f"Корпус{n}", "teacher_short": "Т. О. Ю.",
+             "note": "", "block_start": "14:00", "block_end": "15:00",
+             "mates": [{"student": f"М{m} М. М.", "group": "6301"} for m in range(250)]}
+            for n in range(4)
+        ],
+    }
+    _opd_env(monkeypatch, view)
+    rich_calls = []
+
+    def fake_send(rich_message, *a, token=None, chat_id=None, files=None, timeout=None,
+                  extra_payload=None):
+        rich_calls.append({"rich": rich_message, "extra": extra_payload})
+        return {"ok": True, "result": {"message_id": 0, "ephemeral_message_id": 99}}
+
+    monkeypatch.setattr(group_bot.telegram_api, "send_rich_message", fake_send)
+    group_bot.process_update(_update("/opd"))
+    assert len(rich_calls) == 2
+    for call in rich_calls:
+        assert call["extra"]["ephemeral_message_parameters"]["receiver_user_id"] == ME
+        assert call["extra"]["reply_to_message_id"] == 100
+        assert group_bot._rich_size(call["rich"]) <= group_bot._EPHEMERAL_RICH_MAX_BYTES
+
+
+def test_opd_building_orders_by_room_then_time():
+    import format as fmt
+    people = [
+        {"status": "session", "student": "Яя Я. Я.", "vg": "1", "room": "216",
+         "block_start": "16:00", "block_end": "17:00", "place": "", "building": "Б",
+         "teacher_short": "", "note": "", "mates": []},
+        {"status": "session", "student": "Аа А. А.", "vg": "2", "room": "106хк",
+         "block_start": "14:00", "block_end": "15:00", "place": "", "building": "Б",
+         "teacher_short": "", "note": "", "mates": []},
+        {"status": "session", "student": "Бб Б. Б.", "vg": "3", "room": "216",
+         "block_start": "14:00", "block_end": "15:00", "place": "", "building": "Б",
+         "teacher_short": "", "note": "", "mates": []},
+        {"status": "session", "student": "Вв В. В.", "vg": "4", "room": "106",
+         "block_start": "14:00", "block_end": "15:00", "place": "", "building": "Б",
+         "teacher_short": "", "note": "", "mates": []},
+    ]
+    section = fmt._opd_building_section("Б", people)
+    order = [person["summary"][0]["text"] for person in section["blocks"]]
+    # 106 → 106хк → 216(к 14:00) → 216(к 16:00): кабинет главнее времени,
+    # в одном кабинете раньше тот, кому раньше
+    assert order == ["Вв В. В.", "Аа А. А.", "Бб Б. Б.", "Яя Я. Я."]
 
 
 def test_text_reply_retry_without_anchor_when_command_gone(monkeypatch, tmp_path):

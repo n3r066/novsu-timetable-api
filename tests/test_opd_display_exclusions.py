@@ -35,7 +35,7 @@ def test_requested_thursday_exclusions_preserve_raw_data_and_counts():
     assert [r["student"] for r in view["rows"]] == ["Ширин Я. А."]
     assert view["counts"] == {"session": 1, "cancelled": 0, "free": 0}
     assert source == before
-    rich = {"rich_message": {"blocks": [fmt._opd_section(view)]}}
+    rich = {"rich_message": {"blocks": fmt._opd_section(view)}}
     validate_rich_payload(rich)
     text = json.dumps(rich, ensure_ascii=False)
     assert "Ширин Я. А." in text
@@ -83,7 +83,7 @@ def test_bondarenko_hidden_everywhere_on_2026_09_24():
     blob = json.dumps(view, ensure_ascii=False)
     assert "Бондаренко" not in blob and "111" not in blob
     assert view["counts"]["cancelled"] == 0
-    rich = {"rich_message": {"blocks": [fmt._opd_section(view)]}}
+    rich = {"rich_message": {"blocks": fmt._opd_section(view)}}
     validate_rich_payload(rich)
     assert "Бондаренко" not in json.dumps(rich, ensure_ascii=False)
     assert "Занятий не будет" not in json.dumps(rich, ensure_ascii=False)

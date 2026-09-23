@@ -694,11 +694,24 @@ def _opd_mates_blocks(row: dict, *, open_mates: bool = True) -> list[dict]:
     return [wrap(f"Вместе в ВГ {row['vg']}  ·  {len(mates)} чел. из других групп", *sections)]
 
 
+def _opd_room_sort_key(row: dict) -> tuple:
+    """Порядок людей внутри корпуса: по кабинету (106, 106хк, 216 — числом,
+    суффикс следом, без номера — в конец), в одном кабинете раньше тот, кому
+    к 14:00, дальше по алфавиту."""
+    room = str(row.get("room") or "").strip()
+    digits = re.match(r"^(\d+)", room)
+    start = str(row.get("block_start") or "")
+    student = str(row.get("student") or "").casefold()
+    if digits:
+        return (0, int(digits.group(1)), room[digits.end():].strip(), start, student)
+    return (1, 0, room, start, student)
+
+
 def _opd_building_section(building: str, people: list[dict], *, markers: bool = True,
                           open_mates: bool = True) -> dict:
-    """Раздел корпуса: внутри сначала слот 14:00, потом 16:00, далее по алфавиту;
-    у каждого студента свой раздел с составом его ВГ."""
-    ordered = sorted(people, key=lambda row: (str(row.get("block_start") or ""), row["student"].casefold()))
+    """Раздел корпуса: внутри по кабинетам (_opd_room_sort_key) —
+    однокабинетники рядом; у каждого студента свой раздел с составом его ВГ."""
+    ordered = sorted(people, key=_opd_room_sort_key)
     person_blocks = [
         _details(_opd_person_summary(row, building),
                  *_opd_mates_blocks(row, open_mates=open_mates))
@@ -747,20 +760,31 @@ def _opd_sources(view: dict) -> dict:
     return _rich_paragraph(parts)
 
 
+def _opd_summary_text(view: dict) -> str:
+    """Сводка раздела ОПД одной строкой — заголовок для /opd в груп-боте."""
+    date = dt.date.fromisoformat(view["date"])
+    counts = view["counts"]
+    total = len(view["rows"])
+    return (f"ОПД · ПО ВИРТУАЛЬНЫМ ГРУППАМ  ·  {date.strftime('%d.%m')}"
+            f"  ·  идут {counts['session']} из {total}")
+
+
 def _opd_section(view: dict, *, sources: bool = True, markers: bool = True,
-                 cancelled: bool = True, open_mates: bool = True) -> dict:
-    """Сворачиваемый раздел «ОПД по виртуальным группам» для дня закрепа.
+                 open_mates: bool = True, open_section: bool = False) -> list[dict]:
+    """Раздел «ОПД по виртуальным группам» для дня закрепа.
 
     Только про этот день и без пояснений: кто идёт — сворачиваемыми разделами
     по корпусам (внутри сначала 14:00, потом 16:00, далее по алфавиту), у каждого
     студента свой раздел с составом его ВГ; у кого занятие отменено; ссылки. Кого нет в таблицах, у того ОПД на этой неделе нет;
     чужие даты и штампы времени в закреп не попадают.
 
-    Корпуса — по числу идущих (крупные первыми). Канал зовёт с дефолтами
-    (маркеры, источники и строка отмен на месте); /opd в груп-боте просит
-    чистый вариант: sources=False, markers=False, cancelled=False —
-    без ссылок и эмодзи, а «Занятий не будет» выносится отдельным блоком
-    наружу (см. _opd_cancelled_line).
+    Корпуса — по числу идущих (крупные первыми). Канал зовёт с дефолтами:
+    свёрнутый details одним блоком (корпуса и источники внутри), таблица
+    «Занятий не будет» ложится рядом вызовом _opd_cancelled_table —
+    rich-заголовки внутри details API не принимает. /opd в груп-боте
+    просит open_section=True: настоящий rich-заголовок и корпуса россыпью,
+    раздел всегда раскрыт; sources=False, markers=False — без ссылок и
+    эмодзи.
     """
     rows = view["rows"]
     going = [row for row in rows if row["status"] == "session"]
@@ -778,26 +802,37 @@ def _opd_section(view: dict, *, sources: bool = True, markers: bool = True,
         blocks.append(_paragraph(
             "У группы в этот день ОПД нет: все её виртуальные группы занимаются в другие четверги."
         ))
-    if cancelled:
-        line = _opd_cancelled_line(view, markers=markers)
-        if line:
-            blocks.append(line)
     if sources:
         blocks.append(_opd_sources(view))
-    return _details(_opd_summary(view), *blocks)
+    if open_section:
+        return [_heading(_opd_summary_text(view)), *blocks]
+    return [_details(_opd_summary(view), *blocks)]
 
 
-def _opd_cancelled_line(view: dict, *, markers: bool = True) -> dict | None:
-    """«Занятий не будет» одной строкой; None — отмен в этот день нет.
+def _opd_cancelled_table(view: dict, *, markers: bool = True) -> list[dict]:
+    """«Занятий не будет» таблицей: заголовок + ФИО и ВГ, по алфавиту.
 
-    Канал кладёт строку внутрь свёрнутого раздела; /opd в груп-боте
-    ставит её отдельным блоком после раздела, чтобы она была видна сразу.
+    Одинаково и для канала, и для /opd в груп-боте (у канала маркер ❌).
+    Пусто — когда отмен в этот день нет.
     """
     cancelled = [row for row in view["rows"] if row["status"] == "cancelled"]
     if not cancelled:
-        return None
-    label = "❌ Занятий не будет" if markers else "Занятий не будет"
-    return _opd_people_line(label, cancelled)
+        return []
+    ordered = sorted(cancelled, key=lambda row: str(row.get("student") or "").casefold())
+    cells = [[
+        _table_cell("ФИО", "bold", is_header=True),
+        _table_cell("ВГ", "bold", is_header=True),
+    ]]
+    for row in ordered:
+        cells.append([
+            _table_cell(row["student"], "plain"),
+            _table_cell(row["vg"], "plain"),
+        ])
+    title = "❌ Занятий не будет" if markers else "Занятий не будет"
+    return [
+        _heading(title),
+        {"type": "table", "cells": cells, "is_bordered": True, "is_striped": True},
+    ]
 
 
 def _dashboard_day_section(
@@ -815,7 +850,8 @@ def _dashboard_day_section(
     else:
         blocks.append(_dashboard_lesson_table(lessons, opd_hint=bool(opd_view)))
     if opd_view:
-        blocks.append(_opd_section(opd_view))
+        blocks += _opd_section(opd_view)
+        blocks += _opd_cancelled_table(opd_view)
     notes = [
         (item.get("subject") or "—", exceptional)
         for item in lessons

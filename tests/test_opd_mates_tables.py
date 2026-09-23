@@ -141,9 +141,9 @@ def test_building_keeps_each_person_table_and_slot_room_teacher_summary():
         "counts": {"session": 3, "cancelled": 0, "free": 0}, "sources": {},
     }
     section = _opd_section(view)
-    _validate([section])
-    assert "17.09  ·  идут 3 из 3" in _text(section["summary"])
-    building = section["blocks"][0]
+    _validate(section)
+    assert "17.09  ·  идут 3 из 3" in _text(section[0]["summary"])
+    building = section[0]["blocks"][0]
     people = building["blocks"]
     assert [_text(person["summary"]).split("  ·  ")[0] for person in people] == [
         "Яковлев Я. Я.", "Ширин А. А.", "Антонова А. А.",

@@ -61,7 +61,8 @@ from format import (
     DAY_SHORT_TO_FULL,
     _dashboard_day_section,
     _day_hides_expired,
-    _opd_cancelled_line,
+    _opd_cancelled_table,
+    _opd_room_sort_key,
     _opd_section,
     build_dashboard_rich_message,
 )
@@ -458,13 +459,12 @@ def build_opd_answer(
     if view is None:
         return {**base, "text": f"На {date.strftime('%d.%m')} ОПД нет."}
     plan = {**base, "text": build_opd_text(view)}
-    # Чистый вариант раздела: без источников и эмодзи, строка «Занятий не
-    # будет» — отдельным блоком после свёрнутого раздела, видна сразу.
-    blocks = [_opd_section(view, sources=False, markers=False, cancelled=False,
-                           open_mates=False)]
-    outside = _opd_cancelled_line(view, markers=False)
-    if outside:
-        blocks.append(outside)
+    # Чистый вариант раздела: настоящий rich-заголовок, корпуса россыпью,
+    # составы свёрнуты, без источников и эмодзи; «Занятий не будет» —
+    # rich-заголовком и таблицей в конце, видна сразу.
+    blocks = _opd_section(view, sources=False, markers=False, open_mates=False,
+                          open_section=True)
+    blocks += _opd_cancelled_table(view, markers=False)
     plan["rich"] = {"rich_message": {"blocks": blocks}}
     return plan
 
@@ -483,10 +483,7 @@ def build_opd_text(view: dict) -> str:
     for row in going:
         by_building.setdefault(row.get("building") or "адрес уточняется", []).append(row)
     for building in sorted(by_building, key=lambda b: (-len(by_building[b]), b)):
-        people = sorted(
-            by_building[building],
-            key=lambda row: (str(row.get("block_start") or ""), str(row.get("student") or "").casefold()),
-        )
+        people = sorted(by_building[building], key=_opd_room_sort_key)
         lines.append("")
         lines.append(f"<b>{building}</b> · {len(people)} чел.")
         for row in people:
@@ -659,8 +656,43 @@ def _send_text(plan: dict) -> dict:
     return result
 
 
+# Эфемерные rich-сообщения ограничены ~45 КБ (обычные — нет: закреп
+# канала больше и работает). Берём меньше — с запасом на обёртку запроса.
+_EPHEMERAL_RICH_MAX_BYTES = 43000
+
+
+def _rich_size(rich: dict) -> int:
+    return len(json.dumps(rich, ensure_ascii=False).encode("utf-8"))
+
+
+def _split_rich(rich: dict, limit: int = _EPHEMERAL_RICH_MAX_BYTES) -> list[dict]:
+    """Разрезать rich-сообщение на куски под лимит эфемерок.
+
+    Блоки не делим: переполняющий блок уезжает в свой кусок. Пусто —
+    когда сообщение и так влезает.
+    """
+    blocks = rich.get("rich_message", {}).get("blocks") or []
+    chunks: list[list[dict]] = []
+    for block in blocks:
+        if chunks and _rich_size(
+                {"rich_message": {"blocks": chunks[-1] + [block]}}) > limit:
+            chunks.append([block])
+        elif chunks:
+            chunks[-1].append(block)
+        else:
+            chunks.append([block])
+    if len(chunks) <= 1:
+        return []
+    return [{"rich_message": {"blocks": chunk}} for chunk in chunks]
+
+
 def _send_rich(plan: dict) -> dict:
-    """Отправить rich-раздел дня. Эфемерный, если есть адресат."""
+    """Отправить rich-раздел дня. Эфемерный, если есть адресат.
+
+    Слишком большой эфемерный ответ (лимит ~45 КБ, живьём проверено
+    2026-09-23: 44,2 КБ уходит, 45,4 — «rich message must be non-empty»)
+    режем _split_rich и шлём несколькими сообщениями подряд — каждое
+    своей привязкой к команде."""
     extra: dict[str, Any] = {}
     receiver = plan.get("receiver_user_id")
     if receiver:
@@ -668,9 +700,12 @@ def _send_rich(plan: dict) -> dict:
     anchor = plan.get("command_message_id")
     if anchor:
         extra["reply_to_message_id"] = anchor
-    def _send(extra_payload: dict) -> dict:
+    messages = [plan["rich"]]
+    if receiver:
+        messages = _split_rich(plan["rich"]) or messages
+    def _send(extra_payload: dict, rich_payload: dict) -> dict:
         return telegram_api.send_rich_message(
-            plan["rich"],
+            rich_payload,
             token=config.TG_BOT_TOKEN,
             chat_id=plan["chat_id"],
             files=plan.get("files"),
@@ -678,14 +713,20 @@ def _send_rich(plan: dict) -> dict:
             extra_payload=extra_payload or None,
         )
 
-    result = _send(extra)
-    if not result.get("ok") and anchor and "repl" in str(result.get("description") or "").lower():
-        # Команда уже удалена/недоступна — rich-ответ важнее привязки.
-        extra.pop("reply_to_message_id", None)
-        result = _send(extra)
-    if result.get("ok"):
+    result: dict = {}
+    for rich_payload in messages:
+        result = _send(extra, rich_payload)
+        if not result.get("ok") and anchor and "repl" in str(result.get("description") or "").lower():
+            # Команда уже удалена/недоступна — rich-ответ важнее привязки.
+            unanchored = {k: v for k, v in extra.items() if k != "reply_to_message_id"}
+            result = _send(unanchored, rich_payload)
+        if not result.get("ok"):
+            print(f"[group_bot] sendRichMessage failed: {result}", file=sys.stderr)
+            return result
         message = result.get("result") or {}
         if receiver and not message.get("ephemeral_message_id"):
+            # Страховка: параметры проигнорированы и ответ ушёл публично
+            # (message_id у эфемерных всегда 0). Мгновенно вытираем и орём.
             leaked_id = message.get("message_id") or 0
             deleted = bool(leaked_id) and _delete_message(plan["chat_id"], leaked_id)
             print(
@@ -695,8 +736,6 @@ def _send_rich(plan: dict) -> dict:
             _alert("group_bot: эфемерность не сработала, публичный rich-ответ "
                    f"{'удалён' if deleted else 'НЕ удалён'} — проверь права бота")
             return {"ok": False, "error": "ephemeral_ignored", "leak_deleted": deleted}
-        return result
-    print(f"[group_bot] sendRichMessage failed: {result}", file=sys.stderr)
     return result
 
 
