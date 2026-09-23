@@ -66,6 +66,7 @@ def _env(monkeypatch, tmp_path):
     # скрины-кеш закрепа и ОПД не трогаем: нет сети, нет реальных стейтов
     monkeypatch.setattr(group_bot, "SCREENS_FILE", tmp_path / "dashboard_screens.json")
     monkeypatch.setattr(group_bot.opd_module, "load_opd", lambda *a, **k: None)
+    monkeypatch.setattr(group_bot.config, "GROUP_BOT_ANSWER_DELAY_S", 0.0)
     return tmp_path
 
 
@@ -496,3 +497,18 @@ def test_text_reply_retry_without_anchor_when_command_gone(monkeypatch, tmp_path
     assert attempts[0]["reply_to_message_id"] == 100
     assert "reply_to_message_id" not in attempts[1]
     assert attempts[1]["ephemeral_message_parameters"]["receiver_user_id"] == ME
+
+
+def test_process_update_waits_answer_delay(monkeypatch, tmp_path):
+    """Ответ из кеша обгоняет подтверждение отправки команды и рисуется над
+    ней — поэтому бот выдерживает паузу перед ответом."""
+    _env(monkeypatch, tmp_path)
+    _screens(monkeypatch, tmp_path, "Ср")
+    sleeps = []
+    monkeypatch.setattr(group_bot.time, "sleep", sleeps.append)
+    monkeypatch.setattr(group_bot.config, "GROUP_BOT_ANSWER_DELAY_S", 1.5)
+    monkeypatch.setattr(
+        group_bot.telegram_api, "send_rich_message",
+        lambda *a, **k: {"ok": True, "result": {"message_id": 0, "ephemeral_message_id": 5}})
+    group_bot.process_update(_update("/today"))
+    assert sleeps == [1.5]

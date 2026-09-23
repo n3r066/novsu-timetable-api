@@ -700,6 +700,11 @@ def _send_rich(plan: dict) -> dict:
 
 
 def process_update(update: dict) -> None:
+    # Дать команде долететь и отрисоваться: ответ из кеша настолько быстр,
+    # что обгоняет подтверждение отправки и рисуется над сообщением команды.
+    delay = getattr(config, "GROUP_BOT_ANSWER_DELAY_S", 0)
+    if delay > 0:
+        time.sleep(delay)
     plan = plan_response(
         update,
         allowed_chat=getattr(config, "TG_GROUP_CHAT_ID", None),

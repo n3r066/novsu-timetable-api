@@ -146,6 +146,20 @@ TG_DM_TARGET = _optional_int("TG_DM_TARGET")
 # Чат группы для эфемерных команд group_bot (Bot API id, например -100...).
 TG_GROUP_CHAT_ID = _optional_int("NOVSU_GROUP_CHAT_ID")
 
+
+def _optional_float(name: str, default: float) -> float:
+    try:
+        value = os.environ.get(name)
+        return float(value) if value not in (None, "") else default
+    except (TypeError, ValueError):
+        return default
+
+
+# Пауза перед эфемерным ответом в группе: команда клиента должна долететь до
+# сервера и отрисоваться раньше ответа, иначе эфемерка висит над сообщением
+# команды (ответ из кеша прилетает быстрее подтверждения отправки).
+GROUP_BOT_ANSWER_DELAY_S = _optional_float("NOVSU_GROUP_BOT_DELAY_S", 1.5)
+
 # Только полные Chromium UA: портал отсекает короткие python-UA.
 _FALLBACK_UA_POOL = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
