@@ -460,7 +460,8 @@ def build_opd_answer(
     plan = {**base, "text": build_opd_text(view)}
     # Чистый вариант раздела: без источников и эмодзи, строка «Занятий не
     # будет» — отдельным блоком после свёрнутого раздела, видна сразу.
-    blocks = [_opd_section(view, sources=False, markers=False, cancelled=False)]
+    blocks = [_opd_section(view, sources=False, markers=False, cancelled=False,
+                           open_mates=False)]
     outside = _opd_cancelled_line(view, markers=False)
     if outside:
         blocks.append(outside)

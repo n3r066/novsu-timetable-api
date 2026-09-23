@@ -668,10 +668,11 @@ def _opd_mates_table(people: list[dict]) -> dict:
     return {"type": "table", "cells": cells, "is_bordered": True, "is_striped": True}
 
 
-def _opd_mates_blocks(row: dict) -> list[dict]:
-    """Состав ВГ: раскрытый раздел «Вместе в ВГ N», внутри — раскрытый раздел на
+def _opd_mates_blocks(row: dict, *, open_mates: bool = True) -> list[dict]:
+    """Состав ВГ: раздел «Вместе в ВГ N», внутри — раскрытый раздел на
     каждый институт с таблицей «ФИО · Группа»; крупные институты первыми,
-    каждый одногруппник занимает отдельную строку."""
+    каждый одногруппник занимает отдельную строку. Канал раскрывает составы
+    сразу; /opd в груп-боте держит их свёрнутыми (open_mates=False)."""
     mates = row.get("mates") or []
     if not mates:
         return [_paragraph("Состав виртуальной группы в таблице кафедры пока не найден.")]
@@ -689,15 +690,18 @@ def _opd_mates_blocks(row: dict) -> list[dict]:
         if building:
             title += f" · {building}"
         sections.append(_details_open(title, _opd_mates_table(people)))
-    return [_details_open(f"Вместе в ВГ {row['vg']}  ·  {len(mates)} чел. из других групп", *sections)]
+    wrap = _details_open if open_mates else _details
+    return [wrap(f"Вместе в ВГ {row['vg']}  ·  {len(mates)} чел. из других групп", *sections)]
 
 
-def _opd_building_section(building: str, people: list[dict], *, markers: bool = True) -> dict:
+def _opd_building_section(building: str, people: list[dict], *, markers: bool = True,
+                          open_mates: bool = True) -> dict:
     """Раздел корпуса: внутри сначала слот 14:00, потом 16:00, далее по алфавиту;
     у каждого студента свой раздел с составом его ВГ."""
     ordered = sorted(people, key=lambda row: (str(row.get("block_start") or ""), row["student"].casefold()))
     person_blocks = [
-        _details(_opd_person_summary(row, building), *_opd_mates_blocks(row))
+        _details(_opd_person_summary(row, building),
+                 *_opd_mates_blocks(row, open_mates=open_mates))
         for row in ordered
     ]
     title = f"📍 {building}" if markers else building
@@ -744,7 +748,7 @@ def _opd_sources(view: dict) -> dict:
 
 
 def _opd_section(view: dict, *, sources: bool = True, markers: bool = True,
-                 cancelled: bool = True) -> dict:
+                 cancelled: bool = True, open_mates: bool = True) -> dict:
     """Сворачиваемый раздел «ОПД по виртуальным группам» для дня закрепа.
 
     Только про этот день и без пояснений: кто идёт — сворачиваемыми разделами
@@ -768,7 +772,8 @@ def _opd_section(view: dict, *, sources: bool = True, markers: bool = True,
             by_building.setdefault(row.get("building") or "адрес уточняется", []).append(row)
         ordered = sorted(by_building.items(), key=lambda item: (-len(item[1]), item[0]))
         for building, people in ordered:
-            blocks.append(_opd_building_section(building, people, markers=markers))
+            blocks.append(_opd_building_section(
+                building, people, markers=markers, open_mates=open_mates))
     else:
         blocks.append(_paragraph(
             "У группы в этот день ОПД нет: все её виртуальные группы занимаются в другие четверги."

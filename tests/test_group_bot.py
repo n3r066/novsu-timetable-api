@@ -412,7 +412,15 @@ def test_opd_auto_finds_next_opd_date_and_reuses_channel_block(monkeypatch, tmp_
     blocks = plan["rich"]["rich_message"]["blocks"]
     assert len(blocks) == 2
     assert blocks[0] == group_bot._opd_section(
-        FAKE_OPD_VIEW, sources=False, markers=False, cancelled=False)
+        FAKE_OPD_VIEW, sources=False, markers=False, cancelled=False,
+        open_mates=False)
+    # составы ВГ свёрнуты по умолчанию: сам блок «Вместе в ВГ …» без is_open
+    # (институты внутри остаются раскрытыми — один клик до полной таблицы)
+    import format as fmt
+    mates = fmt._opd_mates_blocks(FAKE_OPD_VIEW["rows"][0], open_mates=False)
+    assert "is_open" not in mates[0] and "Вместе в ВГ 107" in json.dumps(
+        mates[0], ensure_ascii=False)
+    assert mates[0]["blocks"] and "is_open" in mates[0]["blocks"][0]
     assert blocks[1] == group_bot._opd_cancelled_line(FAKE_OPD_VIEW, markers=False)
     section_dump = json.dumps(blocks[0], ensure_ascii=False)
     outside_dump = json.dumps(blocks[1], ensure_ascii=False)
@@ -427,6 +435,8 @@ def test_opd_auto_finds_next_opd_date_and_reuses_channel_block(monkeypatch, tmp_
     assert "📍" in channel_dump and "❌" in channel_dump
     assert "example.com" in channel_dump
     assert "Занятий не будет" in channel_dump
+    # а в канале составы ВГ по-прежнему раскрыты
+    assert '"is_open"' in channel_dump
     assert plan.get("files") is None
     text = plan["text"]
     assert "ОПД · ПО ВИРТУАЛЬНЫМ ГРУППАМ · 24.09 · идут 1 из 3" in text
