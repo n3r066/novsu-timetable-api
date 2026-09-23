@@ -809,10 +809,12 @@ def _opd_section(view: dict, *, sources: bool = True, markers: bool = True,
     return [_details(_opd_summary(view), *blocks)]
 
 
-def _opd_cancelled_table(view: dict, *, markers: bool = True) -> list[dict]:
+def _opd_cancelled_table(
+    view: dict, *, markers: bool = True, title: str = "Занятий не будет",
+) -> list[dict]:
     """«Занятий не будет» таблицей: заголовок + ФИО и ВГ, по алфавиту.
 
-    Одинаково и для канала, и для /opd в груп-боте (у канала маркер ❌).
+    Общая таблица для канала и /opd; title задаёт подпись, markers — маркер ❌.
     Пусто — когда отмен в этот день нет.
     """
     cancelled = [row for row in view["rows"] if row["status"] == "cancelled"]
@@ -828,7 +830,7 @@ def _opd_cancelled_table(view: dict, *, markers: bool = True) -> list[dict]:
             _table_cell(row["student"], "plain"),
             _table_cell(row["vg"], "plain"),
         ])
-    title = "❌ Занятий не будет" if markers else "Занятий не будет"
+    title = f"❌ {title}" if markers else title
     return [
         _heading(title),
         {"type": "table", "cells": cells, "is_bordered": True, "is_striped": True},

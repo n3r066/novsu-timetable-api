@@ -444,6 +444,7 @@ def build_day_answer(data: dict, target: dt.date, today: dt.date | None = None) 
 
 #: Сколько дней вперёд /opd ищет ближайшую дату с ОПД.
 OPD_SCAN_DAYS = 14
+OPD_CANCELLED_TITLE = "Проектной не будет у:"
 
 
 def build_opd_answer(
@@ -490,11 +491,11 @@ def build_opd_answer(
         return {**base, "text": f"На {date.strftime('%d.%m')} ОПД нет."}
     plan = {**base, "text": build_opd_text(view)}
     # Чистый вариант раздела: настоящий rich-заголовок, корпуса россыпью,
-    # составы свёрнуты, без источников и эмодзи; «Занятий не будет» —
+    # составы свёрнуты, без источников и эмодзи; «Проектной не будет у:» —
     # rich-заголовком и таблицей в конце, видна сразу.
     blocks = _opd_section(view, sources=False, markers=False, open_mates=False,
                           open_section=True)
-    blocks += _opd_cancelled_table(view, markers=False)
+    blocks += _opd_cancelled_table(view, markers=False, title=OPD_CANCELLED_TITLE)
     plan["rich"] = {"rich_message": {"blocks": blocks}}
     return plan
 
@@ -525,7 +526,7 @@ def build_opd_text(view: dict) -> str:
             )
     if cancelled:
         lines.append("")
-        lines.append("<b>Занятий не будет:</b> " + ", ".join(
+        lines.append(f"<b>{OPD_CANCELLED_TITLE}</b> " + ", ".join(
             f"{row['student']} (ВГ {row['vg']})" for row in cancelled))
     return "\n".join(lines)
 
