@@ -592,6 +592,8 @@ def plan_response(
         }
         # Пост 1 в 1 как в закрепе канала; текст — запасной ответ.
         plan.update(build_week_answer(data, today))
+        # Составы ВГ при нужде ужимаются, чтобы неделя ушла одной эфемеркой.
+        plan["slim_mates"] = True
         return plan
     plan = {
         "kind": "reply",
@@ -603,6 +605,7 @@ def plan_response(
     # Раздел дня как в закрепе + готовый скрин; текст остаётся запасным
     # ответом, если rich-отправка вдруг не пройдёт.
     plan.update(build_day_answer(data, target, today=today))
+    plan["slim_mates"] = True
     return plan
 
 
@@ -686,13 +689,38 @@ def _split_rich(rich: dict, limit: int = _EPHEMERAL_RICH_MAX_BYTES) -> list[dict
     return [{"rich_message": {"blocks": chunk}} for chunk in chunks]
 
 
+def _slim_mates(rich: dict) -> dict:
+    """Ужать ответ под лимит эфемерных rich (~45 КБ): составы «Вместе в
+    ВГ N · X чел.» заменяются одной строкой со ссылкой на /opd. Полные
+    списки остаются в /opd и в закрепе канала. /opd не ужимается — его
+    смысл и есть составы (там действует нарезка _split_rich)."""
+    def _walk(node):
+        if not isinstance(node, dict):
+            return node
+        if node.get("type") == "details":
+            summary = node.get("summary")
+            if isinstance(summary, str) and summary.startswith("Вместе в ВГ"):
+                text = f"{str(summary).rstrip()} · полные списки: /opd"
+                return {"type": "paragraph", "text": text}
+            if "blocks" in node:
+                return {**node, "blocks": [_walk(child) for child in node["blocks"]]}
+        return node
+    slimmed = dict(rich)
+    message = rich.get("rich_message")
+    if isinstance(message, dict):
+        slimmed["rich_message"] = {**message, "blocks": [_walk(b) for b in message.get("blocks") or []]}
+    return slimmed
+
+
 def _send_rich(plan: dict) -> dict:
     """Отправить rich-раздел дня. Эфемерный, если есть адресат.
 
-    Слишком большой эфемерный ответ (лимит ~45 КБ, живьём проверено
-    2026-09-23: 44,2 КБ уходит, 45,4 — «rich message must be non-empty»)
-    режем _split_rich и шлём несколькими сообщениями подряд — каждое
-    своей привязкой к команде."""
+    Эфемерные rich ограничены ~45 КБ (живьём проверено 2026-09-23: 44,2 КБ
+    уходит, 45,4 — «rich message must be non-empty»; обычным сообщениям
+    лимит не мешает, закреп канала больше и работает). Неделя/день с
+    составами ВГ в лимит не влезают — сначала _slim_mates ужимает составы
+    в строчку «полные списки: /opd» (/timetable и /today уходят одним
+    сообщением); если и это не помогло — _split_rich режет на куски."""
     extra: dict[str, Any] = {}
     receiver = plan.get("receiver_user_id")
     if receiver:
@@ -702,7 +730,13 @@ def _send_rich(plan: dict) -> dict:
         extra["reply_to_message_id"] = anchor
     messages = [plan["rich"]]
     if receiver:
-        messages = _split_rich(plan["rich"]) or messages
+        rich = plan["rich"]
+        if plan.get("slim_mates") and _rich_size(rich) > _EPHEMERAL_RICH_MAX_BYTES:
+            rich = _slim_mates(rich)
+        if _rich_size(rich) > _EPHEMERAL_RICH_MAX_BYTES:
+            messages = _split_rich(rich) or [rich]
+        else:
+            messages = [rich]
     def _send(extra_payload: dict, rich_payload: dict) -> dict:
         return telegram_api.send_rich_message(
             rich_payload,

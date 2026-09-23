@@ -554,6 +554,47 @@ def test_opd_oversized_answer_sends_two_ephemerals(monkeypatch, tmp_path):
         assert group_bot._rich_size(call["rich"]) <= group_bot._EPHEMERAL_RICH_MAX_BYTES
 
 
+def test_week_answer_over_limit_slims_mates_to_one_message(monkeypatch, tmp_path):
+    _env(monkeypatch, tmp_path)
+    view = {
+        "date": "2026-09-24", "group": "6381", "fetched_at": "", "sources": {},
+        "counts": {"session": 4, "cancelled": 0, "free": 0},
+        "rows": [
+            {"status": "session", "student": f"А{n} А. А.", "vg": f"10{n}", "room": "106",
+             "place": "ХТИ", "building": "Антоново", "teacher_short": "Т. О. Ю.",
+             "note": "", "block_start": "14:00", "block_end": "15:00",
+             "mates": [{"student": f"М{m} М. М.", "group": "6301", "institute": "ИГУМ"}
+                       for m in range(250)]}
+            for n in range(4)
+        ],
+    }
+    _opd_env(monkeypatch, view)
+    _screens(monkeypatch, tmp_path, "Ср", "Чт")
+    monkeypatch.setattr(group_bot, "_dashboard_now",
+                        lambda d: dt.datetime(2026, 9, 23, 12, 0, tzinfo=group_bot.MSK))
+    rich_calls = []
+
+    def fake_send(rich_message, *a, token=None, chat_id=None, files=None, timeout=None,
+                  extra_payload=None):
+        rich_calls.append({"rich": rich_message, "extra": extra_payload})
+        return {"ok": True, "result": {"message_id": 0, "ephemeral_message_id": 99}}
+
+    monkeypatch.setattr(group_bot.telegram_api, "send_rich_message", fake_send)
+    plan = group_bot.plan_response(
+        _update("/timetable"), allowed_chat=CHAT, allowed_user=ME, today=WED)
+    assert plan.get("slim_mates") is True
+    assert group_bot._rich_size(plan["rich"]) > group_bot._EPHEMERAL_RICH_MAX_BYTES
+    group_bot.process_update(_update("/timetable"))
+    # неделя уходит ОДНОЙ эфемеркой: составы ужижены в строчку
+    assert len(rich_calls) == 1
+    call = rich_calls[0]
+    assert call["extra"]["ephemeral_message_parameters"]["receiver_user_id"] == ME
+    assert group_bot._rich_size(call["rich"]) <= group_bot._EPHEMERAL_RICH_MAX_BYTES
+    dumped = json.dumps(call["rich"], ensure_ascii=False)
+    assert "полные списки: /opd" in dumped
+    assert '"summary": "Вместе в ВГ' not in dumped
+
+
 def test_opd_building_orders_by_room_then_time():
     import format as fmt
     people = [
