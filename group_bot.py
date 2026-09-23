@@ -55,7 +55,7 @@ import config
 import bells
 import opd as opd_module
 import telegram_api
-from schedule_logic import find_week, resolve_dashboard_view, week_view
+from schedule_logic import find_week, lessons_for_date, resolve_dashboard_view, week_view
 from format import (
     DAY_FULL_TO_SHORT,
     DAY_SHORT_TO_FULL,
@@ -161,7 +161,7 @@ def _lesson_parts(lesson: dict) -> tuple[str, str]:
 def _lesson_lines(lesson: dict) -> list[str]:
     """Две строки пары как в посте канала: заголовок + препод/место."""
     kind, subject = _lesson_parts(lesson)
-    time_label = bells.label(lesson.get("raw_time") or lesson.get("time") or "")
+    time_label = lesson.get("time_label") or bells.label(lesson.get("raw_time") or lesson.get("time") or "")
     number = lesson.get("number")
     head_parts = []
     if number:
@@ -194,8 +194,10 @@ def _lesson_lines(lesson: dict) -> list[str]:
 def day_caption(data: dict, target: dt.date) -> str:
     """Шапка дня: «СРЕДА · 23.09.2026 · 3 пары · 1 ДОТ»."""
     day_name = DAY_NAMES[target.weekday()].upper()
-    lessons = (data.get("schedule") or {}).get("days", {}).get(DAY_NAMES[target.weekday()]) or []
+    week, lessons = lessons_for_date(data.get("schedule"), data.get("weeks") or [], target)
     head = f"<b>{_esc(day_name)} · {target.strftime('%d.%m.%Y')}</b>"
+    if week is None:
+        return f"{head} · нет данных"
     if not lessons:
         return f"{head} · пар нет"
     parts = [head, f"{len(lessons)} {_pairs_word(len(lessons))}"]
@@ -207,9 +209,10 @@ def day_caption(data: dict, target: dt.date) -> str:
 
 def build_day_text(data: dict, target: dt.date) -> str:
     """Вырезка одного дня из поста канала."""
-    day_name = DAY_NAMES[target.weekday()]
-    lessons = (data.get("schedule") or {}).get("days", {}).get(day_name) or []
+    week, lessons = lessons_for_date(data.get("schedule"), data.get("weeks") or [], target)
     caption = day_caption(data, target)
+    if week is None:
+        return f"{caption}\n\nДата вне опубликованного учебного календаря."
     if not lessons:
         return f"{caption}\n\nПар нет 🎉"
     blocks = ["\n".join(_lesson_lines(lesson)) for lesson in lessons]
@@ -237,14 +240,14 @@ def build_week_text(data: dict, target: dt.date, group_name: str = "6381") -> st
         title = f"НЕДЕЛЯ {week.get('week')}{f' · {half}' if half else ''} · {_esc(week.get('start'))}—{_esc(week.get('end'))}"
     else:
         title = f"НЕДЕЛЯ · группа {_esc(group_name)}"
-    days = (data.get("schedule") or {}).get("days", {})
+        return f"<b>{title}</b>\n\nДата вне опубликованного учебного календаря."
     monday = target - dt.timedelta(days=target.weekday())
     chunks = [f"<b>{title}</b>"]
     total = len(chunks[0])
     for offset in range(7):
         day = monday + dt.timedelta(days=offset)
-        day_name = DAY_NAMES[offset]
-        if not days.get(day_name):
+        _, lessons = lessons_for_date(data.get("schedule"), data.get("weeks") or [], day)
+        if not lessons:
             continue
         block = build_day_text(data, day)
         if total + len(block) > 3500:
@@ -800,6 +803,10 @@ def _send_rich(plan: dict) -> dict:
     return result
 
 
+class ReplyDeliveryError(RuntimeError):
+    """The update must remain pending because no answer was delivered."""
+
+
 def process_update(update: dict) -> None:
     # Дать команде долететь и отрисоваться: ответ из кеша настолько быстр,
     # что обгоняет подтверждение отправки и рисуется над сообщением команды.
@@ -814,12 +821,22 @@ def process_update(update: dict) -> None:
     if plan.get("kind") != "reply":
         return
     if plan.get("rich"):
-        result = _send_rich(plan)
-        if result.get("ok"):
-            return
+        try:
+            result = _send_rich(plan)
+        except Exception as exc:  # validation/media failures must reach the text fallback
+            print(f"[group_bot] rich reply failed: {type(exc).__name__}", file=sys.stderr)
+        else:
+            if result.get("ok"):
+                return
         # Не ушло rich'ом — деградируем до текста, ответ терять нельзя.
         print("[group_bot] falling back to plain text", file=sys.stderr)
-    _send_text(plan)
+    try:
+        result = _send_text(plan)
+    except Exception as exc:
+        _alert(f"group_bot: текстовый ответ не отправлен ({type(exc).__name__}); команда будет повторена")
+        raise ReplyDeliveryError("text reply raised an exception") from exc
+    if not result.get("ok"):
+        raise ReplyDeliveryError("text reply was not delivered")
 
 
 def register_commands() -> dict:
@@ -858,6 +875,11 @@ def poll_once(offset: int) -> int:
     for update in updates:
         try:
             process_update(update)
+        except ReplyDeliveryError:
+            # Persist only the successful prefix; do not acknowledge this command
+            # or process later updates ahead of it. run_forever backs off and retries.
+            _write_offset(offset)
+            raise
         except Exception as exc:  # noqa: BLE001 - одно плохое обновление не роняет цикл
             print(f"[group_bot] update {update.get('update_id')} failed: {exc}", file=sys.stderr)
         offset = max(offset, int(update["update_id"]) + 1)
@@ -888,6 +910,8 @@ def run_forever() -> None:
             failures = 0
             alerted = False
         except Exception as exc:  # noqa: BLE001
+            if isinstance(exc, ReplyDeliveryError):
+                offset = _read_offset()
             failures += 1
             print(f"[group_bot ERR {failures}] {exc}", file=sys.stderr)
             if failures >= 3 and not alerted:

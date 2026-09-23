@@ -639,6 +639,14 @@ These commands edit production Telegram content. Use them only when requested.
 
 ## 16. Verification Matrix
 
+Group-command replies (`group_bot.py`) use `lessons_for_date()` for text
+fallbacks as well as the canonical date-aware rich views. A date outside the
+published calendar is reported as unavailable. Local rich validation or media
+read failures fall back to text; if text delivery also fails, the update offset
+advances only through the successful batch prefix, and polling retries the
+failed command with backoff. Ambiguous network outcomes and crashes between
+delivery and offset persistence can still duplicate a reply.
+
 Minimum for any code change:
 
 ```bash
@@ -838,4 +846,3 @@ was removed on user request — the monitor no longer fetches that portal page
 `message can't be deleted` (old channel post), so the message was
 neutralized by edit; delete it manually in the channel if still visible.
 `state/extra_posts.json` removed.
-
