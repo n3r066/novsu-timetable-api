@@ -424,16 +424,22 @@ def test_changes_fallback_handles_one_huge_entity_heavy_line_atomically():
     assert "<script>" not in text
 
 
-def test_dashboard_last_updated_in_title():
+@pytest.mark.parametrize("schedule_changed", ["", "22.09.2026 10:06"])
+def test_dashboard_last_updated_in_title(schedule_changed):
     data = _load()
     weeks = [{"week": 1, "half": "top", "start": "01.09.2026", "end": "05.09.2026"}]
     rm = build_dashboard_rich_message(
         data["schedule"], weeks, "https://example.test", dt.date(2026, 9, 2),
         last_updated="27.08.2026 18:45",
+        schedule_changed=schedule_changed,
     )
     import json
     blob = json.dumps(rm, ensure_ascii=False)
-    assert "Обновлено: 27.08.2026 18:45 МСК" in blob
+    expected = schedule_changed or "27.08.2026 18:45"
+    assert f"Расписание обновлено: {expected} МСК" in blob
+    assert blob.count(" МСК") == 1
+    if schedule_changed:
+        assert "27.08.2026 18:45" not in blob
 
 
 def test_dashboard_no_last_updated_when_empty():
@@ -445,6 +451,7 @@ def test_dashboard_no_last_updated_when_empty():
     import json
     blob = json.dumps(rm, ensure_ascii=False)
     assert "Последние изменения" not in blob
+    assert "Расписание обновлено:" not in blob
 
 
 def test_dashboard_week_before_diary():

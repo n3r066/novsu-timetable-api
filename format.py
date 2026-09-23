@@ -439,10 +439,9 @@ def _dashboard_title(
         ]
     else:
         parts += ["\n", target_date.strftime("%d.%m.%Y")]
-    if last_updated:
-        parts += ["\n", {"type": "italic", "text": f"Обновлено: {last_updated} МСК"}]
-    if schedule_changed and schedule_changed != last_updated:
-        parts += ["\n", {"type": "italic", "text": f"Расписание: {schedule_changed} МСК"}]
+    updated = schedule_changed or last_updated
+    if updated:
+        parts += ["\n", {"type": "italic", "text": f"Расписание обновлено: {updated} МСК"}]
     if sleep_note:
         parts += ["\n", {"type": "marked", "text": sleep_note}]
     return _pullquote(parts)

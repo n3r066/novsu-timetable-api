@@ -64,7 +64,8 @@ def test_render_merges_full_group_schedule_with_her_opd():
     assert "Чужой" not in blob  # чужие ВГ не попадают
     assert "https://sheet" in blob and "https://ann" in blob
     assert "пост обновляется сам" in blob
-    assert "Обновлено: 03.09.2026 10:00" in blob and "Расписание: 01.09.2026 09:00" in blob
+    assert "Расписание обновлено: 01.09.2026 09:00" in blob
+    assert "03.09.2026 10:00" not in blob
 
 
 def test_person_opd_makes_her_the_only_member():
