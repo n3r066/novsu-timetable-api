@@ -444,7 +444,7 @@ def build_day_answer(data: dict, target: dt.date, today: dt.date | None = None) 
 
 #: Сколько дней вперёд /opd ищет ближайшую дату с ОПД.
 OPD_SCAN_DAYS = 14
-OPD_CANCELLED_TITLE = "Проектной не будет у:"
+OPD_CANCELLED_TITLE = "Без проектной:"
 
 
 def build_opd_answer(
@@ -491,7 +491,7 @@ def build_opd_answer(
         return {**base, "text": f"На {date.strftime('%d.%m')} ОПД нет."}
     plan = {**base, "text": build_opd_text(view)}
     # Чистый вариант раздела: настоящий rich-заголовок, корпуса россыпью,
-    # составы свёрнуты, без источников и эмодзи; «Проектной не будет у:» —
+    # составы свёрнуты, без источников и эмодзи; «Без проектной:» —
     # rich-заголовком и таблицей в конце, видна сразу.
     blocks = _opd_section(view, sources=False, markers=False, open_mates=False,
                           open_section=True)
