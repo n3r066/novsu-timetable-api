@@ -692,7 +692,7 @@ def _opd_mates_blocks(row: dict) -> list[dict]:
     return [_details_open(f"Вместе в ВГ {row['vg']}  ·  {len(mates)} чел. из других групп", *sections)]
 
 
-def _opd_building_section(building: str, people: list[dict]) -> dict:
+def _opd_building_section(building: str, people: list[dict], *, markers: bool = True) -> dict:
     """Раздел корпуса: внутри сначала слот 14:00, потом 16:00, далее по алфавиту;
     у каждого студента свой раздел с составом его ВГ."""
     ordered = sorted(people, key=lambda row: (str(row.get("block_start") or ""), row["student"].casefold()))
@@ -700,8 +700,9 @@ def _opd_building_section(building: str, people: list[dict]) -> dict:
         _details(_opd_person_summary(row, building), *_opd_mates_blocks(row))
         for row in ordered
     ]
+    title = f"📍 {building}" if markers else building
     return _details(
-        [{"type": "bold", "text": f"📍 {building}"}, f"  ·  {len(people)} чел."],
+        [{"type": "bold", "text": title}, f"  ·  {len(people)} чел."],
         *person_blocks,
     )
 
@@ -742,17 +743,23 @@ def _opd_sources(view: dict) -> dict:
     return _rich_paragraph(parts)
 
 
-def _opd_section(view: dict) -> dict:
+def _opd_section(view: dict, *, sources: bool = True, markers: bool = True,
+                 cancelled: bool = True) -> dict:
     """Сворачиваемый раздел «ОПД по виртуальным группам» для дня закрепа.
 
     Только про этот день и без пояснений: кто идёт — сворачиваемыми разделами
     по корпусам (внутри сначала 14:00, потом 16:00, далее по алфавиту), у каждого
     студента свой раздел с составом его ВГ; у кого занятие отменено; ссылки. Кого нет в таблицах, у того ОПД на этой неделе нет;
     чужие даты и штампы времени в закреп не попадают.
+
+    Корпуса — по числу идущих (крупные первыми). Канал зовёт с дефолтами
+    (маркеры, источники и строка отмен на месте); /opd в груп-боте просит
+    чистый вариант: sources=False, markers=False, cancelled=False —
+    без ссылок и эмодзи, а «Занятий не будет» выносится отдельным блоком
+    наружу (см. _opd_cancelled_line).
     """
     rows = view["rows"]
     going = [row for row in rows if row["status"] == "session"]
-    cancelled = [row for row in rows if row["status"] == "cancelled"]
     blocks: list[dict] = []
     if going:
         # По корпусам (крупные первыми), внутри корпуса — сначала 14:00, потом 16:00.
@@ -761,15 +768,31 @@ def _opd_section(view: dict) -> dict:
             by_building.setdefault(row.get("building") or "адрес уточняется", []).append(row)
         ordered = sorted(by_building.items(), key=lambda item: (-len(item[1]), item[0]))
         for building, people in ordered:
-            blocks.append(_opd_building_section(building, people))
+            blocks.append(_opd_building_section(building, people, markers=markers))
     else:
         blocks.append(_paragraph(
             "У группы в этот день ОПД нет: все её виртуальные группы занимаются в другие четверги."
         ))
     if cancelled:
-        blocks.append(_opd_people_line("❌ Занятий не будет", cancelled))
-    blocks.append(_opd_sources(view))
+        line = _opd_cancelled_line(view, markers=markers)
+        if line:
+            blocks.append(line)
+    if sources:
+        blocks.append(_opd_sources(view))
     return _details(_opd_summary(view), *blocks)
+
+
+def _opd_cancelled_line(view: dict, *, markers: bool = True) -> dict | None:
+    """«Занятий не будет» одной строкой; None — отмен в этот день нет.
+
+    Канал кладёт строку внутрь свёрнутого раздела; /opd в груп-боте
+    ставит её отдельным блоком после раздела, чтобы она была видна сразу.
+    """
+    cancelled = [row for row in view["rows"] if row["status"] == "cancelled"]
+    if not cancelled:
+        return None
+    label = "❌ Занятий не будет" if markers else "Занятий не будет"
+    return _opd_people_line(label, cancelled)
 
 
 def _dashboard_day_section(

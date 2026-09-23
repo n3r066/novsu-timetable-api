@@ -406,13 +406,32 @@ def test_opd_auto_finds_next_opd_date_and_reuses_channel_block(monkeypatch, tmp_
     assert plan["kind"] == "reply"
     assert plan["receiver_user_id"] == ME
     assert plan["command_message_id"] == 100
-    # rich-блок — ровно тот же _opd_section, что в разделе дня закрепа
-    assert plan["rich"]["rich_message"]["blocks"] == [group_bot._opd_section(FAKE_OPD_VIEW)]
+    # rich: свёрнутый раздел без источников/эмодзи/отмен + строка «Занятий
+    # не будет» отдельным блоком после него
+    blocks = plan["rich"]["rich_message"]["blocks"]
+    assert len(blocks) == 2
+    assert blocks[0] == group_bot._opd_section(
+        FAKE_OPD_VIEW, sources=False, markers=False, cancelled=False)
+    assert blocks[1] == group_bot._opd_cancelled_line(FAKE_OPD_VIEW, markers=False)
+    section_dump = json.dumps(blocks[0], ensure_ascii=False)
+    outside_dump = json.dumps(blocks[1], ensure_ascii=False)
+    assert "📍" not in section_dump and "❌" not in outside_dump
+    assert "Источники" not in section_dump and "example.com" not in section_dump
+    assert "Занятий не будет" not in section_dump
+    assert "Занятий не будет" in outside_dump
+    assert "Азизова А. А. (ВГ 112)" in outside_dump
+    # канал (дефолт) остаётся с маркерами, источниками и отменами внутри
+    channel_dump = json.dumps(
+        [group_bot._opd_section(FAKE_OPD_VIEW)], ensure_ascii=False)
+    assert "📍" in channel_dump and "❌" in channel_dump
+    assert "example.com" in channel_dump
+    assert "Занятий не будет" in channel_dump
     assert plan.get("files") is None
     text = plan["text"]
     assert "ОПД · ПО ВИРТУАЛЬНЫМ ГРУППАМ · 24.09 · идут 1 из 3" in text
     assert "Вересков В. Ю." in text and "ВГ 107" in text
-    assert "❌ Занятий не будет:</b> Азизова А. А. (ВГ 112)" in text
+    assert "📍" not in text and "❌" not in text
+    assert "<b>Занятий не будет:</b> Азизова А. А. (ВГ 112)" in text
 
 
 def test_opd_send_anchors_reply_to_command(monkeypatch, tmp_path):

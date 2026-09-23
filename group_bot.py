@@ -61,6 +61,7 @@ from format import (
     DAY_SHORT_TO_FULL,
     _dashboard_day_section,
     _day_hides_expired,
+    _opd_cancelled_line,
     _opd_section,
     build_dashboard_rich_message,
 )
@@ -457,7 +458,13 @@ def build_opd_answer(
     if view is None:
         return {**base, "text": f"На {date.strftime('%d.%m')} ОПД нет."}
     plan = {**base, "text": build_opd_text(view)}
-    plan["rich"] = {"rich_message": {"blocks": [_opd_section(view)]}}
+    # Чистый вариант раздела: без источников и эмодзи, строка «Занятий не
+    # будет» — отдельным блоком после свёрнутого раздела, видна сразу.
+    blocks = [_opd_section(view, sources=False, markers=False, cancelled=False)]
+    outside = _opd_cancelled_line(view, markers=False)
+    if outside:
+        blocks.append(outside)
+    plan["rich"] = {"rich_message": {"blocks": blocks}}
     return plan
 
 
@@ -480,7 +487,7 @@ def build_opd_text(view: dict) -> str:
             key=lambda row: (str(row.get("block_start") or ""), str(row.get("student") or "").casefold()),
         )
         lines.append("")
-        lines.append(f"<b>📍 {building}</b> · {len(people)} чел.")
+        lines.append(f"<b>{building}</b> · {len(people)} чел.")
         for row in people:
             place = f" · {row['place']}" if row.get("place") else ""
             lines.append(
@@ -490,7 +497,7 @@ def build_opd_text(view: dict) -> str:
             )
     if cancelled:
         lines.append("")
-        lines.append("<b>❌ Занятий не будет:</b> " + ", ".join(
+        lines.append("<b>Занятий не будет:</b> " + ", ".join(
             f"{row['student']} (ВГ {row['vg']})" for row in cancelled))
     return "\n".join(lines)
 
