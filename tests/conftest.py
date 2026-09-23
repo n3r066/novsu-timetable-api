@@ -39,11 +39,12 @@ def _production_state_untouched():
 
 @pytest.fixture(autouse=True)
 def _opd_offline(monkeypatch, tmp_path):
-    """Тесты не ходят в Google за файлами ОПД и не трогают state/opd_cache.json."""
+    """ОПД в тестах не обращается к Google/порталу и не трогает рабочий кэш."""
     import opd
 
     def _blocked(url: str) -> str:
         raise RuntimeError(f"network disabled in tests: {url}")
 
     monkeypatch.setattr(opd, "_download", _blocked)
+    monkeypatch.setattr(opd, "_fetch_index_html", lambda: "")
     monkeypatch.setattr(opd, "_cache_path", lambda: tmp_path / "opd_cache.json")

@@ -6,6 +6,7 @@ ephemeral_message_parameters.receiver_user_id и не удаляется вру�
 """
 
 import datetime as dt
+import copy
 import json
 import sys
 from pathlib import Path
@@ -16,8 +17,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import group_bot
 
-CHAT = -1004446620031
-ME = 7912629458
+CHAT = -1001234500000
+ME = 1234567
 
 DATA = {
     "schedule": {"days": {
@@ -31,7 +32,7 @@ DATA = {
              "subject": "(лек./пр.) Сервисная деятельность",
              "room": "418", "teacher": "Ефимов Олег Николаевич",
              "delivery_mode": "in_person", "location": "ИГУМ, Антоново"},
-            {"number": 3, "time": "17:00 18:00", "raw_time": "17:00 18:00 19:00",
+            {"number": 3, "time": "17:00 18:00 19:00", "raw_time": "17:00 18:00 19:00",
              "subject_raw": "(пр.) Основы российской государственности",
              "subject": "(пр.) Основы российской государственности",
              "room": "1331", "teacher": "Кузина Ксения Александровна",
@@ -61,6 +62,9 @@ def _update(text, user=ME, chat=CHAT, ctype="supergroup", message_id=100, anonym
 
 
 def _env(monkeypatch, tmp_path):
+    monkeypatch.setattr(group_bot.config, "TG_GROUP_CHAT_ID", CHAT)
+    monkeypatch.setattr(group_bot.config, "TG_DM_TARGET", ME)
+    monkeypatch.setattr(group_bot, "today_msk", lambda: WED)
     monkeypatch.setattr(group_bot, "STATE_FILE", tmp_path / "last_parsed.json")
     (tmp_path / "last_parsed.json").write_text(json.dumps(DATA), encoding="utf-8")
     # скрины-кеш закрепа и ОПД не трогаем: нет сети, нет реальных стейтов
@@ -657,3 +661,149 @@ def test_process_update_waits_answer_delay(monkeypatch, tmp_path):
         lambda *a, **k: {"ok": True, "result": {"message_id": 0, "ephemeral_message_id": 5}})
     group_bot.process_update(_update("/today"))
     assert sleeps == [1.5]
+
+
+def _conditional_data():
+    data = copy.deepcopy(DATA)
+    data["weeks"].append({"week": 5, "half": "top", "start": "28.09.2026", "end": "03.10.2026"})
+    prototype = DATA["schedule"]["days"]["Среда"][0]
+    data["schedule"]["days"] = {"Среда": [
+        {**prototype, "subject": "Верхняя", "subject_raw": "Верхняя", "note": "по верхней неделе"},
+        {**prototype, "subject": "Нижняя", "subject_raw": "Нижняя", "note": "по нижней неделе"},
+        {**prototype, "subject": "Отменена", "subject_raw": "Отменена", "note": "23.09 занятий не будет"},
+        {**prototype, "subject": "Поздняя", "subject_raw": "Поздняя", "note": "с 30.09"},
+    ]}
+    return data
+
+
+@pytest.mark.parametrize("target,expected,absent", [
+    (WED, ("Нижняя",), ("Верхняя", "Отменена", "Поздняя")),
+    (dt.date(2026, 9, 30), ("Верхняя", "Отменена", "Поздняя"), ("Нижняя",)),
+])
+def test_text_answers_use_applicable_lessons(target, expected, absent):
+    data = _conditional_data()
+    for text in (group_bot.build_day_text(data, target), group_bot.build_week_text(data, target)):
+        for name in expected:
+            assert name in text
+        for name in absent:
+            assert name not in text
+        assert f"{len(expected)} {group_bot._pairs_word(len(expected))}" in text
+        assert f"{len(expected)} ДОТ" in text
+
+
+def test_zero_applicable_lessons_falls_back_to_empty_day(monkeypatch, tmp_path):
+    _env(monkeypatch, tmp_path)
+    data = _conditional_data()
+    data["schedule"]["days"]["Среда"] = data["schedule"]["days"]["Среда"][:1]
+    monkeypatch.setattr(group_bot, "_load_parsed", lambda: data)
+    plan = group_bot.plan_response(_update("/today"), allowed_chat=CHAT, allowed_user=ME, today=WED)
+    assert "rich" not in plan
+    assert "Пар нет" in plan["text"] and "Верхняя" not in plan["text"]
+    assert "Пар нет" in group_bot.build_week_text(data, WED)
+
+
+def test_text_includes_explicit_date_from_another_weekday():
+    data = copy.deepcopy(DATA)
+    lesson = {**data["schedule"]["days"]["Среда"][0], "subject": "Перенесённая", "note": "только 24.09"}
+    data["schedule"]["days"] = {"Среда": [lesson]}
+    assert "Перенесённая" not in group_bot.build_day_text(data, WED)
+    assert "Перенесённая" in group_bot.build_day_text(data, WED + dt.timedelta(days=1))
+    assert "ЧЕТВЕРГ · 24.09.2026" in group_bot.build_week_text(data, WED)
+
+
+def test_text_outside_calendar_does_not_claim_no_classes():
+    target = dt.date(2026, 10, 7)
+    for text in (group_bot.build_day_text(DATA, target), group_bot.build_week_text(DATA, target)):
+        assert "вне опубликованного учебного календаря" in text
+        assert "Пар нет" not in text and "История России" not in text
+
+
+@pytest.mark.parametrize("failure", ["validation", "missing_attachment"])
+def test_rich_exception_uses_ephemeral_text(monkeypatch, tmp_path, failure):
+    _env(monkeypatch, tmp_path)
+    rich = {"rich_message": {"blocks": [{"type": "paragraph", "text": "x" * (32769 if failure == "validation" else 1)}]}}
+    plan = {"kind": "reply", "chat_id": CHAT, "receiver_user_id": ME,
+            "command_message_id": 100, "text": "Запасной ответ", "rich": rich}
+    if failure == "missing_attachment":
+        plan["files"] = {"image": tmp_path / "missing.png"}
+    monkeypatch.setattr(group_bot, "plan_response", lambda *a, **k: plan)
+    calls = []
+
+    def fake_call(token, method, payload, **kwargs):
+        calls.append((method, payload))
+        return {"ok": True, "result": {"ephemeral_message_id": 1}}
+
+    monkeypatch.setattr(group_bot, "api_call", fake_call)
+    group_bot.process_update(_update("/today"))
+    assert len(calls) == 1 and calls[0][0] == "sendMessage"
+    assert calls[0][1]["text"] == "Запасной ответ"
+    assert calls[0][1]["ephemeral_message_parameters"] == {"receiver_user_id": ME}
+    assert calls[0][1]["reply_to_message_id"] == 100
+
+
+@pytest.mark.parametrize("raises", [False, True])
+def test_total_send_failure_is_retryable(monkeypatch, tmp_path, raises):
+    _env(monkeypatch, tmp_path)
+    monkeypatch.setattr(group_bot, "_send_rich", lambda plan: {"ok": False})
+    alerts = []
+    monkeypatch.setattr(group_bot, "_alert", alerts.append)
+
+    def fail(plan):
+        if raises:
+            raise OSError("offline")
+        return {"ok": False}
+
+    monkeypatch.setattr(group_bot, "_send_text", fail)
+    with pytest.raises(group_bot.ReplyDeliveryError):
+        group_bot.process_update(_update("/today"))
+    if raises:
+        assert alerts
+
+
+def test_poll_retries_failed_command_without_replaying_delivered_prefix(monkeypatch, tmp_path):
+    monkeypatch.setattr(group_bot, "OFFSET_FILE", tmp_path / "offset.json")
+    updates = [{"update_id": n} for n in (10, 11, 12)]
+    polls, attempts, delivered = [], [], []
+    failing = True
+
+    def poll(token, method, payload, **kwargs):
+        polls.append(payload["offset"])
+        return {"ok": True, "result": [u for u in updates if u["update_id"] >= payload["offset"]]}
+
+    def process(update):
+        n = update["update_id"]
+        attempts.append(n)
+        if n == 11 and failing:
+            raise group_bot.ReplyDeliveryError("offline")
+        delivered.append(n)
+
+    monkeypatch.setattr(group_bot, "api_call", poll)
+    monkeypatch.setattr(group_bot, "process_update", process)
+    with pytest.raises(group_bot.ReplyDeliveryError):
+        group_bot.poll_once(10)
+    assert group_bot._read_offset() == 11
+    assert attempts == [10, 11]
+    failing = False
+    assert group_bot.poll_once(group_bot._read_offset()) == 13
+    assert delivered == [10, 11, 12]
+    assert polls == [10, 11]
+    assert group_bot._read_offset() == 13
+
+
+def test_run_forever_resumes_from_persisted_prefix_after_delivery_failure(monkeypatch, tmp_path):
+    monkeypatch.setattr(group_bot, "OFFSET_FILE", tmp_path / "offset.json")
+    group_bot._write_offset(10)
+    calls, sleeps = [], []
+
+    def poll(offset):
+        calls.append(offset)
+        if len(calls) == 1:
+            group_bot._write_offset(11)
+            raise group_bot.ReplyDeliveryError("offline")
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(group_bot, "poll_once", poll)
+    monkeypatch.setattr(group_bot.time, "sleep", sleeps.append)
+    with pytest.raises(KeyboardInterrupt):
+        group_bot.run_forever()
+    assert calls == [10, 11] and sleeps == [2]
