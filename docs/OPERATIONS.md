@@ -823,26 +823,19 @@ Dashboard integration (`post.edit_dashboard_post` → `format`):
 Operations: `python3 opd.py [--date YYYY-MM-DD] [--refresh] [--json]` prints the
 view for a date.
 
-## 20.1 Tracked Extra Post: Full Schedule + OPD For a Non-6381 Person
+## 20.1 Tracked Extra Posts (feature dormant, specs empty)
 
-`knowledge/schedule_notes.json` may contain `opd_tracked_posts`: one post per
-person outside group 6381 (currently Яковлева Екатерина Сергеевна, ПИ,
-6701-до, ВГ 105 — message 187). `extra_posts.py` renders the post as the
-person's full portal timetable for her academic group (`portal_group` ref in
-the spec, same dashboard renderer, no screenshots) merged with her OPD: the
-header lines «ОПД · ВГ N» and «Даты» list all upcoming department dates
-(cancelled ones marked «занятий не будет», past ones dropped), and on
-Thursdays the usual OPD section shows her row and her VG roster. The person
-is a synthetic single member of `_person_opd`, everyone else in her VG
-becomes "mates", so the standard rendering path is reused unchanged.
+`extra_posts.py` + `monitor.run_once` support `opd_tracked_posts` in
+`knowledge/schedule_notes.json`: one channel post per person outside group
+6381, rendered as their full portal timetable merged with their OPD (same
+dashboard renderer, no screenshots), kept in sync by
+`extra_posts.sync(opd_module.load_opd())` each monitor cycle. State lives in
+`state/extra_posts.json`. The code is kept for future use.
 
-`monitor.run_once` calls `extra_posts.sync(opd_module.load_opd())` after the
-dashboard work. Sync fetches the person's group page every cycle, re-renders
-and compares the fingerprint in `state/extra_posts.json`; it edits the
-message only when the portal timetable, the department cache or the day
-itself changes. «Обновлено» stamps the last edit, «Расписание» moves only
-when the portal content fingerprint moves. No channel notifications about
-these edits, the post is never pinned; the first sync sends it and stores
-`message_id`. Per-post failures alert `_dm` only after 3 consecutive cycles
-and never break the main cycle. The monitor owns the post afterwards: do not
-edit or resend it by hand — change the spec in `schedule_notes.json` instead.
+2026-09-23: the only spec (Яковлева, ПИ, 6701-до, ВГ 105, channel message 187)
+was removed on user request — the monitor no longer fetches that portal page
+(~1440 req/day saved). Bot-side deletion of message 187 failed with
+`message can't be deleted` (old channel post), so the message was
+neutralized by edit; delete it manually in the channel if still visible.
+`state/extra_posts.json` removed.
+
