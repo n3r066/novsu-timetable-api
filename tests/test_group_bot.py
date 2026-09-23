@@ -270,6 +270,9 @@ def test_week_command_is_ephemeral_rich_channel_copy(monkeypatch, tmp_path):
     dumped = json.dumps(call["rich"], ensure_ascii=False)
     assert "НЕДЕЛЯ 4" in dumped and "Среда" in dumped and "Четверг" in dumped
     assert "attach://site_screenshot_1" in dumped
+    # строка «Источники» — справка закрепа, в приватном ответе её нет
+    assert "Источники:" not in dumped
+    assert "docs.google.com" not in dumped
     assert call["files"] == {"site_screenshot_1": tmp_path / "day_screen.png",
                              "site_screenshot_2": tmp_path / "day_screen.png"}
 

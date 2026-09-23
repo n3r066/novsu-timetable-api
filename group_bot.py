@@ -282,13 +282,40 @@ def _cached_day_screen(data: dict, target: dt.date, today: dt.date) -> Path | No
 
 
 
+def _strip_sources(rich: dict) -> dict:
+    """Убрать из ответа строку «Источники: …» со ссылками ВГ. В закрепе
+    канала она нужна как справка, в приватных ответах бота — только шум."""
+    def _is_sources(block) -> bool:
+        if not isinstance(block, dict) or block.get("type") != "paragraph":
+            return False
+        text = block.get("text")
+        first = text[0] if isinstance(text, list) and text else None
+        return isinstance(first, dict) and str(first.get("text") or "").startswith("Источники:")
+
+    def _walk(node):
+        if not isinstance(node, dict) or node.get("type") != "details":
+            return node
+        blocks = node.get("blocks")
+        if isinstance(blocks, list):
+            return {**node, "blocks": [_walk(b) for b in blocks if not _is_sources(b)]}
+        return node
+
+    stripped = dict(rich)
+    message = rich.get("rich_message")
+    if isinstance(message, dict):
+        stripped["rich_message"] = {**message,
+                                    "blocks": [_walk(b) for b in message.get("blocks") or []]}
+    return stripped
+
+
 def build_week_answer(data: dict, today: dt.date, now: dt.datetime | None = None) -> dict:
     """Пост недели 1 в 1 как в закрепе канала: те же блоки, ОПД и скрины.
 
     Рендер ноль: скрины только готовые из кеша закрепа
     state/dashboard_screens.json, живые дни считаются той же логикой
     (resolve_dashboard_view), что рисует пост. Без кеша пост уйдёт без
-    картинок — расписание то же.
+    картинок — расписание то же. Строка «Источники» уходит: она для
+    закрепа, не для приватного ответа.
     """
     if now is None:
         now = _dashboard_now(today)
@@ -327,7 +354,7 @@ def build_week_answer(data: dict, today: dt.date, now: dt.datetime | None = None
         opd=opd_data,
         sleep_note="😴 Сайт в спячке — сохранённое расписание" if sleepy else "",
     )
-    return {"rich": rich, "files": files or None}
+    return {"rich": _strip_sources(rich), "files": files or None}
 
 
 def _dashboard_now(today: dt.date) -> dt.datetime:
@@ -409,7 +436,7 @@ def build_day_answer(data: dict, target: dt.date, today: dt.date | None = None) 
     )
     rich = {"rich_message": {"blocks": [block]}}
     files = {"day_screenshot_1": screen} if screen else None
-    return {"rich": rich, "files": files}
+    return {"rich": _strip_sources(rich), "files": files}
 
 
 #: Сколько дней вперёд /opd ищет ближайшую дату с ОПД.
