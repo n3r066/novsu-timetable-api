@@ -2278,6 +2278,73 @@ def _pair_moves(
         [item for index, item in enumerate(added) if index not in used_added],
     )
 
+#: Поля записи портала и их метки в правке — тот же порядок, что в monitor._DIFF_FIELDS.
+_REPLACE_FIELDS = (
+    ("room", "ауд."), ("teacher", "преподаватель"), ("note", "примечание"),
+    ("location", "место"), ("delivery_mode", "формат"),
+)
+
+
+def _replacement_fields(gone: dict, arrived: dict) -> list[list[str]]:
+    old_subject = str(gone.get("subject") or "").split("\n", 1)[0].strip()
+    new_subject = str(arrived.get("subject") or "").split("\n", 1)[0].strip()
+    fields: list[list[str]] = []
+    if old_subject != new_subject:
+        fields.append(["предмет", old_subject, new_subject])
+    for key, label in _REPLACE_FIELDS:
+        old, new = str(gone.get(key) or "").strip(), str(arrived.get(key) or "").strip()
+        if old != new:
+            fields.append([label, old, new])
+    return fields
+
+
+def _pair_replacements(
+    removed: list[dict], added: list[dict]
+) -> tuple[list[dict], list[dict], list[dict]]:
+    """«Убрали Физкультуру» + «добавили Философию» в том же слоте → «заменили пару».
+
+    Слот — день, академические часы, подгруппа и неделя. Сводим только
+    однозначную пару «одна ушла — одна пришла»: при нескольких кандидатах
+    честнее оставить добавление и убирание как есть, чем угадать неверно.
+    """
+    def slot(item: dict) -> tuple | None:
+        hours = tuple(bells.parse_hours(item.get("time")))
+        if not hours:
+            return None
+        return (
+            str(item.get("day") or "").strip(), hours,
+            str(item.get("subgroup") or "").strip().casefold(),
+            _parity_of(str(item.get("note") or "")),
+        )
+
+    removed_slots: dict[tuple, list[int]] = {}
+    added_slots: dict[tuple, list[int]] = {}
+    for items, slots in ((removed, removed_slots), (added, added_slots)):
+        for index, item in enumerate(items):
+            key = slot(item)
+            if key is not None:
+                slots.setdefault(key, []).append(index)
+    replaced: list[dict] = []
+    used_removed: set[int] = set()
+    used_added: set[int] = set()
+    for key, gone_indices in removed_slots.items():
+        arrived_indices = added_slots.get(key, [])
+        if len(gone_indices) != 1 or len(arrived_indices) != 1:
+            continue
+        gone, arrived = removed[gone_indices[0]], added[arrived_indices[0]]
+        fields = _replacement_fields(gone, arrived)
+        if not any(field[0] == "предмет" for field in fields):
+            continue
+        used_removed.add(gone_indices[0])
+        used_added.add(arrived_indices[0])
+        replaced.append({**arrived, "fields": fields, "_replaced": True})
+    return (
+        replaced,
+        [item for index, item in enumerate(removed) if index not in used_removed],
+        [item for index, item in enumerate(added) if index not in used_added],
+    )
+
+
 _DAY_TABLE_HEAD = [
     ("что", "bold"), ("время", "bold"), ("предмет", "bold"),
     ("ауд.", "bold"), ("преподаватель", "bold"),
@@ -2380,74 +2447,320 @@ def _covers_both_weeks(item: dict) -> bool:
     return {"upper", "lower"} <= set(_parities_of(item))
 
 
-def _entry_brief(kind: str, item: dict) -> str:
-    """Короткое «что случилось» для сводки дня: «сменили аудиторию»."""
-    if kind == "moved":
-        return "перенесли пару"
+#: Отмена занятия в примечании: «24.09 занятий не будет», «отменено».
+_CANCEL_NOTE_RE = re.compile(r"занят\w*\s+(?:не\s+будет|нет)|отмен", re.I)
+#: Метки подразделений в примечании — это место, а не смысл примечания.
+_PLACE_MARK_RE = re.compile(
+    r"(?<![А-ЯЁа-яё])(?:ИГУМ|ИГ|ИЭ|ПИ|ПТИ|ХТИ|ИНПО|ИМО|МИ|ЮИ|Антоново)(?![А-ЯЁа-яё])", re.I
+)
+_PARITY_NAME = {"upper": "верхняя неделя", "lower": "нижняя неделя", "every": "каждую неделю"}
+
+
+def _field_map(item: dict) -> dict[str, tuple[str, str]]:
+    """Поля правки как {метка: (было, стало)}; первая запись метки выигрывает."""
+    out: dict[str, tuple[str, str]] = {}
+    for label, old, new in _fields_of(item):
+        out.setdefault(label, (old, new))
+    return out
+
+
+def _is_remote_mode(mode: object) -> bool:
+    return str(mode or "").strip().casefold().startswith("remote")
+
+
+def _room_missing(value: object) -> bool:
+    text = str(value or "").strip().strip(".").strip().casefold()
+    return text in _EMPTY_ROOM or _missing_change_value(text)
+
+
+def _note_compare_key(text: str, locations: list[str]) -> str:
+    """Примечание без места и меток подразделений — чтобы сравнивать смысл.
+
+    Когда пара переезжает в другой корпус, портал переписывает хвост
+    примечания («ИГУМ, Антоново» → «ПТИ, ул. Б. Санкт-Петербургская»). Это
+    смена корпуса, а не «новое примечание», поэтому место из сравнения убираем.
+    """
+    for location in locations:
+        if location:
+            text = re.sub(re.escape(location), " ", text, flags=re.I)
+    text = _PLACE_MARK_RE.sub(" ", text)
+    return re.sub(r"[\s,;.()]+", " ", text).strip().casefold()
+
+
+def _note_delta(item: dict) -> tuple[str, str] | None:
+    """Смысловое примечание (было, стало) или None, если по смыслу оно прежнее.
+
+    Сравниваем без недели, формата ДОТ и места: у них свои отдельные правки
+    («поменяли неделю», «перевели на ДОТ», «поменяли корпус»).
+    """
+    fields = _field_map(item)
+    if "примечание" not in fields:
+        return None
+    old_note, new_note = fields["примечание"]
+    new_location = str(item.get("location") or "").strip()
+    old_location = str(fields.get("место", (new_location, new_location))[0] or "").strip()
+    old_brief = _note_brief({"note": old_note, "location": old_location})
+    new_brief = _note_brief({"note": new_note, "location": new_location})
+    locations = [old_location, new_location]
+    if _note_compare_key(old_brief, locations) == _note_compare_key(new_brief, locations):
+        return None
+    return _note_display(old_brief), _note_display(new_brief)
+
+
+def _note_display(text: str) -> str:
+    """Примечание для строки правки без хвостов места («английский язык ПТИ»)."""
+    text = _PLACE_MARK_RE.sub(" ", text)
+    text = re.sub(r"\s+([,;.])", r"\1", text)
+    text = re.sub(r"([,;])(?:\s*[,;])+", r"\1", text)
+    return re.sub(r"\s{2,}", " ", text).strip(" ,;")
+
+
+def _parity_delta(item: dict) -> tuple[str, str] | None:
+    """Неделя пары (было, стало), если правка примечания её сменила."""
+    fields = _field_map(item)
+    if "примечание" not in fields:
+        return None
+    old, new = (_parity_of(str(value or "")) for value in fields["примечание"])
+    return (old, new) if old != new else None
+
+
+#: Кампусы по фрагменту адреса: портал пишет один адрес по-разному
+#: («Б.С.-Петербургская, 41» и «ул.Б.Санкт.-Петербургская, д.41»).
+_CAMPUS_NEEDLES = (
+    ("антоново", "Антоново"),
+    ("петербург", "Б. Санкт-Петербургская, 41"),
+    ("советскойарми", "ул. Советской Армии, 7"),
+    ("совармии", "ул. Советской Армии, 7"),
+    ("псковск", "ул. Псковская, 3"),
+    ("чудинцев", "ул. Чудинцева, 6"),
+)
+
+
+def _campus_of(location: str) -> str | None:
+    compact = re.sub(r"[^0-9а-яёa-z]+", "", location.casefold())
+    for needle, campus in _CAMPUS_NEEDLES:
+        if needle in compact:
+            return campus
+    return None
+
+
+def _location_changed(old: str, new: str) -> bool:
+    """Место сменилось по существу, а не переписано подробнее или иначе.
+
+    «Антоново» → «ИГУМ, Антоново» и «Б.С.-Петербургская, 41» →
+    «ул.Б.Санкт.-Петербургская, д.41» — это тот же корпус.
+    """
+    old_key, new_key = old.strip().casefold(), new.strip().casefold()
+    if not old_key or not new_key or old_key == new_key:
+        return False
+    old_campus, new_campus = _campus_of(old), _campus_of(new)
+    if old_campus and new_campus:
+        return old_campus != new_campus
+    return old_key not in new_key and new_key not in old_key
+
+
+def _place_actions(old_room: str, new_room: str, old_location: str, new_location: str,
+                   *, room_changed: bool, location_changed: bool, dot: str | None) -> list[str]:
+    """Действия про место: аудитория, корпус; переход на ДОТ поглощает «убрали аудиторию»."""
+    actions: list[str] = []
+    corpus = False
+    if room_changed and not _room_missing(old_room) and not _room_missing(new_room):
+        old_key, new_key = _building_key(old_room), _building_key(new_room)
+        corpus = bool(old_key and new_key and old_key != new_key)
+    if location_changed and _location_changed(old_location, new_location):
+        corpus = True
+    if corpus:
+        actions.append("поменяли корпус")
+    elif location_changed and dot is None and new_location.strip():
+        # Пусто → «ИГУМ, Антоново» — указали; «Антоново» → «ИГУМ, Антоново» — уточнили.
+        actions.append("уточнили корпус" if old_location.strip() else "указали корпус")
+    if room_changed:
+        if _room_missing(old_room) and not _room_missing(new_room):
+            if dot != "off":
+                actions.append("указали аудиторию")
+        elif _room_missing(new_room) and not _room_missing(old_room):
+            if dot != "on":
+                actions.append("убрали аудиторию")
+        elif not _room_missing(old_room):
+            actions.append("поменяли аудиторию")
+    return actions
+
+
+def _subject_action(item: dict) -> str | None:
+    fields = _field_map(item)
+    if "предмет" not in fields:
+        return None
+    if _rename_tail(item):
+        return "уточнили название"
+    old_name, old_kind = _subject_kind(str(fields["предмет"][0] or "").split("\n", 1)[0])
+    new_name, new_kind = _subject_kind(str(fields["предмет"][1] or "").split("\n", 1)[0])
+    if old_name.casefold() == new_name.casefold() and old_kind != new_kind:
+        return "поменяли тип занятия"
+    # Тот же слот и тот же преподаватель — портал переименовал пару. Другой
+    # преподаватель (или склейка «убрали + добавили») — это уже другая пара.
+    if item.get("_replaced") or "преподаватель" in fields:
+        return "заменили пару"
+    return "переименовали пару"
+
+
+def _entry_actions(kind: str, item: dict, partner: dict | None = None) -> list[str]:
+    """Что именно сделали с парой — конкретными действиями, по порядку важности.
+
+    «поменяли преподавателя», «поменяли корпус», «добавили примечание»,
+    «перевели на ДОТ», «отменили занятие»… Сводка дня и колонка «что»
+    строятся из одного и того же списка, поэтому не расходятся.
+    """
     if kind == "added":
-        return "добавили пару"
+        return ["добавили пару"]
     if kind == "removed":
-        return "убрали пару"
-    labels = {
-        str(field[0])
-        for field in (item.get("fields") or [])
-        if isinstance(field, (list, tuple)) and len(field) == 3
-    }
-    if labels == {"предмет"}:
-        return "переименовали пару"
-    if labels == {"преподаватель"} and all(
-        _missing_change_value(field[1]) and not _missing_change_value(field[2]) for field in item.get("fields", [])
-        if isinstance(field, (list, tuple)) and len(field) == 3
-    ):
-        return "указали преподавателя"
-    if labels == {"преподаватель"} and all(
-        _missing_change_value(field[2]) for field in item.get("fields", [])
-        if isinstance(field, (list, tuple)) and len(field) == 3
-    ):
-        return "преподаватель больше не указан"
-    if labels and labels <= {"примечание", "место", "формат"}:
-        return "изменили условия"
-    if labels:
-        words = {"предмет": "название", "преподаватель": "преподавателя",
-                 "ауд.": "аудиторию"}
-        parts = []
-        for label, _old, _new in item["fields"]:
-            word = words.get(label, label)
-            if word not in parts:
-                parts.append(word)
-        if parts:
-            return "сменили " + " и ".join(parts)
-    return "обновили пару"
+        return ["убрали пару"]
+    if kind == "moved":
+        actions = ["перенесли пару"]
+        if partner is not None:
+            old_room = str(item.get("room") or "").strip()
+            new_room = str(partner.get("room") or "").strip()
+            old_loc = str(item.get("location") or "").strip()
+            new_loc = str(partner.get("location") or "").strip()
+            old_dot, new_dot = _is_remote(item), _is_remote(partner)
+            dot = "on" if new_dot and not old_dot else "off" if old_dot and not new_dot else None
+            if dot == "on":
+                actions.append("перевели на ДОТ")
+            elif dot == "off":
+                actions.append("убрали ДОТ")
+            actions += _place_actions(
+                old_room, new_room, old_loc, new_loc,
+                room_changed=old_room.casefold() != new_room.casefold(),
+                location_changed=old_loc.casefold() != new_loc.casefold(), dot=dot,
+            )
+        return actions
+
+    fields = _field_map(item)
+    if not fields:
+        return ["обновили пару"]
+    actions: list[str] = []
+    subject = _subject_action(item)
+    if subject:
+        actions.append(subject)
+        if subject == "заменили пару":
+            # Новая пара на месте старой: её преподаватель, аудитория и
+            # примечание видны в ячейках, в заголовок выносим только главное.
+            return actions
+    if "преподаватель" in fields:
+        old, new = fields["преподаватель"]
+        if _missing_change_value(old) and not _missing_change_value(new):
+            actions.append("указали преподавателя")
+        elif _missing_change_value(new) and not _missing_change_value(old):
+            actions.append("убрали преподавателя")
+        elif not _missing_change_value(new):
+            actions.append("поменяли преподавателя")
+    dot = None
+    if "формат" in fields:
+        old_mode, new_mode = fields["формат"]
+        if _is_remote_mode(new_mode) and not _is_remote_mode(old_mode):
+            dot = "on"
+            actions.append("перевели на ДОТ")
+        elif _is_remote_mode(old_mode) and not _is_remote_mode(new_mode):
+            dot = "off"
+            actions.append("убрали ДОТ")
+    room_old, room_new = fields.get("ауд.", ("", ""))
+    location = str(item.get("location") or "").strip()
+    loc_old, loc_new = fields.get("место", (location, location))
+    actions += _place_actions(
+        str(room_old or ""), str(room_new or ""), str(loc_old or ""), str(loc_new or ""),
+        room_changed="ауд." in fields, location_changed="место" in fields, dot=dot,
+    )
+    parity = _parity_delta(item)
+    if parity:
+        actions.append("поменяли неделю")
+    note = _note_delta(item)
+    if note:
+        old_note, new_note = note
+        was_cancel = bool(_CANCEL_NOTE_RE.search(old_note))
+        is_cancel = bool(_CANCEL_NOTE_RE.search(new_note))
+        if is_cancel and not was_cancel:
+            actions.append("отменили занятие")
+        elif was_cancel and not is_cancel:
+            actions.append("убрали отмену")
+        elif not old_note:
+            actions.append("добавили примечание")
+        elif not new_note:
+            actions.append("убрали примечание")
+        else:
+            actions.append("изменили примечание")
+    if not actions:
+        if "примечание" in fields:
+            return ["уточнили примечание"]
+        return ["обновили пару"]
+    return actions
+
+
+def _combine_actions(actions: list[str]) -> str:
+    """«поменяли преподавателя» + «поменяли аудиторию» → «поменяли преподавателя и аудиторию»."""
+    groups: list[tuple[str, list[str]]] = []
+    for action in dict.fromkeys(actions):
+        verb, _, rest = action.partition(" ")
+        if groups and groups[-1][0] == verb and rest:
+            groups[-1][1].append(rest)
+        else:
+            groups.append((verb, [rest] if rest else []))
+    def objects_text(objects: list[str]) -> str:
+        if len(objects) <= 1:
+            return "".join(objects)
+        return ", ".join(objects[:-1]) + " и " + objects[-1]
+
+    return ", ".join(f"{verb} {objects_text(objects)}".strip() for verb, objects in groups)
+
+
+def _entry_brief(kind: str, item: dict, partner: dict | None = None) -> str:
+    """Короткое «что случилось» для сводки дня: «поменяли аудиторию»."""
+    return _combine_actions(_entry_actions(kind, item, partner))
+
+
+#: Множественное число объектов действий для сводки «(3 пары)».
+_ACTION_PLURALS = (
+    ("преподавателя", "преподавателей"), ("аудиторию", "аудитории"),
+    ("название", "названия"), ("примечание", "примечания"),
+    ("корпус", "корпуса"), ("занятие", "занятия"), ("пару", "пары"),
+    ("неделю", "недели"),
+)
 
 
 def _action_label(brief: str, count: int) -> str:
     if count == 1:
         return brief
-    if brief == "преподаватель больше не указан":
-        return "преподаватели больше не указаны"
-    for singular, plural in (("преподавателя", "преподавателей"),
-                             ("аудиторию", "аудитории"), ("название", "названия"),
-                             ("пару", "пары")):
-        brief = brief.replace(singular, plural)
+    for singular, plural in _ACTION_PLURALS:
+        brief = re.sub(rf"(?<![А-ЯЁа-яё]){singular}(?![А-ЯЁа-яё])", plural, brief)
     return brief
 
 
-def _day_action_groups(entries: list[tuple[str, dict, dict | None]]) -> list[tuple[str, list]]:
-    groups: dict[str, list] = {}
+def _day_action_counts(entries: list[tuple[str, dict, dict | None]]) -> dict[str, int]:
+    """Сколько пар дня затронуло каждое отдельное действие (в порядке появления)."""
+    counts: dict[str, int] = {}
     for entry in entries:
-        groups.setdefault(_entry_brief(entry[0], entry[1]), []).append(entry)
-    return list(groups.items())
+        for action in dict.fromkeys(_entry_actions(*entry)):
+            counts[action] = counts.get(action, 0) + 1
+    return counts
 
 
 def _day_summary(day: str, entries: list[tuple[str, dict, dict | None]]) -> str:
-    """Name each kind of edit once, using ordinary words instead of multipliers."""
-    parts = []
-    for brief, group in _day_action_groups(entries):
-        count = len(group)
-        label = _action_label(brief, count)
-        if count > 1:
-            label += f" ({count} {_pairs_word(count)})"
-        parts.append(label)
+    """Name each concrete edit once, using ordinary words instead of multipliers.
+
+    Считаем отдельные действия, а не их сочетания: две пары с «перенесли +
+    поменяли корпус» и «перенесли» дают «перенесли пары (2 пары), поменяли
+    корпус», а не повтор «перенесли пару» дважды.
+    """
+    parts: list[str] = []
+    singles: list[str] = []
+    for action, count in _day_action_counts(entries).items():
+        if count == 1:
+            singles.append(action)
+            continue
+        if singles:
+            parts.append(_combine_actions(singles))
+            singles = []
+        parts.append(f"{_action_label(action, count)} ({count} {_pairs_word(count)})")
+    if singles:
+        parts.append(_combine_actions(singles))
     if len(entries) == 1:
         return _truncate_rich_text(f"{day} ({', '.join(parts)})", 180)
     return _truncate_rich_text(f"{day} · {', '.join(parts)}", 180)
@@ -3078,6 +3391,8 @@ def _group_by_day(
         day_removed = [item for item in removed if (str(item.get("day") or "").strip() or "—") == day]
         day_changed = [item for item in changed if (str(item.get("day") or "").strip() or "—") == day]
         moves, rest_removed, rest_added = _pair_moves(day_removed, day_added)
+        replaced, rest_removed, rest_added = _pair_replacements(rest_removed, rest_added)
+        day_changed = [*day_changed, *replaced]
         entries: list[tuple[str, dict, dict | None]] = []
         for gone, arrived in moves:
             entries.append(("moved", gone, arrived))
@@ -3174,8 +3489,14 @@ def _place_runs(text: str, *, struck: bool = False) -> list[object]:
 
 
 def _change_what_cell(kind: str, item: dict, partner: dict | None) -> list[object]:
-    """Знак правки и время пары; у переноса — старое время зачёркнуто, новое жирным."""
-    mark = {"type": "code", "text": _KIND_MARK.get(kind, "?")}
+    """Что сделали — словами («Поменяли преподавателя»), и время пары.
+
+    У переноса старое время зачёркнуто, новое жирным; у убранной пары время
+    зачёркнуто. Раньше здесь стоял только значок ``~``/``+``/``−``, и читателю
+    приходилось угадывать, что именно поменялось в строке.
+    """
+    brief = _entry_brief(kind, item, partner)
+    mark = {"type": "bold", "text": _truncate_rich_text(brief[:1].upper() + brief[1:], 200)}
     if kind == "moved" and partner is not None:
         old = bells.slot(item.get("time")).label()
         new = bells.slot(partner.get("time")).label()
@@ -3197,7 +3518,10 @@ def _change_lesson_cell(kind: str, item: dict, partner: dict | None) -> list[obj
     labels = {label for label, _, _ in fields}
     name, abbrev = _subject_kind(_subject_first(current))
     runs: list[object] = []
-    if "предмет" in labels:
+    if "предмет" in labels and kind == "changed" and _subject_action(item) == "поменяли тип занятия":
+        # Название то же, сменился только вид («пр.» → «лек.»): его покажем в контексте.
+        runs.append({"type": "bold", "text": _truncate_rich_text(name, 400)})
+    elif "предмет" in labels:
         tail = _rename_tail(item)
         old_raw = next((old for label, old, _ in fields if label == "предмет"), "")
         old_name, _ = _subject_kind(old_raw.split("\n", 1)[0].strip())
@@ -3210,14 +3534,33 @@ def _change_lesson_cell(kind: str, item: dict, partner: dict | None) -> list[obj
                      {"type": "bold", "text": _truncate_rich_text(name, 400)}]
     else:
         runs.append({"type": "bold", "text": _truncate_rich_text(name, 400)})
-    context: list[str] = []
+    kind_change = kind == "changed" and _subject_action(item) == "поменяли тип занятия"
+    parity_change = _parity_delta(item) if kind == "changed" else None
+    context: list[object] = []
     if abbrev:
-        context.append(_truncate_rich_text(abbrev, 16))
-    parity = _parity_context(current)
-    if parity:
-        context.append(parity)
+        if kind_change:
+            old_raw = next((old for label, old, _ in fields if label == "предмет"), "")
+            _old_name, old_abbrev = _subject_kind(old_raw.split("\n", 1)[0].strip())
+            context.append([*_old_new_runs(old_abbrev, abbrev, 16)])
+        else:
+            context.append(_truncate_rich_text(abbrev, 16))
+    if parity_change and not _covers_both_weeks(item):
+        old_parity, new_parity = parity_change
+        context.append([*_old_value_runs(_PARITY_NAME[old_parity], 40), " → ",
+                        {"type": "bold", "text": _PARITY_NAME[new_parity]}])
+    else:
+        parity = _parity_context(current)
+        if parity:
+            context.append(parity)
     if context:
-        runs += ["\n", {"type": "italic", "text": " · ".join(context)}]
+        if all(isinstance(segment, str) for segment in context):
+            runs += ["\n", {"type": "italic", "text": " · ".join(context)}]
+        else:
+            runs.append("\n")
+            for index, segment in enumerate(context):
+                if index:
+                    runs.append(" · ")
+                runs += segment if isinstance(segment, list) else [{"type": "italic", "text": segment}]
     teacher_field = next((field for field in fields if field[0] == "преподаватель"), None)
     if teacher_field:
         runs += ["\n", *_old_new_runs(teacher_field[1], teacher_field[2], 160)]
@@ -3225,6 +3568,16 @@ def _change_lesson_cell(kind: str, item: dict, partner: dict | None) -> list[obj
         teacher = str(current.get("teacher") or "").strip()
         if teacher and not _missing_change_value(teacher):
             runs += ["\n", {"type": "italic", "text": _truncate_rich_text(teacher, 160)}]
+    # Примечание печатаем только когда поменялось именно оно: неизменное
+    # примечание по-прежнему не выводим, чтобы пост не превращался в полотно.
+    note = _note_delta(item) if kind == "changed" else None
+    if note:
+        old_note, new_note = note
+        runs += ["\n", {"type": "italic", "text": "примечание: "}]
+        if new_note:
+            runs += _old_new_runs(old_note, new_note, 200)
+        else:
+            runs += [*_old_value_runs(old_note, 200), " → убрали"]
     return runs
 
 
@@ -3241,9 +3594,35 @@ def _change_where_cell(kind: str, item: dict, partner: dict | None) -> list[obje
         return _place_runs(after)
     if kind in {"added", "removed"}:
         return _place_runs(_place_line(current, ""), struck=kind == "removed")
+    field_map = _field_map(item)
+    if "формат" in field_map and labels & {"ауд.", "место"} and len(_variants_of(current)) == 1:
+        old_mode, new_mode = field_map["формат"]
+        if _is_remote_mode(old_mode) != _is_remote_mode(new_mode):
+            # Перевели на ДОТ или вернули в аудиторию: «ауд. 303, Антоново → ДОТ»
+            # понятнее, чем «303 → не указано».
+            before = {**current, "delivery_mode": old_mode}
+            for label, key in (("ауд.", "room"), ("место", "location"), ("примечание", "note")):
+                if label in field_map:
+                    before[key] = field_map[label][0]
+            before.pop("_variants", None)
+            old_place, new_place = _where(before), _where(current)
+            if old_place != new_place:
+                runs: list[object] = []
+                if old_place != "место не указано":
+                    runs += [*_old_value_runs(old_place, 200), " → "]
+                runs.append({"type": "bold", "text": _truncate_rich_text(new_place, 200)})
+                return runs
+
+    def derived(field: tuple[str, str, str]) -> bool:
+        # «место» и «формат» обычно выведены из того же примечания. Но
+        # настоящий переезд в другой корпус показываем всегда: «было → стало».
+        if field[0] == "место" and _location_changed(field[1], field[2]):
+            return False
+        return field[0] in {"место", "формат"} and "примечание" in labels
+
     place_fields = [
         field for field in fields
-        if field[0] in {"ауд.", "место", "формат"} and not (field[0] in {"место", "формат"} and "примечание" in labels)
+        if field[0] in {"ауд.", "место", "формат"} and not derived(field)
     ]
     if not place_fields:
         return _place_runs(_place_line(current, ""))

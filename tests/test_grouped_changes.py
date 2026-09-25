@@ -50,7 +50,10 @@ def test_each_occurrence_is_a_row_and_details_keep_week_and_time():
     section = day(diff)
     assert section["summary"] == "Понедельник · указали преподавателей (3 пары)"
     table = rows(section)
-    assert [row[0] for row in table] == ["~\n09:00–10:45", "~\n16:00–17:45", "~\n17:00–18:45"]
+    assert [row[0] for row in table] == [
+        "Указали преподавателя\n09:00–10:45", "Указали преподавателя\n16:00–17:45",
+        "Указали преподавателя\n17:00–18:45",
+    ]
     assert [row[1].split("\n")[0] for row in table] == ["История России", "География туризма", "География туризма"]
     # Новый преподаватель жирным, без «→»: раньше его просто не было.
     text = overview(section)
@@ -67,7 +70,7 @@ def test_add_replace_and_remove_teacher_are_not_misrepresented_as_one_action():
         lesson("Химия", "13:00", fields=[["преподаватель", "Сидоров", ""]]),
     ]})
     assert section["summary"] == (
-        "Понедельник · указали преподавателя, сменили преподавателя, преподаватель больше не указан")
+        "Понедельник · указали преподавателя, поменяли преподавателя, убрали преподавателя")
     table = rows(section)
     assert table[0][1] == "История\nПетров"
     assert table[1][1] == "Физика\nИванов → Петров"
@@ -83,20 +86,20 @@ def test_room_deltas_are_shown_per_row_with_time():
     ]})
     table = rows(section)
     assert [row[2] for row in table] == ["301 → 302", "301 → 302", "303 → 302"]
-    assert table[0][0] == "~\n09:00–10:45"
+    assert table[0][0] == "Поменяли аудиторию\n09:00–10:45"
 
 
 
-def test_unknown_notes_are_preserved_in_closed_details_without_dominating_overview():
+def test_edited_notes_are_shown_old_to_new_in_the_lesson_row():
     section = day({"changed": [
         lesson("История", fields=[["примечание", "ранняя запись", "только 25.09; консультация по согласованию"]]),
         lesson("Физика", "11:00", fields=[["примечание", "старый адрес", "уточнить место у деканата"]]),
     ]})
-    assert section["summary"] == "Понедельник · изменили условия (2 пары)"
-    assert "История" in overview(section) and "Физика" in overview(section)
-    assert "консультация" not in overview(section)  # примечания не выводятся
-    assert "ранняя запись" not in plain(section)  # примечания не выводятся
-    assert "уточнить место" not in plain(section)  # примечания не выводятся
+    assert section["summary"] == "Понедельник · изменили примечания (2 пары)"
+    table = rows(section)
+    assert [row[0].split("\n")[0] for row in table] == ["Изменили примечание"] * 2
+    assert table[0][1] == "История\nпримечание: ранняя запись → только 25.09; консультация по согласованию"
+    assert table[1][1] == "Физика\nпримечание: старый адрес → уточнить место у деканата"
 
 
 

@@ -245,26 +245,44 @@ even if the portal content did not change.
 `build_changes_rich_message()` uses a per-day, table-first layout without emoji:
 
 - Each weekday is a closed `details` section whose summary names the concrete
-  edits, for example `Четверг (сменили аудиторию)` or
-  `Пятница (переименовали пару, убрали пару)` — not a bare change count.
+  edits, for example `Четверг (поменяли аудиторию)` or
+  `Пятница · заменили пару, перевели на ДОТ (2 пары)` — not a bare change count.
+- `_entry_actions()` is the single classifier behind both the day summary and
+  the «что» cell. Vocabulary (combined per row: «поменяли преподавателя и
+  аудиторию, добавили примечание»):
+  - kinds: `добавили пару`, `убрали пару`, `перенесли пару` (same-day time
+    move), `заменили пару` (another subject in the same slot: same day, hours,
+    subgroup and parity, exactly one removed and one added; or a monitor rename
+    that also changed the teacher), `переименовали пару` (same slot and teacher),
+    `уточнили название` (old name is a prefix), `поменяли тип занятия`
+    («пр.» → «лек.»);
+  - teacher: `указали` / `поменяли` / `убрали преподавателя`;
+  - place: `поменяли аудиторию`, `указали` / `убрали аудиторию`,
+    `поменяли корпус` (room decoder says another building, or the location
+    changed beyond a mere rewrite such as «Антоново» → «ИГУМ, Антоново»),
+    `указали корпус`; `перевели на ДОТ` / `убрали ДОТ` absorb the implied room
+    and location removal/addition;
+  - note: compared without parity, `ДОТ`, the location and institute marks.
+    `поменяли неделю` (parity changed), `добавили` / `изменили` / `убрали
+    примечание`, `отменили занятие` / `убрали отмену` («… занятий не будет»,
+    «отмен…»), `уточнили примечание` when only the place wording changed.
 - The body of a day is one rich `table` («что · занятие · где») with a row per
   edit, ordered moves → changes → additions → removals, then by time:
-  - «что»: the mark `+` `−` `~` `↔` on the first line and the pair time on the
-    second (a move shows the old time struck and the new one bold; a removal
-    strikes the time; a missing time is simply omitted);
+  - «что»: the action in bold (capitalised) on the first line and the pair time
+    on the second (a move shows the old time struck and the new one bold; a
+    removal strikes the time; a missing time is simply omitted);
   - «занятие»: the subject in bold (a rename strikes the old name above the new
     one, or highlights the added tail when the old name is a prefix), then the
-    lesson type and applicable parity in italics, then the teacher (a teacher
-    edit shows old struck → new bold; a newly supplied teacher has no arrow);
+    lesson type and applicable parity in italics (a type or parity edit shows
+    old struck → new bold), then the teacher (a teacher edit shows old struck →
+    new bold; a newly supplied teacher has no arrow), then — only when the note
+    itself changed — «примечание: старое → новое» (unchanged notes stay hidden);
   - «где»: `_place_line()` — room, location and `ДОТ`, per week when upper and
     lower differ; room/format/location edits show old struck → new bold and
-    append «другой корпус: …» from the room decoder; a removal strikes the
-    place; an unknown place is a dash, never «место не указано».
-- «Подробности: время, недели и примечания» is a closed `details` with a
-  second table («занятие · время · недели · примечание»), one row per edit in
-  the same order: time and parity (or «время не указано»), and the note line
-  from `_note_line()` (language expanded, week-specific conditions labelled
-  «Верхняя неделя: …»); a note edit shows old struck → new bold.
+    append «другой корпус: …» from the room decoder; a DOT switch that also
+    changed the room/location shows «ауд. 303, ИГУМ, Антоново → ДОТ»; a real
+    location change is shown even when it came with a note edit; a removal
+    strikes the place; an unknown place is a dash, never «место не указано».
 - At most `_RICH_DIFF_MAX_ROWS_PER_DAY` (40) rows per day; the rest is named as
   «Ещё N изменений этого дня не поместились». The global text/block budget
   still trims per-kind record counts and reports omissions.

@@ -81,11 +81,12 @@ def test_reported_single_rename_is_action_first_without_repeated_chrome():
     validate_rich_payload(payload)
     blocks = payload["rich_message"]["blocks"]
     assert blocks[0]["type"] == "details"
-    assert blocks[0]["summary"] == "Понедельник (переименовали пару)"
+    assert blocks[0]["summary"] == "Понедельник (уточнили название)"
     # День — только таблица правок, без абзацев-прозы.
     assert [inner["type"] for inner in blocks[0]["blocks"]] == ["table"]
     what, lesson, where = main_rows(payload)[0]
-    assert text(what["text"]) == "~\n09:00–10:45"
+    # Колонка «что» называет действие словами, а не значком «~».
+    assert text(what["text"]) == "Уточнили название\n09:00–10:45"
     # Название печатаем один раз: старое — префикс нового, поэтому показан
     # только подсвеченный добавленный хвост, а не два длинных названия.
     assert lesson["text"][:4] == [
@@ -141,10 +142,10 @@ def test_upper_lower_locations_are_separate_not_a_room_remote_slash():
 
 
 @pytest.mark.parametrize(("label", "old", "new", "brief", "delta"), [
-    ("ауд.", "1318", "1331", "сменили аудиторию", "1318 → 1331"),
-    ("преподаватель", "Петров", "Иванов", "сменили преподавателя", "Петров → Иванов"),
-    ("формат", "in_person", "remote_or_hybrid", "изменили условия", "без ДОТ → с использованием ДОТ"),
-    ("ауд.", "1318", "", "сменили аудиторию", "1318 → не указано"),
+    ("ауд.", "1318", "1331", "поменяли аудиторию", "1318 → 1331"),
+    ("преподаватель", "Петров", "Иванов", "поменяли преподавателя", "Петров → Иванов"),
+    ("формат", "in_person", "remote_or_hybrid", "перевели на ДОТ", "без ДОТ → с использованием ДОТ"),
+    ("ауд.", "1318", "", "убрали аудиторию", "1318 → не указано"),
 ])
 def test_change_kind_has_specific_summary_and_new_value_emphasis(label, old, new, brief, delta):
     diff = rename_diff()
@@ -186,7 +187,7 @@ def test_multi_field_change_names_fields_and_flags_building_move():
     payload = build_changes_rich_message(diff, [], "https://example.test")
     days = day_sections(payload)
     assert [day["summary"] for day in days] == [
-        "Понедельник (сменили преподавателя и аудиторию)"]
+        "Понедельник (поменяли преподавателя, корпус и аудиторию)"]
     _what, lesson, where = main_rows(payload)[0]
     assert text(lesson["text"]).endswith("\nБарышева Ангелина Алексеевна → Иванова Ольга Петровна")
     # 1318 (старый корпус) → 415 (новый): здание другое, кампус тот же.
@@ -225,7 +226,10 @@ def test_comment_edit_does_not_repeat_derived_location_and_mode_edits():
     payload = build_changes_rich_message(diff, [], "https://example.test")
     main = visible(payload)
     assert "ауд. 1318, ДОТ" in main  # место и формат выведены в ячейку «где»
-    assert "с 14.09" not in main  # примечание больше не выводится
+    # Смысловая часть примечания новая («с 14.09») — её показываем, а ДОТ и
+    # место внутри примечания — отдельными действиями, без повтора.
+    assert day_sections(payload)[0]["summary"] == "Понедельник (перевели на ДОТ, добавили примечание)"
+    assert "с 14.09" in main
     assert "изменился формат" not in main and "сменилось место" not in main
     assert "без ДОТ →" not in main
 
@@ -273,8 +277,9 @@ def test_fallback_long_old_value_does_not_hide_new_value_or_clearing():
     diff = rename_diff()
     diff["changed"][0]["fields"] = [["примечание", "<&>" * 800, ""]]
     fallback = changes_fallback_text(diff, "https://example.test")
-    assert "→ <b>не указано</b>" not in fallback  # примечания больше не выводятся
-    assert "&lt;&amp;&gt;" not in fallback
+    assert "(убрали примечание)" in fallback
+    # Старое примечание зачёркнуто и обрезано, экранировано, дальше — «убрали».
+    assert "<s>&lt;&amp;&gt;" in fallback and "…</s> → убрали" in fallback
     assert "<blockquote expandable><b>Подробности</b>" not in fallback
     assert len(fallback) <= 4096
 
@@ -309,8 +314,8 @@ def test_day_summary_lists_every_change_and_details_hold_the_sentences():
     assert [inner["type"] for inner in days[0]["blocks"]] == ["table"]
     rows = [[text(cell["text"]) for cell in row] for row in main_rows(payload)]
     assert rows == [
-        ["+\n17:00–18:45", "Проектная деятельность", "ауд. 301"],
-        ["−\n09:00–10:45", "Психология", "ауд. 1306"],
+        ["Добавили пару\n17:00–18:45", "Проектная деятельность", "ауд. 301"],
+        ["Убрали пару\n09:00–10:45", "Психология", "ауд. 1306"],
     ]
     _what, _lesson_cell, where = main_rows(payload)[1]
     assert where["text"] == [{"type": "strikethrough", "text": "ауд. 1306"}]
